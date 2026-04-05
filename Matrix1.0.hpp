@@ -1,6 +1,8 @@
 // #include <initializer_list>
 // #include <utility>
 #include <numeric>
+#include <stdexcept>
+#include <string>
 
 template <typename datatype>
 class Matrix{
@@ -37,27 +39,28 @@ class Matrix{
         }
         Matrix& operator=(const std::initializer_list<std::initializer_list<datatype>> &M){ // for direct matrix assignment
             try{
-                if ( M.size() == 0 ) throw (true);  
-            delete[] grid;
+                if (M.size() == 0)
+                    throw std::invalid_argument("Cannot assign empty initializer list to Matrix");
 
-            rowSize = M.size();
-            auto itr = M.begin();
-            colSize = itr->size();
+                delete[] grid;
 
-            grid = new datatype[rowSize*colSize];         // deep copy
+                rowSize = M.size();
+                auto itr = M.begin();
+                colSize = itr->size();
 
-            int i = 0, j = 0, index = 0;
-            for (auto row : M){
-                for (auto element : row){
-                    index = i * colSize + (j++ % colSize);
-                    grid[index] = element;
+                grid = new datatype[rowSize*colSize];         // deep copy
+
+                int i = 0, j = 0, index = 0;
+                for (auto row : M){
+                    for (auto element : row){
+                        index = i * colSize + (j++ % colSize);
+                        grid[index] = element;
+                    }
+                    i++;
                 }
-                i++;
-            }
-            }catch( bool isEmpty){
-                std::cout << "Error, Null Matrix assignment: " << isEmpty << std::endl;
-                std::cout << "Exiting Now.";
-                exit(0);
+            }catch(const std::exception& e){
+                std::cerr << "Matrix assignment error: " << e.what() << std::endl;
+                throw;
             }
             return *this;
         }
@@ -65,18 +68,19 @@ class Matrix{
         Matrix operator+(const Matrix &M){
             Matrix ans = *this;
             try{
-                if( this->colSize != M.colSize ) 
-                    throw (std::make_pair(colSize, M.colSize));
-                else if( this->rowSize != M.rowSize)
-                    throw (std::make_pair(rowSize, M.rowSize));
+                if (this->colSize != M.colSize)
+                    throw std::invalid_argument(
+                        "Column size mismatch in operator+: " + std::to_string(colSize) + " != " + std::to_string(M.colSize));
+                if (this->rowSize != M.rowSize)
+                    throw std::invalid_argument(
+                        "Row size mismatch in operator+: " + std::to_string(rowSize) + " != " + std::to_string(M.rowSize));
 
                 for (int index = 0; index < colSize*rowSize; index++)
                     ans.grid[index] += M.grid[index];
-                
-            }catch(std::pair<int,int> dim){
-                std::cout << "Dimension Error: " << dim.first << " != " << dim.second << std::endl;
-                std::cout << "Exiting Now.";
-                exit(0);
+
+            }catch(const std::exception& e){
+                std::cerr << "Matrix addition error: " << e.what() << std::endl;
+                throw;
             }
             return ans;
         }
@@ -92,32 +96,38 @@ class Matrix{
         Matrix operator*(const Matrix &M){
             try{
                 if (this->colSize != M.rowSize)
-                    throw (true);
+                    throw std::invalid_argument(
+                        "Inner dimensions must match for operator*: (" +
+                        std::to_string(rowSize) + "x" + std::to_string(colSize) + ") * (" +
+                        std::to_string(M.rowSize) + "x" + std::to_string(M.colSize) + ")");
                 Matrix <datatype> ans(this->rowSize, M.colSize);
                 Matrix <datatype> tmp(1, this->colSize);
                 for (int i = 0; i < this->rowSize * M.colSize; i++){
-                    tmp = (*this)(i / M.colSize, ':') % M(':', i % colSize.T()); 
+                    tmp = (*this)(i / M.colSize, ':') % M(':', i % colSize.T());
                     ans[i] = std::accumulate(tmp.grid, tmp.grid + colSize, (datatype)0);
                 }
                 return ans;
-            }catch(bool err){
-                std::cout << "Dimension Error: " << err;
-                exit(0);
+            }catch(const std::exception& e){
+                std::cerr << "Matrix multiplication error: " << e.what() << std::endl;
+                throw;
             }
         }
         //Hadamard product (using %)
         Matrix operator%(const Matrix &M){
             try{
                 if (this->colSize != M.colSize || this->rowSize != M.rowSize)
-                    throw (true);
+                    throw std::invalid_argument(
+                        "Dimension mismatch in Hadamard product: (" +
+                        std::to_string(rowSize) + "x" + std::to_string(colSize) + ") vs (" +
+                        std::to_string(M.rowSize) + "x" + std::to_string(M.colSize) + ")");
                 Matrix <datatype> ans(M.rowSize, M.colSize);
                 for (int i = 0; i < M.rowSize * M.colSize; i++){
                     ans.grid[i] = this->grid[i] * M.grid[i];
                 }
                 return ans;
-            }catch(bool err){
-                std::cout << "Dimension Error: " << err;
-                exit(0);
+            }catch(const std::exception& e){
+                std::cerr << "Hadamard product error: " << e.what() << std::endl;
+                throw;
             }
         }
 
@@ -144,10 +154,11 @@ class Matrix{
                         return ans;
                     }
                 }
-                throw(true);
-            }catch(bool err){
-                std::cout << "Invaild syntax";
-                exit(0);
+                throw std::invalid_argument(
+                    std::string("Invalid row specifier '") + c + "': use ':' for row extraction, e.g. A(i, ':')");
+            }catch(const std::exception& e){
+                std::cerr << "Matrix indexing error: " << e.what() << std::endl;
+                throw;
             }
         }
         //vector extraction for the ith column
@@ -161,10 +172,11 @@ class Matrix{
                         return ans;
                     }
                 }
-                throw(true);
-            }catch(bool err){
-                std::cout << "Invaild syntax";
-                exit(0);
+                throw std::invalid_argument(
+                    std::string("Invalid column specifier '") + c + "': use ':' for column extraction, e.g. A(':', j)");
+            }catch(const std::exception& e){
+                std::cerr << "Matrix indexing error: " << e.what() << std::endl;
+                throw;
             }
         }
         //dot operators
@@ -178,6 +190,7 @@ class Matrix{
                 if ( !((i + 1 )% colSize)) std::cout << "]" << std::endl;
             }
         }
+        //Transpose
         Matrix T() const{
             Matrix <datatype> ans(colSize, rowSize);
             for (int i = 0; i < colSize*rowSize; i++){
@@ -185,6 +198,25 @@ class Matrix{
                 ans.grid[(i % colSize) * rowSize + (i / colSize)] = grid[i];
             }
             return ans;
+        }
+
+        datatype trace() const{
+            try
+            {
+                if (!(rowSize == colSize && rowSize > 0))
+                    throw std::invalid_argument(
+                        "trace() requires a square non-empty matrix, got " +
+                        std::to_string(rowSize) + "x" + std::to_string(colSize));
+                datatype sum = datatype(0);
+                for (int i = 0; i < rowSize; i++) sum += (*this)(i,i);
+
+                return sum;
+            }
+            catch(const std::exception& e)
+            {
+                std::cerr << "Matrix trace error: " << e.what() << '\n';
+                throw;
+            }
         }
 
         // datatype const det() const{
