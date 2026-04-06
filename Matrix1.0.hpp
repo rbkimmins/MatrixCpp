@@ -1,9 +1,22 @@
 // #include <initializer_list>
 // #include <utility>
+#include "random.hpp"
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <vector>
+#include <sstream>
+#include <iomanip>
+#include <iostream>
+#include <cmath>
 
+// Slice sentinel — used in place of all for row/column extraction.
+// A dedicated type prevents ambiguity with operator()(int, int).
+// Usage: A(i, all)  or  A(all, j)
+struct all_t {};
+inline constexpr all_t all;
+//for std=C++11
+//constexpr all_t all;
 template <typename datatype>
 class Matrix{
     public:
@@ -103,7 +116,7 @@ class Matrix{
                 Matrix <datatype> ans(this->rowSize, M.colSize);
                 Matrix <datatype> tmp(1, this->colSize);
                 for (int i = 0; i < this->rowSize * M.colSize; i++){
-                    tmp = (*this)(i / M.colSize, ':') % M(':', i % colSize.T());
+                    tmp = (*this)(int(i / M.colSize), all) % (M(all, int(i % M.colSize))).T();
                     ans[i] = std::accumulate(tmp.grid, tmp.grid + colSize, (datatype)0);
                 }
                 return ans;
@@ -140,56 +153,75 @@ class Matrix{
         datatype& operator()(const int& i, const int& j){
             return grid[(i % rowSize) * colSize + (j % colSize)];
         }
+        const datatype& operator()(const int& i, const int& j) const {
+            return grid[(i % rowSize) * colSize + (j % colSize)];
+        }
         datatype& operator[](const int& i){
             return grid[i % (rowSize * colSize)];
         }
-        //vector extraction for the ith row
-        Matrix operator()(const int& i, const char& c){
-            try{
-                switch(c){
-                    case ':': {
-                        Matrix <datatype> ans(1, this->colSize);
-                        for (int j = 0; j < this->colSize; j++)
-                            ans[j] = this->grid[(i % rowSize) * colSize + (j % colSize)];
-                        return ans;
-                    }
-                }
-                throw std::invalid_argument(
-                    std::string("Invalid row specifier '") + c + "': use ':' for row extraction, e.g. A(i, ':')");
-            }catch(const std::exception& e){
-                std::cerr << "Matrix indexing error: " << e.what() << std::endl;
-                throw;
-            }
+        //vector extraction for the ith row:  A(i, all)
+        Matrix operator()(const int& i, all_t) const {
+            Matrix<datatype> ans(1, this->colSize);
+            for (int j = 0; j < (int)this->colSize; j++)
+                ans[j] = this->grid[(i % rowSize) * colSize + (j % colSize)];
+            return ans;
         }
-        //vector extraction for the ith column
-        Matrix operator()(const char& c, const int& i){
-            try{
-                switch(c){
-                    case ':': {
-                        Matrix <datatype> ans(rowSize, 1);
-                        for (int j = 0; j < rowSize; j++)
-                            ans[j] = grid[(j % rowSize) * colSize + (i % colSize)];
-                        return ans;
-                    }
-                }
-                throw std::invalid_argument(
-                    std::string("Invalid column specifier '") + c + "': use ':' for column extraction, e.g. A(':', j)");
-            }catch(const std::exception& e){
-                std::cerr << "Matrix indexing error: " << e.what() << std::endl;
-                throw;
-            }
+        //vector extraction for the ith column:  A(all, j)
+        Matrix operator()(all_t, const int& i) const {
+            Matrix<datatype> ans(rowSize, 1);
+            for (int j = 0; j < (int)rowSize; j++)
+                ans[j] = grid[(j % rowSize) * colSize + (i % colSize)];
+            return ans;
         }
         //dot operators
         inline bool empty() const { return !(rowSize * colSize); }
         unsigned int rows() const { return rowSize; }
         unsigned int cols() const { return colSize; }
-        void print() const{
-            for (int i = 0; i< rowSize*colSize; i++){
-                if ( !(i % rowSize)) std::cout << "[ ";
-                std::cout << grid[i]<< " ";
-                if ( !((i + 1 )% colSize)) std::cout << "]" << std::endl;
+
+        // Format each row as a string, used by toString() and side-by-side printing.
+        // Floating-point types get fixed decimal notation; integral types are undecorated.
+        std::vector<std::string> toLines(int precision = 6) const {
+            // Pre-pass: format every element to find the widest string
+            std::vector<std::string> cells(rowSize * colSize);
+            size_t colWidth = 0;
+            for (int i = 0; i < (int)(rowSize * colSize); i++) {
+                std::ostringstream oss;
+                if (std::is_floating_point<datatype>::value)
+                    oss << std::fixed << std::setprecision(precision);
+                oss << grid[i];
+                cells[i] = oss.str();
+                if (cells[i].size() > colWidth) colWidth = cells[i].size();
             }
+
+            std::vector<std::string> lines(rowSize);
+            for (int i = 0; i < (int)rowSize; i++) {
+                std::ostringstream row;
+                row << "[ ";
+                for (int j = 0; j < (int)colSize; j++) {
+                    row << std::setw((int)colWidth) << cells[i * colSize + j];
+                    if (j < (int)colSize - 1) row << "  ";
+                }
+                row << " ]";
+                lines[i] = row.str();
+            }
+            return lines;
         }
+
+        // Returns the matrix as a formatted string. Default precision matches NumPy.
+        std::string toString(int precision = 6) const {
+            auto lines = toLines(precision);
+            std::string result;
+            for (size_t i = 0; i < lines.size(); i++) {
+                result += lines[i];
+                if (i + 1 < lines.size()) result += '\n';
+            }
+            return result;
+        }
+
+        // Convenience cast — explicit to prevent accidental implicit conversions.
+        explicit operator std::string() const { return toString(); }
+
+        void print(int precision = 6) const { std::cout << toString(precision) << '\n'; }
         //Transpose
         Matrix T() const{
             Matrix <datatype> ans(colSize, rowSize);
@@ -231,12 +263,12 @@ class Matrix{
                 if (!addcol) {
                     Matrix<datatype> total_vec(1, colSize);
                     for (int i = 0; i < (int)colSize; i++)
-                        total_vec[i] = (*this)(':', i).sum();
+                        total_vec[i] = (*this)(all, i).sum();
                     return total_vec;
                 } else {
                     Matrix<datatype> total_vec(rowSize, 1);
                     for (int i = 0; i < (int)rowSize; i++)
-                        total_vec[i] = (*this)(i, ':').sum();
+                        total_vec[i] = (*this)(i, all).sum();
                     return total_vec;
                 }
             }catch(const std::exception& e){
@@ -254,9 +286,9 @@ class Matrix{
                         " != " + std::to_string(M.colSize));
                     Matrix<datatype> argumentMatrix(this->rowSize + M.rowSize, colSize);
                     for (int i = 0; i < (int)this->rowSize; i++)
-                        argumentMatrix(i, ':') = (*this)(i, ':');
+                        argumentMatrix(i, all) = (*this)(i, all);
                     for (int i = 0; i < (int)M.rowSize; i++)
-                        argumentMatrix(i + this->rowSize, ':') = M(i, ':');
+                        argumentMatrix(i + this->rowSize, all) = M(i, all);
                     return argumentMatrix;
                 } else {
                     // horizontal concat: stack columns, rows must match
@@ -265,9 +297,9 @@ class Matrix{
                         " != " + std::to_string(M.rowSize));
                     Matrix<datatype> argumentMatrix(rowSize, this->colSize + M.colSize);
                     for (int i = 0; i < (int)this->colSize; i++)
-                        argumentMatrix(':', i) = (*this)(':', i);
+                        argumentMatrix(all, i) = (*this)(all, i);
                     for (int i = 0; i < (int)M.colSize; i++)
-                        argumentMatrix(':', i + this->colSize) = M(':', i);
+                        argumentMatrix(all, i + this->colSize) = M(all, i);
                     return argumentMatrix;
                 }
             }catch(const std::exception& e){
@@ -275,15 +307,122 @@ class Matrix{
                 throw;
             }
         }
-        
-        // LU factorization (Doolittle's method: diag(L) = 1).
-        // Returns a packed matrix: upper triangle (incl. diagonal) = U,
-        // lower triangle (below diagonal) = L.
-        // To recover L: take lower triangle and set diagonal to 1.
-        // To recover U: take upper triangle including diagonal.
-        Matrix LU() const{
+
+        Matrix& set_Ran_values(double lowBound, double highBound){
+            //Modifies a "this" matrix with random values with a unique seed everything (within 24 hours). Over-writes existing values.
             try
             {
+                if(lowBound >= highBound) throw std::invalid_argument(
+                    "Improper boundaries given, low: " + std::to_string(lowBound) + " > high: " + std::to_string(highBound));
+                double range = highBound - lowBound;
+                long seed;
+                setRan(seed);
+                for (unsigned int i = 0; i < rowSize*colSize; i++){
+                    double val = range * ran2(&seed) + lowBound;
+                    grid[i] = std::is_integral<datatype>::value ? datatype(std::round(val)) : datatype(val);
+                }
+            }catch(const std::exception& e){
+                std::cerr << "Bounds error: " << e.what() << std::endl;
+                throw;
+            }
+            return *this;
+        }
+        Matrix& set_Ran_values(double lowBound, double highBound, long customSeed){
+            //random matrix generator for a given seed. Over-writes existing values.
+            //SEED MUST BE <0 
+            try
+            {
+                if( customSeed >= 0) throw std::invalid_argument(
+                    "Seed, " + std::to_string(customSeed) + " is >= 0");
+                if(lowBound >= highBound) throw std::invalid_argument(
+                    "Improper boundaries given, low: " + std::to_string(lowBound) + " > high: " + std::to_string(highBound));
+                double range = highBound - lowBound;
+                long seed = customSeed;
+                for (unsigned int i = 0; i < rowSize*colSize; i++){
+                    double val = range * ran2(&seed) + lowBound;
+                    grid[i] = std::is_integral<datatype>::value ? datatype(std::round(val)) : datatype(val);
+                }
+            }catch(const std::exception& e){
+                std::cerr << "Error: " << e.what() << std::endl;
+                throw;
+            }
+            return *this;
+        }
+        
+        // --------------------------------------------------------
+        // LUResult — returned by Matrix::LU()
+        // Stores the packed Doolittle factorization and pivot vector.
+        // Relation: PA = LU, where P is the permutation matrix.
+        //   packed lower triangle (below diag) = L factors (diag of L is implicitly 1)
+        //   packed upper triangle (incl. diag)  = U
+        // --------------------------------------------------------
+        class LUResult {
+        public:
+            // L and U are always double — LU is a floating-point algorithm.
+            // Materialize L: lower triangle with diag = 1
+            Matrix<double> getL() const {
+                Matrix<double> L(n, n);
+                for (int i = 0; i < n; i++) {
+                    L(i, i) = 1.0;
+                    for (int j = 0; j < i; j++)
+                        L(i, j) = packedAt(i, j);
+                }
+                return L;
+            }
+
+            // Materialize U: upper triangle including diagonal
+            Matrix<double> getU() const {
+                Matrix<double> U(n, n);
+                for (int i = 0; i < n; i++)
+                    for (int j = i; j < n; j++)
+                        U(i, j) = packedAt(i, j);
+                return U;
+            }
+
+            // Materialize P: permutation matrix such that PA = LU.
+            // 0s and 1s only, so datatype is fine here.
+            Matrix<datatype> getPivot() const {
+                Matrix<datatype> P(n, n);
+                for (int i = 0; i < n; i++) P(i, i) = datatype(1);
+                for (int k = 0; k < n; k++) {
+                    if (pivotVec[k] != k) {
+                        for (int j = 0; j < n; j++) {
+                            datatype tmp = P(k, j);
+                            P(k, j) = P(pivotVec[k], j);
+                            P(pivotVec[k], j) = tmp;
+                        }
+                    }
+                }
+                return P;
+            }
+
+        private:
+            // std::vector<double> avoids the incomplete-type error that arises from
+            // storing Matrix<double> inside a nested class of Matrix<datatype>.
+            std::vector<double> packedData;
+            std::vector<int>    pivotVec;
+            int                 n;
+
+            double packedAt(int i, int j) const { return packedData[i * n + j]; }
+            double& packedAt(int i, int j)       { return packedData[i * n + j]; }
+
+            LUResult(int size, const std::vector<double>& data, const std::vector<int>& pv)
+                : packedData(data), pivotVec(pv), n(size) {}
+
+            // pivotSign() is private — only Matrix::det() needs it
+            int pivotSign() const {
+                int sign = 1;
+                for (int k = 0; k < n; k++)
+                    if (pivotVec[k] != k) sign = -sign;
+                return sign;
+            }
+
+            friend class Matrix;
+        };
+
+        // LU factorization with partial pivoting (Doolittle's method, diag(L) = 1)
+        LUResult LU() const {
+            try {
                 if (rowSize != colSize)
                     throw std::invalid_argument(
                         "LU: matrix must be square, got " +
@@ -295,33 +434,74 @@ class Matrix{
                         "), must be at least 2x2");
 
                 int n = (int)rowSize;
-                Matrix<datatype> packed = *this;  // in-place Doolittle on a copy
+                // Always work in double — integer types would truncate the L factors.
+                // Store as flat vector to avoid incomplete-type issues with Matrix<double>.
+                std::vector<double> packedData(n * n);
+                for (int i = 0; i < n; i++)
+                    for (int j = 0; j < n; j++)
+                        packedData[i * n + j] = double((*this)(i, j));
+
+                auto pat = [&](int i, int j) -> double& { return packedData[i * n + j]; };
+
+                std::vector<int> pivotVec(n);
+                for (int i = 0; i < n; i++) pivotVec[i] = i;
 
                 for (int k = 0; k < n; k++) {
-                    if (packed(k, k) == datatype(0))
+                    // Partial pivoting: find row >= k with largest |value| in column k
+                    int maxRow = k;
+                    double maxVal = std::abs(pat(k, k));
+                    for (int i = k + 1; i < n; i++) {
+                        double val = std::abs(pat(i, k));
+                        if (val > maxVal) { maxVal = val; maxRow = i; }
+                    }
+
+                    if (maxVal == 0.0)
                         throw std::runtime_error(
-                            "LU: zero pivot at position (" + std::to_string(k) +
-                            "," + std::to_string(k) + ") — matrix may be singular");
-                    // Compute L column k (rows below pivot)
+                            "LU: zero pivot in column " + std::to_string(k) +
+                            " — matrix is singular");
+
+                    // Swap rows k and maxRow
+                    if (maxRow != k)
+                        for (int j = 0; j < n; j++)
+                            std::swap(pat(k, j), pat(maxRow, j));
+                    pivotVec[k] = maxRow;
+
+                    // Doolittle: L column below pivot, then update trailing submatrix
                     for (int i = k + 1; i < n; i++)
-                        packed(i, k) /= packed(k, k);
-                    // Update trailing submatrix
+                        pat(i, k) /= pat(k, k);
                     for (int i = k + 1; i < n; i++)
                         for (int j = k + 1; j < n; j++)
-                            packed(i, j) -= packed(i, k) * packed(k, j);
+                            pat(i, j) -= pat(i, k) * pat(k, j);
                 }
-                return packed;
-            }
-            catch(const std::exception& e)
-            {
+
+                return LUResult(n, packedData, pivotVec);
+            } catch (const std::exception& e) {
                 std::cerr << "LU factorization error: " << e.what() << '\n';
                 throw;
             }
         }
 
-        // datatype det() const{
+        datatype det() const {
+            try {
+                if (rowSize != colSize)
+                    throw std::invalid_argument(
+                        "det() requires a square matrix, got " +
+                        std::to_string(rowSize) + "x" + std::to_string(colSize));
+                LUResult lu = this->LU();
+                double d = double(lu.pivotSign());
+                for (int i = 0; i < (int)rowSize; i++)
+                    d *= lu.packedAt(i, i);
+                // For integer matrices the determinant is always a whole number;
+                // round before casting to avoid floating-point drift (e.g. 2.9999 → 3)
+                return std::is_integral<datatype>::value
+                    ? datatype(std::round(d))
+                    : datatype(d);
+            } catch (const std::exception& e) {
+                std::cerr << "det() error: " << e.what() << '\n';
+                throw;
+            }
+        }
 
-        // }
         //deconstructor
         ~Matrix(){
             if (grid) delete[] grid;
@@ -331,6 +511,48 @@ class Matrix{
         unsigned int colSize;
         datatype *grid;
 };
+
+// scalar * A  (scalar on left) — complements the member A * scalar
+template<typename datatype, typename scalar>
+Matrix<datatype> operator*(const scalar k, Matrix<datatype> A) {
+    return A * k;
+}
+
+// Stream insertion — lets you write: std::cout << A;
+template<typename datatype>
+std::ostream& operator<<(std::ostream& os, const Matrix<datatype>& M) {
+    return os << M.toString();
+}
+
+// Print two matrices side by side with an operator symbol centred on the middle row.
+// e.g. printSideBySide(A, "*", B);
+template<typename datatype>
+void printSideBySide(const Matrix<datatype>& A, const std::string& op,
+                     const Matrix<datatype>& B, int precision = 6) {
+    auto linesA = A.toLines(precision);
+    auto linesB = B.toLines(precision);
+
+    size_t rowsA = linesA.size();
+    size_t rowsB = linesB.size();
+    size_t totalRows = rowsA > rowsB ? rowsA : rowsB;
+
+    // Width of a blank line matching A's and B's row width
+    size_t widthA = rowsA > 0 ? linesA[0].size() : 0;
+    size_t widthB = rowsB > 0 ? linesB[0].size() : 0;
+    std::string blankA(widthA, ' ');
+    std::string blankB(widthB, ' ');
+
+    // op column: symbol on middle row, spaces elsewhere
+    size_t midRow = totalRows / 2;
+    std::string opPad(op.size(), ' ');
+
+    for (size_t r = 0; r < totalRows; r++) {
+        const std::string& rowA = r < rowsA ? linesA[r] : blankA;
+        const std::string& rowB = r < rowsB ? linesB[r] : blankB;
+        const std::string& sym  = r == midRow ? op : opPad;
+        std::cout << rowA << "   " << sym << "   " << rowB << '\n';
+    }
+}
 
 // ============================================================
 // IdentityMatrix — lazy proxy for k*I
@@ -477,5 +699,6 @@ Matrix<datatype> operator*(const IdentityMatrix& Id, Matrix<datatype> A) {
     }
 }
 
-// Global instance — include this header and 'I' is ready to use
+// Global instance — include this header and 'I' is ready to use, inline version is for std=C++17 and beyond
 inline const IdentityMatrix I;
+//const IdentityMatrix I;
