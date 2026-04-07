@@ -20,17 +20,21 @@ inline constexpr all_t all;
 template <typename datatype>
 class Matrix{
     public:
-        //constructors
+        // --- Constructors ---
+
+        // Default: creates an empty 0x0 matrix
         Matrix(){
             rowSize = 0;
             colSize = 0;
             grid = nullptr;
         }
+        // Creates an i x j matrix, zero-initialised
         Matrix(int i, int j){
             rowSize = i;
             colSize = j;
             grid = new datatype[rowSize*colSize]();
         }
+        // Copy constructor: deep copies M
         Matrix(const Matrix &M){
             rowSize = M.rowSize;
             colSize = M.colSize;
@@ -38,7 +42,10 @@ class Matrix{
             for (int index = 0; index < rowSize*colSize; index++)
                 grid[index] = M.grid[index];
         }
-        // Overloaded operators
+
+        // --- Assignment operators ---
+
+        // Assigns from another Matrix (deep copy)
         Matrix& operator=(const Matrix &M){
             if (this == &M) return *this;  // self-assignment guard
 
@@ -50,7 +57,8 @@ class Matrix{
                 grid[index] = M.grid[index];
             return *this;
         }
-        Matrix& operator=(const std::initializer_list<std::initializer_list<datatype>> &M){ // for direct matrix assignment
+        // Assigns from a 2D initializer list, e.g. A = {{1,2},{3,4}}
+        Matrix& operator=(const std::initializer_list<std::initializer_list<datatype>> &M){
             try{
                 if (M.size() == 0)
                     throw std::invalid_argument("Cannot assign empty initializer list to Matrix");
@@ -78,6 +86,9 @@ class Matrix{
             return *this;
         }
 
+        // --- Arithmetic operators ---
+
+        // Element-wise addition. Requires identical dimensions. Returns a new Matrix.
         Matrix operator+(const Matrix &M){
             Matrix ans = *this;
             try{
@@ -98,6 +109,7 @@ class Matrix{
             return ans;
         }
 
+        // Scalar multiplication: multiplies every element by num. Returns a new Matrix.
         template <typename scalar>
         Matrix operator*(const scalar& num) const {
             Matrix ans = *this;
@@ -105,12 +117,15 @@ class Matrix{
                 ans.grid[index] *= num;
             return ans;
         }
+        // In-place scalar multiplication
         template <typename scalar>
         Matrix& operator*= (const scalar& num) {
             (*this) = (*this) * num;
             return (*this);
         }
 
+        // Matrix multiplication (dot product). Requires this->cols == M.rows.
+        // Returns an (this->rows x M.cols) Matrix.
         Matrix operator*(const Matrix &M) const{
             try{
                 if (this->colSize != M.rowSize)
@@ -131,11 +146,13 @@ class Matrix{
             }
         }
 
+        // In-place matrix multiplication
         Matrix& operator*= (const Matrix &M){
             (*this) = (*this) * M;
             return (*this);
         }
-        //Hadamard product (using %)
+
+        // Hadamard (element-wise) product. Requires identical dimensions. Returns a new Matrix.
         Matrix operator%(const Matrix &M) const{
             try{
                 if (this->colSize != M.colSize || this->rowSize != M.rowSize)
@@ -153,26 +170,30 @@ class Matrix{
                 throw;
             }
         }
-        //For Matrix A and integer n, A mod n returns a_ij % n  for all i,j
-        //Note, n mod A should not work. What would it return?
+        // Integer modulo: applies modulo to every element. Returns a new Matrix.
+        // e.g. A % 3 gives a matrix where each element is a_ij % 3.
+        // Note: n % A has no defined meaning and is not supported.
         Matrix operator% (const int& modulo) const{
             Matrix ans;
             ans = *this;
             for (int i = 0; i< rowSize*colSize; i++) ans.grid[i] %= modulo;
-            return ans;  
+            return ans;
         }
 
+        // In-place integer modulo
         Matrix& operator%= (const int& modulo){
             *this = (*this) % modulo;
             return *this;
         }
 
+        // In-place Hadamard product
         Matrix& operator%= (const Matrix& M){
             *this = (*this) % M;
             return *this;
         }
-        //Scalar division, preserves the type of the matrix
-        //Note, a scaler divided by a matrix has no meaning
+
+        // Scalar division: divides every element by n. Preserves datatype.
+        // Note: n / A has no defined meaning and is not supported.
         template <typename scalar>
         Matrix operator/ (const scalar& n) const{
             Matrix ans;
@@ -181,48 +202,63 @@ class Matrix{
             return ans;
         }
 
+        // In-place scalar division
         template <typename scalar>
         Matrix& operator/= (const scalar& n){
             *this = *this / n;
             return *this;
         }
 
+        // Element-wise subtraction. Requires identical dimensions. Returns a new Matrix.
         Matrix operator-(const Matrix &M){
             return *this + M*-1;
         }
 
-        //Indexing (note, negative indexes will read the matrix backwards)
-        //Assume the matrix A is indexed as A_ij
+        // --- Indexing operators ---
+        // Note: negative indices wrap backwards (e.g. -1 gives last element).
+        // Matrix is indexed as A(i, j) where i = row, j = column (0-based).
+
+        // Returns a reference to element (i, j)
         datatype& operator()(const int& i, const int& j){
             return grid[(i % rowSize) * colSize + (j % colSize)];
         }
+        // Const version of element access
         const datatype& operator()(const int& i, const int& j) const {
             return grid[(i % rowSize) * colSize + (j % colSize)];
         }
+        // Flat index access into the underlying row-major array
         datatype& operator[](const int& i){
             return grid[i % (rowSize * colSize)];
         }
-        //vector extraction for the ith row:  A(i, all)
+        // Returns the i-th row as a (1 x cols) Matrix.  Usage: A(i, all)
         Matrix operator()(const int& i, all_t) const {
             Matrix<datatype> ans(1, this->colSize);
             for (int j = 0; j < (int)this->colSize; j++)
                 ans[j] = this->grid[(i % rowSize) * colSize + (j % colSize)];
             return ans;
         }
-        //vector extraction for the ith column:  A(all, j)
+        // Returns the j-th column as a (rows x 1) Matrix.  Usage: A(all, j)
         Matrix operator()(all_t, const int& i) const {
             Matrix<datatype> ans(rowSize, 1);
             for (int j = 0; j < (int)rowSize; j++)
                 ans[j] = grid[(j % rowSize) * colSize + (i % colSize)];
             return ans;
         }
-        //dot operators
+
+        // --- Inspection ---
+
+        // Returns true if the matrix has no elements (0x0 or any zero dimension)
         inline bool empty() const { return !(rowSize * colSize); }
+        // Returns the number of rows
         unsigned int rows() const { return rowSize; }
+        // Returns the number of columns
         unsigned int cols() const { return colSize; }
 
-        // Format each row as a string, used by toString() and side-by-side printing.
-        // Floating-point types get fixed decimal notation; integral types are undecorated.
+        // --- Printing and string conversion ---
+
+        // Returns a vector of formatted row strings, one per row.
+        // Used internally by toString() and printSideBySide().
+        // precision: decimal places for floating-point types (ignored for integral types).
         std::vector<std::string> toLines(int precision = 6) const {
             // Pre-pass: format every element to find the widest string
             std::vector<std::string> cells(rowSize * colSize);
@@ -250,7 +286,8 @@ class Matrix{
             return lines;
         }
 
-        // Returns the matrix as a formatted string. Default precision matches NumPy.
+        // Returns the full matrix as a formatted multi-line string.
+        // precision: decimal places (default 6, matching NumPy's default).
         std::string toString(int precision = 6) const {
             auto lines = toLines(precision);
             std::string result;
@@ -261,11 +298,16 @@ class Matrix{
             return result;
         }
 
-        // Convenience cast — explicit to prevent accidental implicit conversions.
+        // Explicit cast to std::string using default precision (6dp).
+        // Use toString(n) directly when a specific precision is needed.
         explicit operator std::string() const { return toString(); }
 
+        // Prints the matrix to stdout. precision: decimal places (default 6).
         void print(int precision = 6) const { std::cout << toString(precision) << '\n'; }
-        //Transpose
+
+        // --- Linear algebra ---
+
+        // Returns the transpose of this matrix as a new (cols x rows) Matrix.
         Matrix T() const{
             Matrix <datatype> ans(colSize, rowSize);
             for (int i = 0; i < colSize*rowSize; i++){
@@ -275,6 +317,7 @@ class Matrix{
             return ans;
         }
 
+        // Returns the sum of the main diagonal elements. Requires a square matrix.
         datatype trace() const{
             try
             {
@@ -293,14 +336,14 @@ class Matrix{
                 throw;
             }
         }
-        //sum member function
-        datatype sum() const{// adds all elements
+        // Returns the sum of all elements in the matrix.
+        datatype sum() const{
             datatype total = datatype(0);
             for (int i = 0; i< rowSize * colSize; i++) total += grid[i];
             return total;
         }
-        // for 1, you get a column matrix containing the sum of each row.
-        // For 0, return a row matrix of the sum of each column.
+        // Dimensional sum. addcol=0: returns a (1 x cols) row matrix of column sums.
+        //                  addcol=1: returns a (rows x 1) column matrix of row sums.
         Matrix sum(const bool& addcol) const{
             try{
                 if (!addcol) {
@@ -319,9 +362,12 @@ class Matrix{
                 throw;
             }
         }
-        //Takes in the matrix M and the dimension bool. 0 for row and 1 for column 
+        // Concatenates M to this matrix. concatCol=0: vertical (stack rows, cols must match).
+        //                               concatCol=1: horizontal (stack cols, rows must match).
+        // If this matrix is empty, returns M directly.
         Matrix concat(const Matrix& M, const bool& concatCol) const{
             try{
+                if (this->empty()) return M;
                 if (!concatCol) {
                     // vertical concat: stack rows, columns must match
                     if (this->colSize != M.colSize) throw std::invalid_argument(
@@ -329,9 +375,11 @@ class Matrix{
                         " != " + std::to_string(M.colSize));
                     Matrix<datatype> argumentMatrix(this->rowSize + M.rowSize, colSize);
                     for (int i = 0; i < (int)this->rowSize; i++)
-                        argumentMatrix(i, all) = (*this)(i, all);
+                        for (int j = 0; j < (int)colSize; j++)
+                            argumentMatrix(i, j) = (*this)(i, j);
                     for (int i = 0; i < (int)M.rowSize; i++)
-                        argumentMatrix(i + this->rowSize, all) = M(i, all);
+                        for (int j = 0; j < (int)M.colSize; j++)
+                            argumentMatrix(i + (int)this->rowSize, j) = M(i, j);
                     return argumentMatrix;
                 } else {
                     // horizontal concat: stack columns, rows must match
@@ -339,10 +387,12 @@ class Matrix{
                         "concat: row size mismatch: " + std::to_string(rowSize) +
                         " != " + std::to_string(M.rowSize));
                     Matrix<datatype> argumentMatrix(rowSize, this->colSize + M.colSize);
-                    for (int i = 0; i < (int)this->colSize; i++)
-                        argumentMatrix(all, i) = (*this)(all, i);
-                    for (int i = 0; i < (int)M.colSize; i++)
-                        argumentMatrix(all, i + this->colSize) = M(all, i);
+                    for (int i = 0; i < (int)this->rowSize; i++)
+                        for (int j = 0; j < (int)this->colSize; j++)
+                            argumentMatrix(i, j) = (*this)(i, j);
+                    for (int i = 0; i < (int)M.rowSize; i++)
+                        for (int j = 0; j < (int)M.colSize; j++)
+                            argumentMatrix(i, j + (int)this->colSize) = M(i, j);
                     return argumentMatrix;
                 }
             }catch(const std::exception& e){
@@ -351,25 +401,26 @@ class Matrix{
             }
         }
 
-        // Kronecker (tensor) product: replaces each element A_ij with A_ij * M
+        // Kronecker (tensor) product: replaces every element A_ij with the block A_ij * M.
+        // Returns a (rows*M.rows x cols*M.cols) Matrix.
         Matrix tensor(const Matrix& M) const{
-            int rA = (int)this->rowSize, cA = (int)this->colSize;
-            // Build each block-row by horizontal concat, seeding with j=0 block
-            std::vector<Matrix> argumented_Rows(rA);
-            for (int i = 0; i < rA; i++){
-                argumented_Rows[i] = (*this)(i, 0) * M;   // seed with first block
-                for (int j = 1; j < cA; j++)
-                    argumented_Rows[i] = argumented_Rows[i].concat((*this)(i,j)*M, 1);
+            int rM = (int)M.rowSize, cM = (int)M.colSize;
+            int cOut = (int)colSize * cM;
+            Matrix<datatype> ans((int)rowSize * rM, cOut);
+            for (int idx = 0; idx < (int)ans.rowSize * (int)ans.colSize; idx++){
+                int r = idx / cOut, c = idx % cOut;
+                ans[idx] = (*this)(r / rM, c / cM) * M(r % rM, c % cM);
             }
-            // Stack block-rows vertically, seeding with row 0
-            Matrix ans = argumented_Rows[0];
-            for (int k = 1; k < rA; k++)
-                ans = ans.concat(argumented_Rows[k], 0);
             return ans;
         }
 
+        // --- Random initialisation ---
+
+        // Fills every element with a random value in [lowBound, highBound).
+        // Seed is derived from the current time (unique within a 24-hour window).
+        // Integral types are rounded to the nearest integer.
+        // Returns *this to allow chaining.
         Matrix& set_Ran_values(double lowBound, double highBound){
-            //Modifies a "this" matrix with random values with a unique seed everything (within 24 hours). Over-writes existing values.
             try
             {
                 if(lowBound >= highBound) throw std::invalid_argument(
@@ -387,9 +438,11 @@ class Matrix{
             }
             return *this;
         }
+        // Fills every element with a random value in [lowBound, highBound) using a custom seed.
+        // customSeed MUST be negative (required by ran2 to trigger initialisation).
+        // Integral types are rounded to the nearest integer.
+        // Returns *this to allow chaining.
         Matrix& set_Ran_values(double lowBound, double highBound, long customSeed){
-            //random matrix generator for a given seed. Over-writes existing values.
-            //SEED MUST BE <0 
             try
             {
                 if( customSeed >= 0) throw std::invalid_argument(
@@ -480,7 +533,10 @@ class Matrix{
             friend class Matrix;
         };
 
-        // LU factorization with partial pivoting (Doolittle's method, diag(L) = 1)
+        // Performs LU factorization with partial pivoting (Doolittle's method).
+        // Requires a square matrix of at least 2x2.
+        // Returns an LUResult from which L, U, and P can be extracted.
+        // Throws if the matrix is singular (zero pivot encountered).
         LUResult LU() const {
             try {
                 if (rowSize != colSize)
@@ -541,6 +597,8 @@ class Matrix{
             }
         }
 
+        // Returns the determinant of this matrix via LU factorization.
+        // Requires a square matrix. Integer types are rounded to avoid floating-point drift.
         datatype det() const {
             try {
                 if (rowSize != colSize)
@@ -572,20 +630,26 @@ class Matrix{
         datatype *grid;
 };
 
-// scalar * A  (scalar on left) — complements the member A * scalar
+// Scalar multiplication with scalar on the left: k * A.
+// Complements the member operator A * k so both orderings work.
 template<typename datatype, typename scalar>
 Matrix<datatype> operator*(const scalar k, Matrix<datatype> A) {
     return A * k;
 }
 
-// Stream insertion — lets you write: std::cout << A;
+// Stream insertion: allows std::cout << A and writing to any std::ostream.
+// Uses default precision (6dp). For custom precision call A.toString(n) directly.
 template<typename datatype>
 std::ostream& operator<<(std::ostream& os, const Matrix<datatype>& M) {
     return os << M.toString();
 }
 
-// Print two matrices side by side with an operator symbol centred on the middle row.
-// e.g. printSideBySide(A, "*", B);
+// Prints two matrices side by side with an operator symbol centred on the middle row.
+// A:        left matrix
+// op:       operator string shown between them, e.g. "*", "+", "="
+// B:        right matrix
+// precision: decimal places for floating-point types (default 6)
+// Handles mismatched row counts by padding the shorter matrix with blank lines.
 template<typename datatype>
 void printSideBySide(const Matrix<datatype>& A, const std::string& op,
                      const Matrix<datatype>& B, int precision = 6) {

@@ -15,6 +15,7 @@
 #define NDIV (1+IMM1/NTAB)
 #define EPS 1.2e-7
 #define RNMX (1.0-EPS)
+//See numerial recipes in C, chapter 7
 float ran2(long *idum){
     int j;
     long k;
