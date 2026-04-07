@@ -99,14 +99,19 @@ class Matrix{
         }
 
         template <typename scalar>
-        Matrix operator*(const scalar num) const {
+        Matrix operator*(const scalar& num) const {
             Matrix ans = *this;
             for (int index = 0; index < rowSize*colSize; index++)
                 ans.grid[index] *= num;
             return ans;
         }
+        template <typename scalar>
+        Matrix& operator*= (const scalar& num) {
+            (*this) = (*this) * num;
+            return (*this);
+        }
 
-        Matrix operator*(const Matrix &M){
+        Matrix operator*(const Matrix &M) const{
             try{
                 if (this->colSize != M.rowSize)
                     throw std::invalid_argument(
@@ -125,8 +130,13 @@ class Matrix{
                 throw;
             }
         }
+
+        Matrix& operator*= (const Matrix &M){
+            (*this) = (*this) * M;
+            return (*this);
+        }
         //Hadamard product (using %)
-        Matrix operator%(const Matrix &M){
+        Matrix operator%(const Matrix &M) const{
             try{
                 if (this->colSize != M.colSize || this->rowSize != M.rowSize)
                     throw std::invalid_argument(
@@ -142,6 +152,39 @@ class Matrix{
                 std::cerr << "Hadamard product error: " << e.what() << std::endl;
                 throw;
             }
+        }
+        //For Matrix A and integer n, A mod n returns a_ij % n  for all i,j
+        //Note, n mod A should not work. What would it return?
+        Matrix operator% (const int& modulo) const{
+            Matrix ans;
+            ans = *this;
+            for (int i = 0; i< rowSize*colSize; i++) ans.grid[i] %= modulo;
+            return ans;  
+        }
+
+        Matrix& operator%= (const int& modulo){
+            *this = (*this) % modulo;
+            return *this;
+        }
+
+        Matrix& operator%= (const Matrix& M){
+            *this = (*this) % M;
+            return *this;
+        }
+        //Scalar division, preserves the type of the matrix
+        //Note, a scaler divided by a matrix has no meaning
+        template <typename scalar>
+        Matrix operator/ (const scalar& n) const{
+            Matrix ans;
+            ans = *this;
+            for(int i = 0; i < rowSize*colSize; i++) ans.grid[i] /= n;
+            return ans;
+        }
+
+        template <typename scalar>
+        Matrix& operator/= (const scalar& n){
+            *this = *this / n;
+            return *this;
         }
 
         Matrix operator-(const Matrix &M){
@@ -276,7 +319,7 @@ class Matrix{
                 throw;
             }
         }
-
+        //Takes in the matrix M and the dimension bool. 0 for row and 1 for column 
         Matrix concat(const Matrix& M, const bool& concatCol) const{
             try{
                 if (!concatCol) {
@@ -306,6 +349,23 @@ class Matrix{
                 std::cerr << "Matrix concat error: " << e.what() << std::endl;
                 throw;
             }
+        }
+
+        // Kronecker (tensor) product: replaces each element A_ij with A_ij * M
+        Matrix tensor(const Matrix& M) const{
+            int rA = (int)this->rowSize, cA = (int)this->colSize;
+            // Build each block-row by horizontal concat, seeding with j=0 block
+            std::vector<Matrix> argumented_Rows(rA);
+            for (int i = 0; i < rA; i++){
+                argumented_Rows[i] = (*this)(i, 0) * M;   // seed with first block
+                for (int j = 1; j < cA; j++)
+                    argumented_Rows[i] = argumented_Rows[i].concat((*this)(i,j)*M, 1);
+            }
+            // Stack block-rows vertically, seeding with row 0
+            Matrix ans = argumented_Rows[0];
+            for (int k = 1; k < rA; k++)
+                ans = ans.concat(argumented_Rows[k], 0);
+            return ans;
         }
 
         Matrix& set_Ran_values(double lowBound, double highBound){
