@@ -150,26 +150,23 @@ int main(){
     // -------------------------------------------------------
     // Trace, determinant
     // -------------------------------------------------------
-    section("Trace: A.trace()");
+    section("Trace: tr(A)");
     cout << "A:\n" << A << "\n";
-    cout << "trace(A) = " << A.trace() << "\n";
+    cout << "tr(A) = " << tr(A) << "\n";
 
-    section("Determinant: Ad.det()");
+    section("Determinant: det(Ad)");
     cout << "Ad:\n" << Ad << "\n";
-    cout << "det(Ad) = " << Ad.det() << "\n";
+    cout << "det(Ad) = " << det(Ad) << "\n";
 
-    section("Determinant (integer matrix): A.det()");
+    section("Determinant (integer matrix): det(A)");
     cout << "A:\n" << A << "\n";
-    cout << "det(A) = " << A.det() << "\n";
+    cout << "det(A) = " << det(A) << "\n";
 
     // -------------------------------------------------------
     // LU factorisation
     // -------------------------------------------------------
     section("LU Factorisation: Ad.LU()  ->  L, U, P  where P*Ad = L*U");
-    auto lu = Ad.LU();
-    Matrix<double> L = lu.getL();
-    Matrix<double> U = lu.getU();
-    Matrix<double> P = lu.getPivot();
+    auto [L, U, P] = Ad.LU();
     cout << "Ad:\n" << Ad << "\n";
     cout << "L:\n" << L << "\n";
     cout << "U:\n" << U << "\n";

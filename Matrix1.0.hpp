@@ -9,6 +9,12 @@
 #include <iomanip>
 #include <iostream>
 #include <cmath>
+#include <algorithm>   // std::min
+#include <limits>      // std::numeric_limits
+#include <tuple>       // std::tuple, std::make_tuple
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 // Slice sentinel — used in place of all for row/column extraction.
 // A dedicated type prevents ambiguity with operator()(int, int).
@@ -31,7 +37,16 @@ class Matrix{
         // Creates an i x j matrix, zero-initialised
         Matrix(long i, long j){
             if (i < 0 || j < 0)
-                throw std::invalid_argument("Matrix: dimensions must be non-negative, got " + std::to_string(i) + "x" + std::to_string(j));
+                throw std::invalid_argument(
+                    "Matrix: dimensions must be non-negative, got " +
+                    std::to_string(i) + "x" + std::to_string(j));
+            // Indexing operators use signed int, so both dimensions and their product
+            // must fit within INT_MAX to guarantee every element is reachable.
+            static constexpr long MAX_IDX = std::numeric_limits<int>::max();
+            if (i > MAX_IDX || j > MAX_IDX || i * j > MAX_IDX)
+                throw std::invalid_argument(
+                    "Matrix: dimensions " + std::to_string(i) + "x" + std::to_string(j) +
+                    " exceed the maximum indexable size (" + std::to_string(MAX_IDX) + ")");
             rowSize = i;
             colSize = j;
             grid = new datatype[rowSize*colSize]();
@@ -212,12 +227,34 @@ class Matrix{
             return *this;
         }
 
-        // In-place Hadamard product
+        // In-place Hadamard product (Element-wise Matrix multipication)
         Matrix& operator%= (const Matrix& M){
             *this = (*this) % M;
             return *this;
         }
 
+        //Element-wise Matrix division
+        Matrix operator/ (const Matrix& M) const{
+            try{
+                if (this->colSize != M.colSize || this->rowSize != M.rowSize)
+                    throw std::invalid_argument(
+                        "Dimension mismatch in Element-wise division: (" +
+                        std::to_string(rowSize) + "x" + std::to_string(colSize) + ") vs (" +
+                        std::to_string(M.rowSize) + "x" + std::to_string(M.colSize) + ")");
+                Matrix ans(rowSize, colSize);
+                for (long i = 0; i < rowSize * colSize; i++)
+                    ans.grid[i] = grid[i] / M.grid[i];
+                return ans;
+            }catch(const std::exception& e){
+                std::cerr << "Element-wise division error: " << e.what() << std::endl;
+                throw;
+            }
+        }
+
+        Matrix& operator/= (const Matrix& M){
+            *this = (*this) / M;
+            return *this;
+        }
         // Scalar division: divides every element by n. Preserves datatype.
         // Note: n / A has no defined meaning and is not supported.
         template <typename scalar>
@@ -240,6 +277,16 @@ class Matrix{
             return *this + M*-1;
         }
 
+        Matrix& operator-= (const Matrix &M){
+            *this = (*this) - M;
+            return *this;
+        }
+
+        //Agrumented Matrix operator, allows for similar math notation.
+        //Note, to preserve predence use with (), EX (A|B)
+        Matrix operator| (const Matrix &M){
+            return (*this).concat(M, 1);
+        }
         // --- Proxy classes for slice assignment ---
         // Returned by non-const slice operators. Holds a reference back to the
         // parent Matrix so that A(i, all) = B writes through to A.
@@ -472,13 +519,72 @@ class Matrix{
             return ans;
         }
 
+        //element-wise power
+        template <typename scalar>
+        Matrix pow(scalar num) const{
+            Matrix ans = *this;
+            for (long i = 0; i < (*this).colSize*(*this).rowSize; i++)
+                ans[i] = std::pow(ans[i],num);
+            return ans;
+        }  
+
+        //element-wise exp
+        Matrix exp() const{
+            Matrix ans = *this;
+            for (long i = 0; i < (*this).colSize*(*this).rowSize; i++)
+                ans[i] = std::exp(ans[i]);
+            return ans;
+        }
+
+        //element-wise log base 10
+        Matrix log10() const{
+            Matrix ans = *this;
+            for (long i = 0; i < (*this).colSize*(*this).rowSize; i++)
+                ans[i] = std::log10(ans[i]);
+            return ans;
+        }
+
+        //element-wise log base 2, using computer science notation.
+        Matrix lg() const{
+            Matrix ans = *this;
+            for (long i = 0; i < (*this).colSize*(*this).rowSize; i++)
+                ans[i] = std::log2(ans[i]);
+            return ans;
+        }
+
+        //element-wise natural log
+        Matrix ln() const{
+            Matrix ans = *this;
+            for (long i = 0; i < (*this).colSize*(*this).rowSize; i++)
+                ans[i] = std::log(ans[i]);
+            return ans;
+        }
+
+        //element-wise log with arbitrary base
+        template <typename scalar>
+        Matrix log(scalar base) const{
+            Matrix ans = *this;
+            for (long i = 0; i < (*this).colSize*(*this).rowSize; i++)
+                ans[i] = std::log2(ans[i])/std::log2(base);
+            return ans;
+        }
+
+        // Returns whether a matrix is diagonal: all off-diagonal elements are zero.
+        // Works for non-square matrices. Single flat loop — no allocations, early exit.
+        bool IsDiagonal() const{
+            for (long k = 0; k < rowSize * colSize; k++)
+                if (k / colSize != k % colSize && grid[k] != datatype(0))
+                    return false;
+            return true;
+        }
+
         // Returns the sum of the main diagonal elements. Requires a square matrix.
-        datatype trace() const{
+        datatype tr() const{
             try
             {
                 if (!(rowSize == colSize && rowSize > 0))
                     throw std::invalid_argument(
-                        "trace() requires a square non-empty matrix, got " +
+                        "tr() requires a square non-empty matrix, got " +
                         std::to_string(rowSize) + "x" + std::to_string(colSize));
                 datatype sum = datatype(0);
                 for (long i = 0; i < rowSize; i++) sum += (*this)(int(i), int(i));
@@ -616,161 +722,243 @@ class Matrix{
             }
             return *this;
         }
-        
-        // --------------------------------------------------------
-        // LUResult — returned by Matrix::LU()
-        // Stores the packed Doolittle factorization and pivot vector.
-        // Relation: PA = LU, where P is the permutation matrix.
-        //   packed lower triangle (below diag) = L factors (diag of L is implicitly 1)
-        //   packed upper triangle (incl. diag)  = U
-        // --------------------------------------------------------
-        class LUResult {
-        public:
-            // L and U are always double — LU is a floating-point algorithm.
-            // Materialize L: lower triangle with diag = 1
-            Matrix<double> getL() const {
-                Matrix<double> L(n, n);
+        //
+
+
+        // QR factorisation with column pivoting using Householder reflections.
+        // Mirrors LAPACK's DGEQP3: at each step the column with the largest remaining
+        // norm is pivoted to the front, then a Householder reflector eliminates the
+        // sub-diagonal entries of that column. Column norms are maintained via the
+        // Bischof-Pan rank-1 downdate, avoiding a full norm recomputation each step.
+        //
+        // For m×n matrix A, computes  A * P = Q * R  where:
+        //   Q — m×m orthogonal (product of Householder reflectors)
+        //   R — m×n upper triangular
+        //   P — n×n permutation matrix (column pivoting for stability)
+        //
+        // Works for any m×n, including m < n.
+        // Usage: auto [Q, R, P] = A.QR();
+        std::tuple<Matrix<double>, Matrix<double>, Matrix<datatype>> QR() const {
+            try {
+                if (rowSize == 0 || colSize == 0)
+                    throw std::invalid_argument("QR: matrix must be non-empty");
+
+                int m = (int)rowSize, n = (int)colSize;
+                int r = std::min(m, n);
+
+                // Working copy in double (row-major flat array)
+                std::vector<double> work(m * n);
+                for (int k = 0; k < m * n; k++) work[k] = double(grid[k]);
+                auto W = [&](int i, int j) -> double& { return work[i * n + j]; };
+
+                // Column pivot tracking — pivots[k] = original column index at position k
+                std::vector<int> pivots(n);
+                std::iota(pivots.begin(), pivots.end(), 0);
+
+                // Squared column norms for Bischof-Pan pivot selection
+                std::vector<double> sqNorms(n, 0.0);
+                for (int j = 0; j < n; j++)
+                    for (int i = 0; i < m; i++) sqNorms[j] += W(i, j) * W(i, j);
+
+                // Householder taus + vectors stored for Q accumulation
+                std::vector<double>              taus(r, 0.0);
+                std::vector<std::vector<double>> hvecs(r);
+
+                for (int k = 0; k < r; k++) {
+                    // ── Pivot: bring the largest-norm remaining column to position k ──
+                    int jmax = k;
+                    for (int j = k + 1; j < n; j++)
+                        if (sqNorms[j] > sqNorms[jmax]) jmax = j;
+                    if (jmax != k) {
+                        for (int i = 0; i < m; i++) std::swap(W(i, k), W(i, jmax));
+                        std::swap(pivots[k],  pivots[jmax]);
+                        std::swap(sqNorms[k], sqNorms[jmax]);
+                    }
+
+                    // ── Householder reflector for column k, rows k:m-1 ──
+                    // Choose alpha opposite in sign to x[0] to avoid cancellation.
+                    double xnorm = 0.0;
+                    for (int i = k; i < m; i++) xnorm += W(i, k) * W(i, k);
+                    xnorm = std::sqrt(xnorm);
+
+                    if (xnorm == 0.0) { hvecs[k].assign(m - k, 0.0); continue; }
+
+                    double alpha = (W(k, k) >= 0.0 ? -1.0 : 1.0) * xnorm;
+                    std::vector<double> v(m - k);
+                    for (int i = 0; i < m - k; i++) v[i] = W(k + i, k);
+                    v[0] -= alpha;  // v = x - alpha*e_1
+
+                    double vTv = 0.0;
+                    for (double vi : v) vTv += vi * vi;
+                    double tau = 2.0 / vTv;
+                    taus[k]  = tau;
+                    hvecs[k] = v;
+
+                    // Apply H_k = I - tau*v*v^T to trailing block W(k:m-1, k:n-1)
+                    for (int j = k; j < n; j++) {
+                        double vTw = 0.0;
+                        for (int i = 0; i < m - k; i++) vTw += v[i] * W(k + i, j);
+                        for (int i = 0; i < m - k; i++) W(k + i, j) -= tau * v[i] * vTw;
+                    }
+
+                    // Bischof-Pan downdate: H_k is orthogonal so column norms are
+                    // preserved; the squared norm below row k shrinks by W(k,j)^2.
+                    for (int j = k + 1; j < n; j++) {
+                        sqNorms[j] -= W(k, j) * W(k, j);
+                        if (sqNorms[j] < 0.0) sqNorms[j] = 0.0;
+                    }
+                }
+
+                // ── Materialise R (upper triangle of the worked array) ──
+                Matrix<double> R(m, n);
+                for (int i = 0; i < m; i++)
+                    for (int j = i; j < n; j++)
+                        R(i, j) = W(i, j);
+
+                // ── Accumulate Q = H_0 * H_1 * … * H_{r-1} ──
+                // Apply reflectors in reverse order to the m×m identity.
+                // At descending step k, columns 0:k-1 of Q are zero in rows k:m-1,
+                // so only columns k:m-1 need updating.
+                Matrix<double> Q(m, m);
+                for (int i = 0; i < m; i++) Q(i, i) = 1.0;
+                for (int k = r - 1; k >= 0; k--) {
+                    if (taus[k] == 0.0) continue;
+                    const auto& v = hvecs[k];
+                    int sz = (int)v.size();
+                    for (int j = k; j < m; j++) {
+                        double vTq = 0.0;
+                        for (int i = 0; i < sz; i++) vTq += v[i] * Q(k + i, j);
+                        for (int i = 0; i < sz; i++) Q(k + i, j) -= taus[k] * v[i] * vTq;
+                    }
+                }
+
+                // ── Materialise P: A*P = Q*R, so P[pivots[k], k] = 1 ──
+                Matrix<datatype> P(n, n);
+                for (int k = 0; k < n; k++) P(pivots[k], k) = datatype(1);
+
+                return std::make_tuple(Q, R, P);
+
+            } catch (const std::exception& e) {
+                std::cerr << "QR factorization error: " << e.what() << '\n';
+                throw;
+            }
+        }
+
+        // Performs LU factorization with partial pivoting (Doolittle's method).
+        // Requires a square matrix of at least 2x2. Throws if singular.
+        // Returns std::tuple<L, U, P> where PA = LU.
+        // Usage: auto [L, U, P] = A.LU();
+        std::tuple<Matrix<double>, Matrix<double>, Matrix<datatype>> LU() const {
+            try {
+                auto [packed, pivotVec] = luPacked();
+                int n = (int)rowSize;
+                auto pat = [&](int i, int j) { return packed[i * n + j]; };
+
+                Matrix<double> L(n, n), U(n, n);
                 for (int i = 0; i < n; i++) {
                     L(i, i) = 1.0;
-                    for (int j = 0; j < i; j++)
-                        L(i, j) = packedAt(i, j);
+                    for (int j = 0; j < i;  j++) L(i, j) = pat(i, j);
+                    for (int j = i; j < n;  j++) U(i, j) = pat(i, j);
                 }
-                return L;
-            }
 
-            // Materialize U: upper triangle including diagonal
-            Matrix<double> getU() const {
-                Matrix<double> U(n, n);
-                for (int i = 0; i < n; i++)
-                    for (int j = i; j < n; j++)
-                        U(i, j) = packedAt(i, j);
-                return U;
-            }
-
-            // Materialize P: permutation matrix such that PA = LU.
-            // 0s and 1s only, so datatype is fine here.
-            Matrix<datatype> getPivot() const {
                 Matrix<datatype> P(n, n);
                 for (int i = 0; i < n; i++) P(i, i) = datatype(1);
                 for (int k = 0; k < n; k++) {
-                    if (pivotVec[k] != k) {
-                        for (int j = 0; j < n; j++) {
-                            datatype tmp = P(k, j);
-                            P(k, j) = P(pivotVec[k], j);
-                            P(pivotVec[k], j) = tmp;
-                        }
-                    }
-                }
-                return P;
-            }
-
-        private:
-            // std::vector<double> avoids the incomplete-type error that arises from
-            // storing Matrix<double> inside a nested class of Matrix<datatype>.
-            std::vector<double> packedData;
-            std::vector<int>    pivotVec;
-            int                 n;
-
-            double packedAt(int i, int j) const { return packedData[i * n + j]; }
-            double& packedAt(int i, int j)       { return packedData[i * n + j]; }
-
-            LUResult(int size, const std::vector<double>& data, const std::vector<int>& pv)
-                : packedData(data), pivotVec(pv), n(size) {}
-
-            // pivotSign() is private — only Matrix::det() needs it
-            int pivotSign() const {
-                int sign = 1;
-                for (int k = 0; k < n; k++)
-                    if (pivotVec[k] != k) sign = -sign;
-                return sign;
-            }
-
-            friend class Matrix;
-        };
-
-        // Performs LU factorization with partial pivoting (Doolittle's method).
-        // Requires a square matrix of at least 2x2.
-        // Returns an LUResult from which L, U, and P can be extracted.
-        // Throws if the matrix is singular (zero pivot encountered).
-        LUResult LU() const {
-            try {
-                if (rowSize != colSize)
-                    throw std::invalid_argument(
-                        "LU: matrix must be square, got " +
-                        std::to_string(rowSize) + "x" + std::to_string(colSize));
-                if (rowSize < 2)
-                    throw std::invalid_argument(
-                        "LU: matrix too small (" +
-                        std::to_string(rowSize) + "x" + std::to_string(colSize) +
-                        "), must be at least 2x2");
-
-                int n = (int)rowSize;
-                // Always work in double — integer types would truncate the L factors.
-                // Store as flat vector to avoid incomplete-type issues with Matrix<double>.
-                std::vector<double> packedData(n * n);
-                for (int i = 0; i < n; i++)
-                    for (int j = 0; j < n; j++)
-                        packedData[i * n + j] = double((*this)(i, j));
-
-                auto pat = [&](int i, int j) -> double& { return packedData[i * n + j]; };
-
-                std::vector<int> pivotVec(n);
-                for (int i = 0; i < n; i++) pivotVec[i] = i;
-
-                for (int k = 0; k < n; k++) {
-                    // Partial pivoting: find row >= k with largest |value| in column k
-                    int maxRow = k;
-                    double maxVal = std::abs(pat(k, k));
-                    for (int i = k + 1; i < n; i++) {
-                        double val = std::abs(pat(i, k));
-                        if (val > maxVal) { maxVal = val; maxRow = i; }
-                    }
-
-                    if (maxVal == 0.0)
-                        throw std::runtime_error(
-                            "LU: zero pivot in column " + std::to_string(k) +
-                            " — matrix is singular");
-
-                    // Swap rows k and maxRow
-                    if (maxRow != k)
+                    if (pivotVec[k] != k)
                         for (int j = 0; j < n; j++)
-                            std::swap(pat(k, j), pat(maxRow, j));
-                    pivotVec[k] = maxRow;
-
-                    // Doolittle: L column below pivot, then update trailing submatrix
-                    for (int i = k + 1; i < n; i++)
-                        pat(i, k) /= pat(k, k);
-                    for (int i = k + 1; i < n; i++)
-                        for (int j = k + 1; j < n; j++)
-                            pat(i, j) -= pat(i, k) * pat(k, j);
+                            std::swap(P(k, j), P(pivotVec[k], j));
                 }
 
-                return LUResult(n, packedData, pivotVec);
+                return std::make_tuple(L, U, P);
             } catch (const std::exception& e) {
                 std::cerr << "LU factorization error: " << e.what() << '\n';
                 throw;
             }
         }
 
-        // Returns the determinant of this matrix via LU factorization.
-        // Requires a square matrix. Integer types are rounded to avoid floating-point drift.
+        // Returns the determinant via LU factorisation.
+        // Integer types are rounded to avoid floating-point drift (e.g. 2.9999 → 3).
         datatype det() const {
             try {
                 if (rowSize != colSize)
                     throw std::invalid_argument(
                         "det() requires a square matrix, got " +
                         std::to_string(rowSize) + "x" + std::to_string(colSize));
-                LUResult lu = this->LU();
-                double d = double(lu.pivotSign());
-                for (long i = 0; i < rowSize; i++)
-                    d *= lu.packedAt(i, i);
-                // For integer matrices the determinant is always a whole number;
-                // round before casting to avoid floating-point drift (e.g. 2.9999 → 3)
+                auto [packed, pivotVec] = luPacked();
+                int n = (int)rowSize;
+                int sign = 1;
+                for (int k = 0; k < n; k++)
+                    if (pivotVec[k] != k) sign = -sign;
+                double d = double(sign);
+                for (int i = 0; i < n; i++) d *= packed[i * n + i];
                 return std::is_integral<datatype>::value
                     ? datatype(std::round(d))
                     : datatype(d);
             } catch (const std::exception& e) {
                 std::cerr << "det() error: " << e.what() << '\n';
+                throw;
+            }
+        }
+
+        // Eigendecomposition via the implicit-shift QR algorithm.
+        // Usage: auto [eigenvalues, Q] = A.eig();
+        //   eigenvalues — n×1 column vector (diagonal of Schur form)
+        //   Q           — n×n orthogonal matrix (eigenvectors for symmetric A,
+        //                 Schur vectors for general A)
+        std::pair<Matrix<double>, Matrix<double>> eig() const {
+            try {
+                if (rowSize != colSize)
+                    throw std::invalid_argument(
+                        "eig: matrix must be square, got " +
+                        std::to_string(rowSize) + "x" + std::to_string(colSize));
+                if (rowSize == 0)
+                    throw std::invalid_argument("eig: matrix must be non-empty");
+                int n = (int)rowSize;
+                auto [H, Qv] = schurDecomp();
+                Matrix<double> eigenvals(n, 1), eigenvecs(n, n);
+                for (int i = 0; i < n; i++) eigenvals(i, 0) = H[i * n + i];
+                for (int i = 0; i < n; i++)
+                    for (int j = 0; j < n; j++)
+                        eigenvecs(i, j) = Qv[i * n + j];
+                return {eigenvals, eigenvecs};
+            } catch (const std::exception& e) {
+                std::cerr << "eig() error: " << e.what() << '\n';
+                throw;
+            }
+        }
+
+        // Computes A^(-1) via LU factorisation and back-substitution.
+        // Solves A * X = I column by column. Requires square, non-singular matrix.
+        Matrix<double> inverse() const {
+            try {
+                if (rowSize != colSize)
+                    throw std::invalid_argument(
+                        "inverse: matrix must be square, got " +
+                        std::to_string(rowSize) + "x" + std::to_string(colSize));
+                auto [packed, pivots] = luPacked();
+                int n = (int)rowSize;
+                Matrix<double> inv(n, n);
+                for (int col = 0; col < n; col++) {
+                    std::vector<double> b(n, 0.0);
+                    b[col] = 1.0;
+                    // Apply row permutations from LU pivoting
+                    for (int i = 0; i < n; i++)
+                        if (pivots[i] != i) std::swap(b[i], b[pivots[i]]);
+                    // Forward substitution: L y = b  (L has unit diagonal)
+                    for (int i = 0; i < n; i++)
+                        for (int j = 0; j < i; j++)
+                            b[i] -= packed[i * n + j] * b[j];
+                    // Backward substitution: U x = y
+                    for (int i = n - 1; i >= 0; i--) {
+                        for (int j = i + 1; j < n; j++)
+                            b[i] -= packed[i * n + j] * b[j];
+                        b[i] /= packed[i * n + i];
+                    }
+                    for (int i = 0; i < n; i++) inv(i, col) = b[i];
+                }
+                return inv;
+            } catch (const std::exception& e) {
+                std::cerr << "inverse() error: " << e.what() << '\n';
                 throw;
             }
         }
@@ -784,6 +972,164 @@ class Matrix{
         long colSize;
         datatype *grid;
 
+        // Computes the real Schur decomposition of this matrix.
+        // Returns {T_flat, Q_flat} where A = Q * T * Q^T,
+        // T is upper (quasi-)triangular and Q is orthogonal (both n×n, row-major double).
+        // Public so that the free pow() function can access it; also useful on its own.
+        public:
+        std::pair<std::vector<double>, std::vector<double>> schurDecomp() const {
+            int n = (int)rowSize;
+            std::vector<double> H(n * n), Q(n * n, 0.0);
+            for (int k = 0; k < n * n; k++) H[k] = double(grid[k]);
+            for (int i = 0; i < n; i++) Q[i * n + i] = 1.0;
+            auto h  = [&](int i, int j) -> double& { return H[i * n + j]; };
+            auto qv = [&](int i, int j) -> double& { return Q[i * n + j]; };
+
+            // ── Hessenberg reduction ──────────────────────────────────────────
+            for (int k = 0; k < n - 2; k++) {
+                double xn = 0.0;
+                for (int i = k + 1; i < n; i++) xn += h(i, k) * h(i, k);
+                xn = std::sqrt(xn);
+                if (xn < 1e-14) continue;
+                int sz = n - k - 1;
+                double alpha = (h(k + 1, k) >= 0.0 ? -1.0 : 1.0) * xn;
+                std::vector<double> v(sz);
+                for (int i = 0; i < sz; i++) v[i] = h(k + 1 + i, k);
+                v[0] -= alpha;
+                double vv = 0.0;
+                for (double vi : v) vv += vi * vi;
+                if (vv < 1e-28) continue;
+                double tau = 2.0 / vv;
+                for (int j = k; j < n; j++) {
+                    double s = 0.0;
+                    for (int i = 0; i < sz; i++) s += v[i] * h(k + 1 + i, j);
+                    for (int i = 0; i < sz; i++) h(k + 1 + i, j) -= tau * v[i] * s;
+                }
+                for (int i = 0; i < n; i++) {
+                    double s = 0.0;
+                    for (int j = 0; j < sz; j++) s += h(i, k + 1 + j) * v[j];
+                    for (int j = 0; j < sz; j++) h(i, k + 1 + j) -= tau * v[j] * s;
+                }
+                for (int i = 0; i < n; i++) {
+                    double s = 0.0;
+                    for (int j = 0; j < sz; j++) s += qv(i, k + 1 + j) * v[j];
+                    for (int j = 0; j < sz; j++) qv(i, k + 1 + j) -= tau * v[j] * s;
+                }
+            }
+
+            // ── QR iteration with Wilkinson shift and deflation ───────────────
+            const double eps = std::numeric_limits<double>::epsilon();
+            int maxSteps = 30 * n, ihi = n - 1;
+            while (ihi >= 1) {
+                int ilo = ihi;
+                while (ilo > 0 &&
+                       std::abs(h(ilo, ilo - 1)) >
+                       eps * (std::abs(h(ilo - 1, ilo - 1)) + std::abs(h(ilo, ilo))))
+                    ilo--;
+                if (ilo == ihi) { ihi--; continue; }
+                if (maxSteps-- < 0)
+                    throw std::runtime_error("schurDecomp: QR iteration did not converge");
+                double a = h(ihi-1,ihi-1), b = h(ihi-1,ihi);
+                double c = h(ihi,ihi-1),   d = h(ihi,ihi);
+                double tr2 = (a+d)/2.0, disc = tr2*tr2 - (a*d - b*c);
+                double sigma = (disc >= 0.0)
+                    ? (std::abs(tr2+std::sqrt(disc)-d) < std::abs(tr2-std::sqrt(disc)-d)
+                       ? tr2+std::sqrt(disc) : tr2-std::sqrt(disc))
+                    : d;
+                int sz = ihi - ilo + 1;
+                std::vector<double> tv(sz, 0.0);
+                std::vector<std::vector<double>> hv(sz);
+                for (int i = ilo; i <= ihi; i++) h(i,i) -= sigma;
+                for (int k = ilo; k < ihi; k++) {
+                    int ki = k-ilo, rows = ihi-k+1;
+                    double xn = 0.0;
+                    for (int i = k; i <= ihi; i++) xn += h(i,k)*h(i,k);
+                    xn = std::sqrt(xn);
+                    if (xn < 1e-14) { hv[ki].assign(rows,0.0); continue; }
+                    double alpha = (h(k,k)>=0.0?-1.0:1.0)*xn;
+                    std::vector<double> v(rows);
+                    for (int i = 0; i < rows; i++) v[i] = h(k+i,k);
+                    v[0] -= alpha;
+                    double vv = 0.0;
+                    for (double vi : v) vv += vi*vi;
+                    if (vv < 1e-28) { hv[ki].assign(rows,0.0); continue; }
+                    double tau = 2.0/vv;
+                    tv[ki] = tau; hv[ki] = v;
+                    for (int j = k; j < n; j++) {
+                        double s = 0.0;
+                        for (int i = 0; i < rows; i++) s += v[i]*h(k+i,j);
+                        for (int i = 0; i < rows; i++) h(k+i,j) -= tau*v[i]*s;
+                    }
+                }
+                for (int ki = 0; ki < sz-1; ki++) {
+                    int k = ilo+ki;
+                    if (tv[ki] == 0.0) continue;
+                    const auto& v = hv[ki];
+                    int rows = (int)v.size();
+                    for (int i = 0; i < n; i++) {
+                        double s = 0.0;
+                        for (int j = 0; j < rows; j++) s += h(i,k+j)*v[j];
+                        for (int j = 0; j < rows; j++) h(i,k+j) -= tv[ki]*v[j]*s;
+                    }
+                    for (int i = 0; i < n; i++) {
+                        double s = 0.0;
+                        for (int j = 0; j < rows; j++) s += qv(i,k+j)*v[j];
+                        for (int j = 0; j < rows; j++) qv(i,k+j) -= tv[ki]*v[j]*s;
+                    }
+                }
+                for (int i = ilo; i <= ihi; i++) h(i,i) += sigma;
+                if (std::abs(h(ihi,ihi-1)) <= eps*(std::abs(h(ihi-1,ihi-1))+std::abs(h(ihi,ihi)))) {
+                    h(ihi,ihi-1) = 0.0;
+                    ihi--;
+                }
+            }
+            return {H, Q};
+        }
+
+        // Shared Doolittle factorisation used by both LU() and det().
+        // Returns {packedData, pivotVec} — packed lower/upper triangle + row-swap record.
+        std::pair<std::vector<double>, std::vector<int>> luPacked() const {
+            if (rowSize != colSize)
+                throw std::invalid_argument(
+                    "LU: matrix must be square, got " +
+                    std::to_string(rowSize) + "x" + std::to_string(colSize));
+            if (rowSize < 2)
+                throw std::invalid_argument(
+                    "LU: matrix must be at least 2x2, got " +
+                    std::to_string(rowSize) + "x" + std::to_string(colSize));
+
+            int n = (int)rowSize;
+            std::vector<double> packed(n * n);
+            for (int k = 0; k < n * n; k++) packed[k] = double(grid[k]);
+
+            auto pat = [&](int i, int j) -> double& { return packed[i * n + j]; };
+
+            std::vector<int> pivotVec(n);
+            for (int i = 0; i < n; i++) pivotVec[i] = i;
+
+            for (int k = 0; k < n; k++) {
+                int maxRow = k;
+                double maxVal = std::abs(pat(k, k));
+                for (int i = k + 1; i < n; i++) {
+                    double v = std::abs(pat(i, k));
+                    if (v > maxVal) { maxVal = v; maxRow = i; }
+                }
+                if (maxVal == 0.0)
+                    throw std::runtime_error(
+                        "LU: zero pivot in column " + std::to_string(k) +
+                        " — matrix is singular");
+                if (maxRow != k)
+                    for (int j = 0; j < n; j++)
+                        std::swap(pat(k, j), pat(maxRow, j));
+                pivotVec[k] = maxRow;
+                for (int i = k + 1; i < n; i++) pat(i, k) /= pat(k, k);
+                for (int i = k + 1; i < n; i++)
+                    for (int j = k + 1; j < n; j++)
+                        pat(i, j) -= pat(i, k) * pat(k, j);
+            }
+            return {packed, pivotVec};
+        }
+
         // Crossover point: matrices smaller than this use naive O(n³) multiplication.
         // 64 is a common empirical choice — below this the Strassen overhead outweighs
         // the asymptotic benefit.
@@ -796,16 +1142,27 @@ class Matrix{
             return p;
         }
 
-        // Naive O(n³) matrix multiplication (i-k-j loop order for cache friendliness).
+        // Cache-blocked, OpenMP-parallelised matrix multiplication.
+        // Tile size: 64 elements × sizeof(datatype) fits comfortably in L1 cache.
+        // Each outer ii-tile is an independent OpenMP task, so cores don't share work.
         // Used as the base case for Strassen-Winograd and for rectangular matrices.
         static Matrix naiveMul(const Matrix& A, const Matrix& B) {
-            Matrix ans(A.rowSize, B.colSize);
-            for (long i = 0; i < A.rowSize; i++)
-                for (long k = 0; k < A.colSize; k++) {
-                    const datatype aik = A.grid[i * A.colSize + k];
-                    for (long j = 0; j < B.colSize; j++)
-                        ans.grid[i * B.colSize + j] += aik * B.grid[k * B.colSize + j];
-                }
+            const long M  = A.rowSize;
+            const long K  = A.colSize;
+            const long N  = B.colSize;
+            Matrix ans(M, N);
+            constexpr long BLOCK = 64;
+
+            #pragma omp parallel for schedule(dynamic) shared(ans)
+            for (long ii = 0; ii < M; ii += BLOCK)
+                for (long kk = 0; kk < K; kk += BLOCK)
+                    for (long jj = 0; jj < N; jj += BLOCK)
+                        for (long i = ii; i < std::min(ii + BLOCK, M); i++)
+                            for (long k = kk; k < std::min(kk + BLOCK, K); k++) {
+                                const datatype aik = A.grid[i * K + k];
+                                for (long j = jj; j < std::min(jj + BLOCK, N); j++)
+                                    ans.grid[i * N + j] += aik * B.grid[k * N + j];
+                            }
             return ans;
         }
 
@@ -946,6 +1303,196 @@ class Matrix{
             return C;
         }
 };
+
+// pow(A, p) — matrix power A^p (not element-wise; use A.pow(p) for that).
+//
+// Integer p  — binary exponentiation using operator* (Strassen-accelerated).
+//              Negative integers use A.inverse() then repeated squaring.
+//
+// Real p     — Higham Schur-Padé algorithm:
+//   1. Schur decompose:  A = Q T Q^T
+//   2. Compute T^p via Parlett recurrence on the upper triangular T
+//      (diagonal entries λᵢ^p; super-diagonals via the commutativity equation T·F = F·T)
+//   3. Return Q * T^p * Q^T
+//
+// Requires square matrix. For real p, all eigenvalues must be positive
+// (negative eigenvalues with non-integer p yield complex results — an exception is thrown).
+//
+// Usage: auto Ahalf = pow(A, 0.5);   // matrix square root
+//        auto Ainv  = pow(A, -1);    // same as A.inverse()
+//        auto A3    = pow(A, 3);     // A * A * A  via binary squaring
+template<typename datatype, typename scalar>
+Matrix<double> pow(const Matrix<datatype>& A, scalar p) {
+    if (A.rows() != A.cols())
+        throw std::invalid_argument(
+            "pow: matrix must be square, got " +
+            std::to_string(A.rows()) + "x" + std::to_string(A.cols()));
+    int n = (int)A.rows();
+
+    // Convert to double for consistent arithmetic
+    Matrix<double> Ad(n, n);
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+            Ad(i, j) = double(A(i, j));
+
+    auto identity = [&]() {
+        Matrix<double> I(n, n);
+        for (int i = 0; i < n; i++) I(i, i) = 1.0;
+        return I;
+    };
+
+    // ── Integer fast path: binary exponentiation ──────────────────────────────
+    long ip = (long)std::round(double(p));
+    if (std::abs(double(p) - double(ip)) < 1e-9) {
+        if (ip == 0) return identity();
+        if (ip == 1) return Ad;
+        Matrix<double> base = (ip < 0) ? Ad.inverse() : Ad;
+        Matrix<double> result = identity();
+        for (long exp = std::abs(ip); exp > 0; exp >>= 1) {
+            if (exp & 1) result = result * base;
+            if (exp > 1) base = base * base;
+        }
+        return result;
+    }
+
+    // ── Real power: Schur-Padé via Parlett recurrence ─────────────────────────
+    // Step 1: Schur decompose Ad = Q * T * Q^T
+    auto [Tv, Qv] = Ad.schurDecomp();
+    auto T  = [&](int i, int j) -> double  { return Tv[i * n + j]; };
+    auto Qm = [&](int i, int j) -> double  { return Qv[i * n + j]; };
+
+    // Step 2: Parlett recurrence for F = T^p (upper triangular)
+    // Diagonal: F[i,i] = T[i,i]^p  (eigenvalue must be positive for real result)
+    std::vector<double> F(n * n, 0.0);
+    auto f = [&](int i, int j) -> double& { return F[i * n + j]; };
+
+    for (int i = 0; i < n; i++) {
+        double lam = T(i, i);
+        if (lam <= 0.0)
+            throw std::domain_error(
+                "pow: eigenvalue " + std::to_string(lam) +
+                " is non-positive — real matrix power undefined for non-integer exponent");
+        f(i, i) = std::pow(lam, double(p));
+    }
+
+    // Super-diagonals via commutativity equation T·F = F·T → Parlett recurrence.
+    // For distinct eigenvalues (|λᵢ - λⱼ| > ε):
+    //   F[i,j] = (T[i,j]·(F[i,i]−F[j,j]) + Σ_{k=i+1}^{j-1}(F[i,k]·T[k,j] − T[i,k]·F[k,j]))
+    //            / (T[i,i] − T[j,j])
+    // For repeated eigenvalues (|λᵢ−λⱼ| < relative eps), the standard formula
+    // has a near-zero denominator. Use the L'Hôpital limit instead:
+    //   lim_{λⱼ→λᵢ} (f(λᵢ)−f(λⱼ))/(λᵢ−λⱼ) = f'(λᵢ) = p·λᵢ^(p−1)
+    // This is exact for adjacent super-diagonals (d=1) and a good approximation
+    // for d>1 because when eigenvalues are equal the inner sum is also zero.
+    for (int d = 1; d < n; d++) {
+        for (int i = 0; i < n - d; i++) {
+            int j = i + d;
+            double num = T(i, j) * (f(i, i) - f(j, j));
+            for (int k = i + 1; k < j; k++)
+                num += f(i, k) * T(k, j) - T(i, k) * f(k, j);
+            double denom = T(i, i) - T(j, j);
+            double scale = std::max(std::abs(T(i, i)), std::abs(T(j, j)));
+            if (std::abs(denom) > std::numeric_limits<double>::epsilon() * 1e4 * scale)
+                f(i, j) = num / denom;
+            else
+                f(i, j) = T(i, j) * double(p) * std::pow(T(i, i), double(p) - 1.0);
+        }
+    }
+
+    // Step 3: A^p = Q·F·Qᵀ  —  two O(n³) multiplications, not one O(n⁴) loop
+    Matrix<double> Fm(n, n), Qmat(n, n);
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++) {
+            Fm(i, j)   = f(i, j);
+            Qmat(i, j) = Qm(i, j);
+        }
+    return Qmat * Fm * Qmat.T();
+}
+
+// log(A, base) — matrix logarithm in an arbitrary base (free function).
+// Distinct from A.log(base) which is the element-wise member function.
+//
+// Algorithm: Schur-Padé with f(x) = ln(x) / ln(base)
+//   1. Schur decompose:  A = Q T Qᵀ
+//   2. Compute F = ln(T) via Parlett recurrence on upper triangular T:
+//        diagonal:       F[i,i] = ln(T[i,i])           (eigenvalue must be > 0)
+//        super-diagonals: same recurrence as pow() with f'(λ) = 1/λ
+//   3. Return Q · (F / ln(base)) · Qᵀ
+//
+// For symmetric (diagonalizable) A the Schur form is diagonal, so Parlett
+// collapses to element-wise log on the eigenvalues — exact with no extra cost.
+//
+// Requires: square matrix, all eigenvalues positive, base > 0 and base ≠ 1.
+// Usage: auto L2 = log(A, 2.0);   // log base-2 of matrix A
+//        auto Le = log(A, M_E);   // natural matrix logarithm
+template<typename datatype, typename scalar>
+Matrix<double> log(const Matrix<datatype>& A, scalar base) {
+    if (A.rows() != A.cols())
+        throw std::invalid_argument(
+            "log: matrix must be square, got " +
+            std::to_string(A.rows()) + "x" + std::to_string(A.cols()));
+    if (double(base) <= 0.0 || double(base) == 1.0)
+        throw std::invalid_argument("log: base must be positive and not equal to 1");
+
+    int n = (int)A.rows();
+    Matrix<double> Ad(n, n);
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+            Ad(i, j) = double(A(i, j));
+
+    // ── Schur decompose: A = Q T Qᵀ ─────────────────────────────────────────
+    auto [Tv, Qv] = Ad.schurDecomp();
+    auto T  = [&](int i, int j) { return Tv[i * n + j]; };
+    auto Qm = [&](int i, int j) { return Qv[i * n + j]; };
+
+    // ── Parlett recurrence for F = ln(T), f(x)=ln(x), f'(x)=1/x ────────────
+    std::vector<double> F(n * n, 0.0);
+    auto f = [&](int i, int j) -> double& { return F[i * n + j]; };
+
+    for (int i = 0; i < n; i++) {
+        double lam = T(i, i);
+        if (lam <= 0.0)
+            throw std::domain_error(
+                "log: eigenvalue " + std::to_string(lam) +
+                " is non-positive — matrix logarithm is not real-valued");
+        f(i, i) = std::log(lam);
+    }
+
+    for (int d = 1; d < n; d++) {
+        for (int i = 0; i < n - d; i++) {
+            int j = i + d;
+            double num = T(i, j) * (f(i, i) - f(j, j));
+            for (int k = i + 1; k < j; k++)
+                num += f(i, k) * T(k, j) - T(i, k) * f(k, j);
+            double denom = T(i, i) - T(j, j);
+            double scale = std::max(std::abs(T(i, i)), std::abs(T(j, j)));
+            if (std::abs(denom) > std::numeric_limits<double>::epsilon() * 1e4 * scale)
+                f(i, j) = num / denom;
+            else
+                f(i, j) = T(i, j) / T(i, i);   // f'(λ) = 1/λ for ln
+        }
+    }
+
+    // ── A^log = Q · (F/ln(base)) · Qᵀ  ─────────────────────────────────────
+    double logBase = std::log(double(base));
+    Matrix<double> Fm(n, n), Qmat(n, n);
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++) {
+            Fm(i, j)   = f(i, j) / logBase;
+            Qmat(i, j) = Qm(i, j);
+        }
+    return Qmat * Fm * Qmat.T();
+}
+
+// tr(A) — sum of the main diagonal elements. Mirrors mathematical notation.
+template<typename datatype>
+datatype tr(const Matrix<datatype>& A) { return A.tr(); }
+
+// det(A) — determinant. Mirrors mathematical notation.
+template<typename datatype>
+datatype det(const Matrix<datatype>& A) { return A.det(); }
+
+
 
 // Scalar multiplication with scalar on the left: k * A.
 // Complements the member operator A * k so both orderings work.
