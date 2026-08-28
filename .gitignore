@@ -1,0 +1,25 @@
+# Compiled binaries (these were previously committed — remove them from the
+# index with:  git rm --cached Running_time test test_noomp running_time)
+Running_time
+running_time
+test
+test_noomp
+*.o
+*.out
+a.out
+
+validate
+numpy_validate
+
+# Benchmark and validation output — regenerate with the commands in README.md
+bench/
+validation/
+plots/ops/
+plots/julia/
+plots/summary_*.png
+rt_*.txt
+running_time.txt
+numpy_running_time.txt
+
+# Julia
+Manifest.toml

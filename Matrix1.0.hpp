@@ -12,15 +12,701 @@
 #include <algorithm>   // std::min
 #include <limits>      // std::numeric_limits
 #include <tuple>       // std::tuple, std::make_tuple
+#include <type_traits> // std::is_floating_point, std::enable_if, std::false_type
+#include <complex>     // std::complex, std::conj — see COMPLEX NUMBER SUPPORT below
+#include <utility>     // std::pair, std::swap
+#include <cstddef>     // std::size_t
+#include <cstdint>     // std::uintptr_t
+#if defined(__linux__) && !defined(MATRIXCPP_NO_HUGEPAGE)
+#  include <sys/mman.h>   // madvise, MADV_HUGEPAGE — see adviseHuge()
+#endif
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+
+// ─── Global tolerances ──────────────────────────────────────────────────────
+// Default cap on the number of terms the Taylor-series matrix functions
+// (exp, sin, cos, sinh, cosh) will evaluate. It is only a cap: every one of
+// those functions scales its argument first and then stops as soon as the
+// terms stop contributing, which in practice happens after 15-25 terms. Raise
+// it only if you deliberately disable scaling — see TaylorOpts below.
+const static long taylor_limit = 300;
+
+// ─── Scalar type traits ─────────────────────────────────────────────────────
+// is_complex<T>  — true only for std::complex<U>
+// real_of<T>     — the underlying real type: double for complex<double>, T otherwise
+// These let one body serve both real and complex datatypes via `if constexpr`,
+// which is what makes conj()/real()/imag()/H() below degrade gracefully instead
+// of failing to compile on Matrix<double>.
+template<class T> struct is_complex                  : std::false_type {};
+template<class T> struct is_complex<std::complex<T>> : std::true_type  {};
+
+template<class T> struct real_of                     { using type = T; };
+template<class T> struct real_of<std::complex<T>>    { using type = T; };
+template<class T> using  real_t = typename real_of<T>::type;
+
+// True for the types toLines() should format with fixed/setprecision.
+// std::is_floating_point<std::complex<double>> is FALSE, which is why this
+// wrapper exists — see roadmap item 5.
+template<class T> struct is_float_like
+    : std::integral_constant<bool,
+        std::is_floating_point<T>::value ||
+        (is_complex<T>::value && std::is_floating_point<real_t<T>>::value)> {};
+
+// Tells the compiler that two pointers cannot address the same memory. Without
+// it, a loop reading through two pointers and writing through a third has to
+// assume they may overlap, which blocks vectorisation.
+#if defined(__GNUC__) || defined(__clang__)
+#  define MATRIXCPP_RESTRICT __restrict__
+#elif defined(_MSC_VER)
+#  define MATRIXCPP_RESTRICT __restrict
+#else
+#  define MATRIXCPP_RESTRICT
+#endif
+
+// Magnitude of a scalar as a plain double, for any supported datatype.
+// std::abs on a complex already returns the real modulus, so this is a single
+// spelling that works for int, double and complex alike.
+template<class T>
+inline double magnitude(const T& x) { return double(std::abs(x)); }
+
+// |x|^2, computed without ever taking a square root. std::abs on a complex
+// evaluates sqrt(re*re + im*im), so squaring that result computes a square root
+// only to undo it — pure waste in the Frobenius norm, which wants the sum of
+// squared magnitudes. std::norm is exactly re*re + im*im.
+template<class T>
+inline double magnitudeSq(const T& x) {
+    if constexpr (is_complex<T>::value) return double(std::norm(x));
+    else { const double d = double(x); return d * d; }
+}
+
+// Largest absolute component: |x| for a real, max(|re|, |im|) for a complex.
+// Used to decide whether squaring is safe BEFORE any squaring happens — testing
+// the square would be too late, since that is the operation that overflows.
+// Costs a bit-mask and a compare; unlike std::abs on a complex it takes no
+// square root.
+template<class T>
+inline double maxComponent(const T& x) {
+    if constexpr (is_complex<T>::value) {
+        const double a = std::fabs(double(x.real())), b = std::fabs(double(x.imag()));
+        return a > b ? a : b;
+    } else {
+        return std::fabs(double(x));
+    }
+}
+
+// Pairwise summation, following the algorithm NumPy uses for every one of its
+// sum/mean reductions (pairwise_sum_@TYPE@ in numpy/_core/src/umath/loops.c.src).
+// Two problems with the obvious `for (i) acc += a[i]` loop, and this fixes both:
+//
+//   Speed.    A single accumulator makes every add depend on the one before it,
+//             so the loop runs at the LATENCY of a floating-point add (~4 cycles)
+//             rather than its throughput, and cannot vectorise at all. The eight
+//             independent partial sums in the 128-element base case keep both FMA
+//             ports busy and give the vectoriser something to widen.
+//   Accuracy. Sequential summation accumulates rounding error as O(n·eps); the
+//             recursive halving here makes it O(log n · eps), because no partial
+//             sum ever grows large relative to the terms still being added to it.
+//
+// The block size (128) and the unroll (8) are NumPy's; the recursion trims the
+// split point to a multiple of 8 so the base case always sees whole groups.
+template<class T>
+inline T pairwiseSum(const T* MATRIXCPP_RESTRICT a, long n) {
+    if (n < 8) {
+        T r = T(0);
+        for (long i = 0; i < n; i++) r += a[i];
+        return r;
+    }
+    if (n <= 128) {
+        T r0 = a[0], r1 = a[1], r2 = a[2], r3 = a[3],
+          r4 = a[4], r5 = a[5], r6 = a[6], r7 = a[7];
+        long i = 8;
+        for (; i + 7 < n; i += 8) {
+            r0 += a[i];     r1 += a[i + 1]; r2 += a[i + 2]; r3 += a[i + 3];
+            r4 += a[i + 4]; r5 += a[i + 5]; r6 += a[i + 6]; r7 += a[i + 7];
+        }
+        for (; i < n; i++) r0 += a[i];
+        return ((r0 + r1) + (r2 + r3)) + ((r4 + r5) + (r6 + r7));
+    }
+    // Recurse for scalar element types only. Measured on 4M elements:
+    //
+    //                        double    complex<double>
+    //     4 accumulators     0.642 ms      0.940 ms
+    //     8 accumulators     ~0.40 ms      0.899 ms
+    //     recursive pairwise  0.404 ms     2.895 ms
+    //
+    // For double the split is a clear win. For complex it is a 3x LOSS, and
+    // stays a loss at every base-case size tried up to 16384, so the recursion
+    // is skipped entirely there and the flat eight-accumulator pass above
+    // handles the whole array. The likely cause is that a complex add is not a
+    // single vector instruction, so the block boundaries interrupt a loop that
+    // was already only just keeping up with L3 bandwidth (a 4M complex array is
+    // 64 MB, exactly this machine's L3). Accuracy for complex therefore stays at
+    // the O(n·eps) of the previous four-accumulator version rather than
+    // improving to O(log n · eps) — worth knowing, and the reason this is a
+    // deliberate branch and not an oversight.
+    if constexpr (is_complex<T>::value) {
+        T r0 = a[0], r1 = a[1], r2 = a[2], r3 = a[3],
+          r4 = a[4], r5 = a[5], r6 = a[6], r7 = a[7];
+        long i = 8;
+        for (; i + 7 < n; i += 8) {
+            r0 += a[i];     r1 += a[i + 1]; r2 += a[i + 2]; r3 += a[i + 3];
+            r4 += a[i + 4]; r5 += a[i + 5]; r6 += a[i + 6]; r7 += a[i + 7];
+        }
+        for (; i < n; i++) r0 += a[i];
+        return ((r0 + r1) + (r2 + r3)) + ((r4 + r5) + (r6 + r7));
+    } else {
+        long half = n / 2;
+        half -= half % 8;
+        return pairwiseSum(a, half) + pairwiseSum(a + half, n - half);
+    }
+}
+
+// Sum of squares, with the same pairwise structure and for the same two reasons
+// (eight independent chains, O(log n · eps) error growth). Kept separate rather
+// than expressed as pairwiseSum of a squared range so that no temporary buffer
+// is needed: every caller wants this over a vector it already has.
+inline double pairwiseSum_sq(const double* MATRIXCPP_RESTRICT a, long n) {
+    if (n < 8) {
+        double r = 0.0;
+        for (long i = 0; i < n; i++) r += a[i] * a[i];
+        return r;
+    }
+    if (n <= 128) {
+        double r0 = a[0]*a[0], r1 = a[1]*a[1], r2 = a[2]*a[2], r3 = a[3]*a[3],
+               r4 = a[4]*a[4], r5 = a[5]*a[5], r6 = a[6]*a[6], r7 = a[7]*a[7];
+        long i = 8;
+        for (; i + 7 < n; i += 8) {
+            r0 += a[i]*a[i];         r1 += a[i+1]*a[i+1];
+            r2 += a[i+2]*a[i+2];     r3 += a[i+3]*a[i+3];
+            r4 += a[i+4]*a[i+4];     r5 += a[i+5]*a[i+5];
+            r6 += a[i+6]*a[i+6];     r7 += a[i+7]*a[i+7];
+        }
+        for (; i < n; i++) r0 += a[i]*a[i];
+        return ((r0 + r1) + (r2 + r3)) + ((r4 + r5) + (r6 + r7));
+    }
+    long half = n / 2;
+    half -= half % 8;
+    return pairwiseSum_sq(a, half) + pairwiseSum_sq(a + half, n - half);
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ROADMAP — where the project is at
+//
+// Naming convention already in use (keep it):
+//   A.f()   member function  → ELEMENT-WISE   (A.pow(2), A.ln(), A.exp())
+//   f(A)    free function    → MATRIX-WISE    (pow(A,2), log(A,base))
+//   Operators are element-wise EXCEPT operator*(Matrix), which is matmul.
+//   operator() is indexing/slicing, not arithmetic.
+//
+// Everything claimed below is checked by validate.cpp — build and run it before
+// trusting any of it:
+//     g++ -std=c++17 -O2 -fopenmp -o validate validate.cpp && ./validate
+//
+// DONE
+//   [x] solve, norm, rank            — solve covers square (LU) and over-determined
+//                                       (least squares via column-pivoted QR);
+//                                       inverse() is now solve(I), one copy of the
+//                                       substitution code rather than two
+//   [x] cholesky                     — SPD, with the failed-pivot case doubling as
+//                                       the positive-definiteness test
+//   [x] svd, pinv, cond              — svd is one-sided Jacobi, chosen over
+//                                       bidiagonalise-then-QR for its relative
+//                                       accuracy on small singular values, which is
+//                                       what cond() and pinv() actually depend on
+//   [x] diag, triu, tril, reshape    — plus the free diag(v) that goes the other way
+//   [x] min/max/mean/var/stddev/argmin/argmax  — scalar and axis forms, mirroring sum(bool)
+//   [x] ==, !=, allclose, unary -    — and operator+=; operator+/-/| are now const,
+//                                       so they work on const operands
+//   [x] adjugate                     — det*inverse when non-singular, cofactor
+//                                       expansion when not
+//   [x] exp(A) matrix exponential    — scaling-and-squaring around a Taylor series
+//   [x] sin/cos/tan/sinh/cosh/tanh   — element-wise members and matrix-wise free fns.
+//                                       tan/tanh are SOLVES (cos(A)·X = sin(A)), not
+//                                       the element-wise division they look like
+//   [x] conj(), real(), imag(), H()  — see COMPLEX below
+//   [x] Caller-supplied series limits on every Taylor-based function, via TaylorOpts
+//
+// THE 2x2 SCHUR BLOCK — resolved, and it was worse than previously recorded.
+//   The old note said eig() *read* complex-conjugate pairs wrongly. It did, but
+//   schurDecomp() also never CONVERGED on them: a conjugate pair's sub-diagonal
+//   entry does not go to zero (that is the definition of a real Schur form), so
+//   the iteration ran to its step limit and threw. A plain rotation matrix was
+//   enough. Fixed in schurDecomp() by deflating an isolated trailing 2x2 as a
+//   block, splitting it with a Givens rotation when its roots turn out to be real,
+//   and adding an exceptional shift for stalled blocks.
+//   Consequences:
+//     - eigvals() returns every eigenvalue including complex ones, block-aware.
+//     - eig() stays real-valued but now THROWS on a conjugate pair instead of
+//       silently returning the real part twice.
+//     - The matrix trig functions never needed this: they sum a Taylor series and
+//       so avoid the Schur form entirely. pow()/log() still go through it and
+//       still require positive eigenvalues.
+//
+// COMPLEX NUMBER SUPPORT — Matrix<std::complex<double>>, via <complex> only.
+// Status as measured, not guessed (see the probe in validate.cpp):
+//   WORKING: constructors, =, + - * / %, matmul incl. Strassen, T(), H(), conj(),
+//     real(), imag(), tr(), sum(), IsDiagonal(), slicing/proxies, set_Ran_values(),
+//     concat, tensor, reshape/triu/tril/diag, ==/!=/allclose, unary -,
+//     norm() (all of Fro/One/Inf — std::abs already gives the complex modulus),
+//     and operator<< now formats properly.
+//   REFUSED AT COMPILE TIME, deliberately: min/max/argmin/argmax (complex has no
+//     ordering) and mean/var/stddev, svd, cholesky, and the Taylor matrix
+//     functions. Each of those would otherwise compile by taking std::real() of
+//     every entry and quietly discarding the imaginary part — a wrong answer
+//     dressed as a working one. They static_assert with an explanation instead.
+//   STILL TO DO: det, inverse, solve, LU, QR, eig, schurDecomp, pow, log. All of
+//     them fail on the same single construct, double(grid[k]).
+//
+//   [ ] 1. Replace the double(...) casts using the work_t idea. real_of/is_complex
+//          already exist at the top of this header; what is missing is
+//            work_t = std::complex<double> when datatype is complex, else double
+//          plus turning the std::vector<double> scratch buffers into
+//          std::vector<work_t> and widening the return types to Matrix<work_t>.
+//          Real matrices are unaffected because work_t collapses to double.
+//   [x] 2. conj(), real(), imag(), H() — done. H() is the one that matters: for
+//          complex matrices it, not T(), is the adjoint. NOTE the corollary is
+//          still outstanding — Q^T in QR, Q*T*Q^T in schurDecomp and every symmetry
+//          check in this header still call .T(), and each must become .H() when
+//          item 1 lands. Every one of those is a SILENT wrong answer if missed; it
+//          compiles perfectly, it is just not the right matrix.
+//   [ ] 3. Householder reflectors need their complex form. The real code picks
+//          alpha = -sign(x_1)*||x||; the complex version is
+//          alpha = -exp(i*arg(x_1))*||x||, and tau becomes complex. This is a
+//          genuine algorithm change, not a type substitution. Same for the
+//          Givens rotations and the Wilkinson shift inside schurDecomp.
+//   [ ] 4. Pivoting is fine as written — std::abs() on a complex returns the
+//          real magnitude, so the LU pivot search keeps working and keeps
+//          meaning the right thing. Explicit sign tests like (W(k,k) >= 0.0) do
+//          NOT survive; complex has no ordering. Those are the lines to hunt,
+//          and split2x2()'s (half >= 0.0) is now one of them.
+//   [x] 5. Printing — toLines() now tests is_float_like<datatype>, which is true
+//          for complex<double> where std::is_floating_point is false.
+//   [x] 6. Complex eig() — eigvals() delivers this; see THE 2x2 SCHUR BLOCK above.
+//
+// The imaginary unit. This works — verified, C++17, no third-party anything:
+//     inline constexpr std::complex<double> i(0.0, 1.0);
+//     auto z = 3.0 + 4.0*i;   // (3,4)
+// Two things to weigh before committing to the name `i` specifically:
+//   - Nearly every loop in this header uses `i` as its counter, and a local
+//     declaration shadows the global. It still COMPILES (the loop wins, harmlessly)
+//     but it means `i` is unusable as the imaginary unit inside almost any
+//     function you would want to write matrix code in. -Wshadow lights up on
+//     every one; the current build line does not enable it, so it would be quiet.
+//   - The standard already ships this, since C++14, with no global and no
+//     collision:  using namespace std::complex_literals;  then  3.0 + 4.0i
+//     That is <complex> only, so it costs nothing against the no-third-party goal.
+// A namespaced constant (cx::i) is the middle option if a named symbol is wanted.
+//
+// BUILD FLAG WARNING — this one is specific to the current compile line.
+// -ffast-math enables -fcx-limited-range (verified with -Q --help=optimizers on
+// this toolchain: disabled at -O3, enabled once -ffast-math is added). That
+// switches complex multiply and divide to the naive textbook formulas with no
+// range reduction, so complex division can overflow or underflow spuriously on
+// operands that are individually well within double's range. Drop -ffast-math,
+// or add -fno-cx-limited-range, before trusting any complex benchmark numbers.
+//
+// Also outstanding (not code):
+//   [x] .gitignore — added; the committed binaries still need `git rm --cached`
+//   [x] rt_mat_pow_real.txt was empty — root cause found and fixed. It was not a
+//       benchmark-harness problem at all: Strassen-Winograd was computing wrong
+//       products (see below), so B.T()*B came back non-symmetric with negative
+//       eigenvalues, pow(A,0.5) threw on the first size that used the padded
+//       Strassen path (n=86), and the program aborted before flushing the file.
+//   [x] README now documents the build line and the member/free convention
+//   [ ] The committed rt_*.txt timings predate the Strassen fix. The fix does not
+//       change the operation count, so the timings should still stand, but they
+//       were measured against a path that returned wrong answers — worth a rerun
+//       before they are quoted anywhere.
+//
+// STRASSEN-WINOGRAD — was silently wrong, now correct but compiled OUT.
+//   Two errors in the combination table (T4 had its operands reversed, and U7
+//   used the wrong pair of intermediates) meant operator* returned incorrect
+//   products for EVERY size that actually entered the recursion. It went
+//   unnoticed because n=64 hits the base case and falls straight back to
+//   naiveMul, so the recursion first ran for real at n=128. validate.cpp now
+//   checks operator* against a reference product at every size class.
+//   Once correct, it was benchmarked against the same blocked naive multiply
+//   and lost at every size (0.43x at n=128, 0.11x at n=1024) — the recursion is
+//   serial where naiveMul is OpenMP-parallel, and it allocates ~20 temporaries
+//   per level. It is therefore behind MATRIXCPP_ENABLE_STRASSEN and off by
+//   default; see the note at operator*(Matrix) for what would make it pay.
+//
+// PERFORMANCE WORK ALREADY DONE (all measured, all still green in validate.cpp
+// and numpy_validate.py):
+//   [x] NRVO — returning a local declared inside a try block suppresses the
+//       named return value optimisation, adding a full allocate-zero-copy of the
+//       result. 9x on Hadamard and element-wise division. The rule this leaves
+//       behind: keep the try around the CHECKS, not around the result.
+//   [x] Element-wise ops build into an uninitialised buffer in one pass instead
+//       of copy-then-modify. 1.6-2.1x.
+//   [x] schurDecomp QR step uses Givens rotations, exploiting the Hessenberg
+//       structure the previous full-length Householders ignored: O(n^4) -> O(n^3),
+//       and Q accumulates transposed so its updates are contiguous. 107x on eig,
+//       ~90x on pow(A,real) and log(A).
+//   [x] QR accumulates Q transposed for the same reason. 1.5x.
+//   [x] concat/tensor index directly instead of through the wrapping operator(),
+//       which ran an integer division per coordinate. Up to 5x.
+//   [x] Frobenius norm uses |x|^2 directly rather than squaring std::abs, which
+//       for a complex matrix was computing a square root only to undo it. 55x.
+//   [x] sum() and the norms use four accumulators so the loop runs at add
+//       throughput rather than add latency. 3.7x.
+//
+// IDEAS TAKEN FROM Eigen / Armadillo / uBLAS / MTL4 (all measured):
+//   [x] Rule of FIVE. The class had a destructor, copy constructor and copy
+//       assignment but no MOVE pair, so every `C = A + B;` deep-copied the
+//       temporary operator+ had just built. Adding them, noexcept so that
+//       std::vector<Matrix> actually moves on reallocation, took a 4-term
+//       expression chain from 28.6ms to 7.2ms.
+//   [x] Rvalue-qualified arithmetic. In A + B + C the left operand of the second
+//       + is the temporary the first + produced, so the && overloads write into
+//       that buffer instead of allocating another. A chain of k operations now
+//       allocates once, not k times. This is the cheap half of what expression
+//       templates (Eigen, uBLAS, MTL4) do; the full version fuses the chain into
+//       one pass, but it changes what `A + B` RETURNS, which breaks template
+//       argument deduction in ordinary user code like f(A + B). Not worth it here.
+//       CAVEAT: only catches temporaries on the left. A + (B + C) still allocates.
+//   [x] Small-buffer storage, the runtime cousin of Eigen's fixed-size types.
+//       Matrices up to 4x4 live inside the object. A 2x2 A+B was 19ns of which
+//       19ns was new/delete — the allocator WAS the operation.
+//   [x] __restrict on the kernels. Biggest single win of the group: naiveMul
+//       went from 64 to ~175 GFLOP/s at n=2048, because without it the compiler
+//       must assume the result aliases the operands and refuses to vectorise.
+//       Element-wise ops did NOT improve — at n=2000 they move 96MB and are
+//       already at the memory roofline, so there is nothing for vectorisation to
+//       recover.
+//   [ ] Aligned allocation (Eigen aligns to 16/32/64). new[] gives 16 here and
+//       never 32, so AVX loads are unaligned. Untested; likely small next to the
+//       bandwidth limit above.
+//   [ ] Register-blocked GEMM micro-kernel (Eigen/BLIS/Goto). The inner loop is
+//       an axpy doing one FMA per two memory ops. Computing a 4x4 tile of C in
+//       registers would reuse each loaded value four times. This is the single
+//       biggest remaining item for multiply.
+//   [ ] Sparse storage (PETSc/Trilinos). Out of scope for a dense library, but
+//       it is what those two are actually for.
+//
+// A NOTE ON REF-QUALIFYING MEMBER OPERATORS, learned the hard way:
+//   once ANY overload of an operator name is ref-qualified, every sibling
+//   overload must be too. operator*(scalar) was qualified while
+//   operator*(Matrix) was not, and for an rvalue left operand the &&-qualified
+//   scalar template then beat the unqualified matrix one — silently routing
+//   `Q.T() * B` into scalar multiplication. It compiled. validate.cpp caught it.
+//
+// IDEAS TAKEN FROM WHAT NumPy AND LAPACK ACTUALLY DO (all measured).
+// NumPy's speed comes from three places, and it turned out that copying them was
+// mostly about STORAGE and MEMORY, not about cleverer arithmetic:
+//
+//   [x] madvise(MADV_HUGEPAGE) on large buffers. Lifted straight from NumPy's
+//       PyDataMem_NEW (numpy/_core/src/multiarray/alloc.c), same 4 MB threshold.
+//       Proved by toggling NumPy's own switch, _set_madvise_hugepage:
+//           np.hstack of two 2000x2000 doubles, hugepages ON   6.5 ms
+//                                               hugepages OFF 26.8 ms
+//           our concat, before the change                     24.8 ms
+//       That is, our copy loop was ALREADY as good as NumPy's and the entire
+//       4x gap was page-fault traffic. See adviseHuge().
+//   [x] Constructor-free storage (also Eigen/Armadillo). `new T[n]` runs T's
+//       default constructor, which for double is nothing but for
+//       std::complex<double> writes a zero to every element — faulting the whole
+//       buffer in before adviseHuge can apply, then paying a second full pass
+//       when the caller overwrites it. Complex concat: 49.8 -> 8.6 ms.
+//   [x] Pairwise summation, NumPy's reduction algorithm. Eight independent
+//       accumulator chains instead of one latency-bound one, and O(log n · eps)
+//       error growth instead of O(n · eps). sum(axis=1): 2.06 -> 0.36 ms.
+//       Kept OFF for complex, where it measured 3x slower — see pairwiseSum.
+//   [x] Column-major working arrays inside the factorisations. This is the
+//       single most valuable thing LAPACK does that a row-major library gets
+//       wrong for free. Every step of a Householder QR and every rotation of a
+//       one-sided Jacobi SVD walks a COLUMN; in row-major storage that strides
+//       by a whole row, one cache line per element, and no vectorisation.
+//       Fortran has contiguous columns by construction. Transposing the working
+//       copy (not the input) buys the same thing:
+//           svd, n=256:  644 -> 60.6 ms       qr, n=512:  838 -> 72.3 ms
+//   [x] Cached column norms in the Jacobi sweep, as dgesvj's sva[] array. Only
+//       the cross term p·q has to be recomputed per pair; the two squared norms
+//       update exactly through the rotation as alpha - t·gamma, beta + t·gamma.
+//       Three dot products per pair become one.
+//   [x] Brent-Luk round-robin pair ordering, so a sweep splits into rounds of
+//       column-disjoint pairs that run in parallel. Deterministic regardless of
+//       thread count. svd, n=256: 60.6 -> 19.7 ms, and 12.3 ms after the thread
+//       cap below. Total 52x, and it now beats NumPy's LAPACK dgesdd.
+//   [x] Parallelism where NumPy structurally cannot use it. NumPy's ufuncs are
+//       SIMD but strictly SINGLE-THREADED, so every element-wise map and every
+//       element-wise binary op is one core there. Threading them (mapElems,
+//       forEachIndex) is a gap that is simply not available to it:
+//           elem_ln 11.6 -> 0.62 ms      hadamard 2.55 -> 0.80 ms
+//       Also the per-right-hand-side loop in solve(), which is what inverse() is
+//       built on: 83 -> 10.7 ms at n=512.
+//   [x] Index arithmetic. tr(), IsDiagonal() and cholesky() recovered (i,j) with
+//       / and %, or went through the wrapping operator() — up to four integer
+//       divisions in the innermost loop of an O(n³) algorithm. cholesky was held
+//       to 0.78 GFLOP/s by this alone: 26.8 -> 6.0 ms.
+//   [x] Thread counts matched to the work. A memory-bound loop saturates with
+//       about half the reported threads (physical cores, no SMT) and gets SLOWER
+//       past that; a Jacobi sweep enters ~2000 parallel regions per
+//       factorisation and wants only as many threads as leave each one ~8k
+//       element-updates. See memoryThreads() and the table at svd's sweepThreads.
+//
+// A CAVEAT ON THE BENCHMARK'S LARGEST SIZE, worth knowing before quoting it:
+//   this machine has 64 MiB of L3, and a 2000x2000 double matrix is 32 MB — so
+//   a one-input, one-output real op at n=2000 has a 64 MB working set that
+//   fits ENTIRELY in L3, while the complex version at 128 MB does not.
+//       A * scalar:  n=1000  794 GB/s | n=2000  771 GB/s | n=3000  34 GB/s
+//   That cliff is why the real element-wise numbers look so much better than the
+//   complex ones (2.3-23x against ~1.0x): above L3 both libraries are pinned to
+//   the same DRAM roofline and the only remaining lever is thread count.
+//
+// STILL SLOWER THAN LAPACK/NumPy, in rough order of how much is on the table:
+//   [ ] eig (0.81x) and pow(A, real) (0.85x). schurDecomp is O(n^3) but
+//       memory-bound at n >= 512. LAPACK's answer is the blocked multishift QR
+//       of dlaqr0, which chases several bulges per pass over memory. The single
+//       biggest algorithmic item left.
+//   [ ] complex elem_div. libstdc++ implements complex division with Smith's
+//       algorithm — branches and a range reduction that will not vectorise.
+//       NumPy uses the naive formula. This is a correctness/speed trade, not an
+//       oversight: -ffast-math would take our path too (via -fcx-limited-range)
+//       and quietly change the answers, which is why the build flag warning
+//       above exists.
+//   [ ] reshape (0.95x) is a pure copy racing memcpy; there is nothing here.
+//   [ ] qr is blocked in neither sense: LAPACK's dgeqrf accumulates reflectors
+//       into a WY block so the trailing update is a matrix multiply. Column
+//       pivoting rules that out (the norms must be downdated before the next
+//       pivot is chosen), so matching dgeqrf would mean offering an unpivoted
+//       path as well. We are 8.7x ahead of NumPy anyway, because NumPy's qr
+//       returns the full m x m Q.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+//  GAP AGAINST BASE MATLAB  (no toolboxes, plotting ignored)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// OPERATOR MAPPING — settled, and the one deliberate divergence is documented:
+//     MATLAB    here                       note
+//     A * B     A * B
+//     A .* B    A % B / A.emul(B) / A*dot*B
+//     A / B     A / B                      right division; CHANGED to match
+//     A ./ B    A.ediv(B) / A /dot/ B      C++ cannot spell a leading dot
+//     A \ B     A.solve(B)                 no operator\ in C++
+//     A ^ n     pow(A, n)                  ^ has the wrong precedence in C++
+//     A .^ n    A.pow(n)
+//     A'        A.H()                      conjugate transpose
+//     A.'       A.T()
+//
+// [ ] TIER 1 — THE LOGICAL / MASKING LAYER. The biggest structural gap, and the
+//     one that gets more expensive the longer it waits, because it is a TYPE
+//     decision rather than a function:
+//       - A > 0, A <= B, ... returning a MASK. operator== here returns a single
+//         bool for whole-matrix equality; MATLAB's returns a logical array. There
+//         is no <, >, <=, >= at all.
+//       - any / all / nnz / find
+//       - logical indexing: A(A > 0), A(mask) = 0
+//     Everything else on this list is a function that can be added in isolation.
+//     This one needs Matrix<bool> (or a dedicated mask type) plus an indexing
+//     overload, and every later element-wise addition should be built on it.
+//
+// [ ] TIER 2 — REDUCTIONS. Have: sum, min, max, mean, var, stddev, argmin,
+//     argmax, each with an axis form. Missing: prod, cumsum, cumprod, median,
+//     mode, diff, sort, sortrows, unique. sort and cumsum are the two that would
+//     be missed immediately.
+//
+// [ ] TIER 3 — ELEMENT-WISE MATH. Missing: sign, floor, ceil, round, fix,
+//     mod/rem on floats (only integer % exists), atan2, hypot, angle/arg,
+//     asinh/acosh/atanh, expm1, log1p. angle is the notable one for the quantum
+//     direction — real/imag/conj exist but there is no way to get a phase.
+//
+// [ ] TIER 4 — LINEAR ALGEBRA. Several are nearly free given what is already
+//     here, and are the best value per line in the whole list:
+//       null, orth        column subsets of V / U from svd()
+//       roots             companion matrix + eigvals()
+//       hess              already computed inside schurDecomp, just not exposed
+//       schur             exists but returns std::vector pairs; wrap as matrices
+//       polyfit           column-pivoted QR least squares already exists
+//       dot, cross        trivial
+//       rref              small and self-contained
+//       issymmetric, ishermitian, istriu, istril, isbanded, bandwidth
+//                         only IsDiagonal exists today
+//       rcond, condest, normest
+//                         cheap estimators; cond() currently pays a full SVD
+//       funm              the Schur-Parlett machinery is already in log(A)
+//       decomposition     a reusable factorisation object — every solve()
+//                         currently re-factors from scratch. Probably the
+//                         highest value-per-line item here.
+//       eig(A,B), qz, polyeig, lsqminnorm
+//                         real work, no shortcuts
+//
+// [ ] TIER 5 — CONSTRUCTION AND SHAPE. linspace, logspace, repmat, fliplr,
+//     flipud, rot90, circshift, blkdiag, randn (only uniform exists), randi,
+//     randperm, numel. Plus the structured test matrices — magic, hilb, pascal,
+//     toeplitz, hankel, vander, wilkinson — which are cheap and would strengthen
+//     validate.cpp: hilb(n) is the standard ill-conditioning case and wilkinson
+//     the standard eigenvalue stress case.
+//
+// [ ] TIER 6 — IN BASE MATLAB, OUTSIDE LINEAR ALGEBRA. fft/ifft (base MATLAB,
+//     and directly relevant to the quantum direction — the QFT); poly, polyval,
+//     conv, deconv; trapz, cumtrapz, gradient, interp1, filter. Further out and
+//     probably not this library's job: ode45, fzero, fminsearch, integral.
+//
+// [ ] ALSO STILL REAL-ONLY: svd, cholesky and the matrix functions static_assert
+//     against complex. MATLAB is complex-capable throughout. Belongs on this
+//     list even though it is already scheduled separately.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+//  GOING N-DIMENSIONAL — a measured survey
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// MATLAB arrays are N-dimensional; Matrix is strictly rank 2. That is a real
+// ceiling for the ML and quantum directions — a 5-qubit state is naturally
+// 2x2x2x2x2, and a batch of images is (batch, channel, height, width). Four
+// layouts were considered and three of them measured, on a
+// (32, 32, 64, 64) tensor = 4.19M doubles = 33.6 MB:
+//
+//     operation                nested   vector<Matrix>     flat
+//     allocate                11.77 ms      ~same        1.91 ms
+//     element-wise add        14.22 ms     13.29 ms      3.83 ms
+//     sum all                  0.83 ms      0.79 ms      0.43 ms
+//     allocations                 1024         1024            1
+//     contraction to a GEMM        no           no    3.10 ms @ 173 GFLOP/s
+//
+// [ ] OPTION A — Matrix<Matrix<double>>, i.e. nesting the existing template.
+//     It COMPILES, and element-wise addition even works, which makes it more
+//     tempting than it should be. Three reasons it is the wrong answer:
+//       1. operator* THROWS. naiveMul accumulates into datatype(0), and for a
+//          nested element that is a 0x0 matrix, so the first `0x0 += 64x64`
+//          fails. This is not a bug to fix but a structural problem: a generic
+//          algorithm needs a zero of the right SHAPE, and a nested element type
+//          cannot supply one without knowing the block dimensions. Every
+//          algorithm here that starts from an accumulator has the same issue.
+//       2. 1024 separate allocations instead of one, and 6x the allocation cost.
+//          Nothing is contiguous across the outer dimensions, so the huge-page
+//          work, the __restrict work and the GEMM blocking all stop applying at
+//          the block boundary.
+//       3. 3.7x slower on element-wise work, for a layout holding the same bytes.
+//     Verdict: viable only for genuine BLOCK matrices where the blocks are the
+//     mathematical objects (block-diagonal preconditioners, and so on) — not as
+//     a general tensor.
+//
+// [ ] OPTION B — std::vector<Matrix<double>>, a list of rank-2 slices.
+//     Measurably the same as option A (13.29 ms vs 14.22 ms): still one
+//     allocation per slice, still no contiguity across the outer index, still no
+//     way to hand the whole thing to a GEMM. It buys ordinary container
+//     semantics and nothing else. Useful as a CONTAINER of matrices — a batch of
+//     independent problems — but not as a tensor.
+//
+// [x] OPTION C — ONE FLAT BUFFER PLUS SHAPE AND STRIDE METADATA. This is what
+//     NumPy, PyTorch and TensorFlow all do, and the measurements say the same
+//     thing: 3.7x faster element-wise, 6x faster to allocate, one allocation.
+//     The decisive argument is not those numbers though, it is this:
+//
+//       Every fast tensor contraction in every library is implemented as
+//       reshape -> permute -> 2-D GEMM -> permute back.
+//
+//     With a flat buffer, reshape is FREE — it only rewrites the shape metadata,
+//     no data moves — and the GEMM is the naiveMul that already runs at
+//     173 GFLOP/s. The (1024x4096)*(4096x64) contraction above IS that GEMM,
+//     unmodified. With options A or B the reshape is impossible without first
+//     copying everything into a flat buffer, at which point you have built
+//     option C the slow way.
+//     For quantum circuits this is exactly the operation that matters: applying
+//     a k-qubit gate to an n-qubit state is reshape, permute the k target axes
+//     to the front, multiply by the 2^k x 2^k gate, permute back.
+//
+// [ ] OPTION D — compile-time rank, Tensor<T, N> (Eigen's unsupported Tensor
+//     module, xtensor). Same flat storage as C, but the rank is a template
+//     parameter, so index arithmetic unrolls and shape checks happen at compile
+//     time. Faster still for small ranks, at the cost of rank-generic code being
+//     hard to write and error messages getting much worse. Worth considering
+//     LATER as a typed layer over C's storage, not instead of it.
+//
+// EVEN ON A FLAT BUFFER THE AXIS MATTERS — measured on the same tensor:
+//     reduce over the last axis   (contiguous)        0.98 ms
+//     reduce over the first axis  (contiguous passes) 0.77 ms
+//     reduce over a middle axis   (strided gather)    5.17 ms
+// A 5.3x spread, which is the whole reason the permute-then-GEMM strategy earns
+// its keep rather than reducing along whatever axis the caller asked for.
+//
+// WHAT THIS WOULD MEAN HERE, concretely:
+//   - Add Tensor<T> holding { std::vector<long> shape, strides; T* data; },
+//     using the SAME allocator path as Matrix so it inherits adviseHuge() and
+//     the constructor-free storage.
+//   - Make Matrix a rank-2 special case over that storage rather than a separate
+//     class, so every optimisation already measured carries over unchanged.
+//   - reshape() becomes O(1) metadata for Tensor. NOTE it is a COPY today, which
+//     is the right behaviour for a value-semantics Matrix but would be a serious
+//     performance bug in a tensor.
+//   - permute()/transpose() sets strides; a materialise() forces contiguity when
+//     a GEMM needs it.
+//   - Contraction = reshape + permute + naiveMul. No new kernel.
+//   - Non-contiguous strides mean the element-wise fast paths need a "contiguous?"
+//     test before using the flat restrict loops, with a strided fallback. That
+//     branch is the main new cost, and it is per-operation, not per-element.
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Slice sentinel — used in place of all for row/column extraction.
 // A dedicated type prevents ambiguity with operator()(int, int).
 // Usage: A(i, all)  or  A(all, j)
 struct all_t {};
 inline constexpr all_t all;
+
+// Element-wise operator sugar. MATLAB writes .* and ./ ; C++ cannot define an
+// operator with a leading dot, but it CAN read the dot as an operand:
+//
+//     A *dot* B      is  A .* B      (same as A % B, and as A.emul(B))
+//     A /dot/ B      is  A ./ B      (same as A.ediv(B))
+//
+// `A *dot` yields a proxy holding a pointer to A, which the second * or /
+// consumes immediately. * and / share one precedence level and associate
+// left-to-right, so `A /dot/ B` parses as `(A / dot) / B` — the intended
+// grouping — and mixes correctly with surrounding + and -.
+//
+// The proxy never outlives the full expression it appears in, so a temporary on
+// the left (`(A + B) /dot/ C`) is still alive when it is used. It does mean the
+// sugar always allocates, where `std::move(t).ediv(C)` would reuse t's buffer;
+// use the named form in a hot loop if that matters.
+struct dot_t {};
+inline constexpr dot_t dot;
+
+// Selects which norm norm()/cond() compute.
+//   Fro — Frobenius, sqrt of the sum of squares of every element
+//   One — maximum absolute column sum
+//   Inf — maximum absolute row sum
+//   Two — spectral norm, the largest singular value (requires svd())
+enum class NormType { Fro, One, Inf, Two };
+
+// Controls how the Taylor-series matrix functions evaluate their series.
+//
+// exp, sin, cos, sinh and cosh (and tan/tanh, which are built on them) each
+// take an optional trailing argument of this type. It converts implicitly from
+// a plain integer, so every one of these call forms works:
+//
+//     exp(A)                     // library defaults
+//     exp(A, 25)                 // stop after at most 25 terms
+//     exp(A, 25, 1e-12)          // ... or earlier, once a term falls below 1e-12
+//     exp(A, 25, 1e-12, false)   // ... and skip scaling-and-squaring entirely
+//
+//   maxTerms — hard cap on series terms. The series normally exits well before
+//              this on the tolerance test; set it to pin an exact term count.
+//   tol      — relative size at which a term is deemed negligible and the sum
+//              stops. Negative selects machine epsilon (the accurate default).
+//              Set tol = 0 to force exactly maxTerms terms with no early exit.
+//   scaling  — when true the argument is halved until its norm is below the
+//              series' comfortable radius and the result is recovered by
+//              repeated squaring (exp) or double-angle identities (trig).
+//              This is what keeps the series accurate for large ||A||;
+//              turning it off is a study aid, not a faster path.
+struct TaylorOpts {
+    long   maxTerms = taylor_limit;
+    double tol      = -1.0;
+    bool   scaling  = true;
+
+    TaylorOpts() = default;
+    TaylorOpts(long n)                   : maxTerms(n) {}
+    TaylorOpts(long n, double t)         : maxTerms(n), tol(t) {}
+    TaylorOpts(long n, double t, bool s) : maxTerms(n), tol(t), scaling(s) {}
+
+    // Resolved tolerance: negative means "use machine epsilon".
+    double epsTol() const {
+        return tol < 0.0 ? std::numeric_limits<double>::epsilon() : tol;
+    }
+};
 //for std=C++11
 //constexpr all_t all;
 template <typename datatype>
@@ -49,28 +735,81 @@ class Matrix{
                     " exceed the maximum indexable size (" + std::to_string(MAX_IDX) + ")");
             rowSize = i;
             colSize = j;
-            grid = new datatype[rowSize*colSize]();
+            allocZero(rowSize * colSize);
         }
+        // Move constructor: takes over M's buffer instead of copying it.
+        //
+        // Without this the class stopped at the rule of THREE, so every Matrix
+        // built from a temporary — which is every arithmetic result — paid a
+        // full allocate + zero-fill + element-by-element copy for data that was
+        // about to be destroyed anyway. Eigen and Armadillo both rely on this;
+        // it is the cheapest structural win available to a value-semantics
+        // matrix type.
+        //
+        // noexcept matters as much as the move itself: std::vector<Matrix> only
+        // moves its elements when reallocating if the move cannot throw,
+        // otherwise it silently falls back to copying them.
+        Matrix(Matrix &&M) noexcept {
+            rowSize = M.rowSize;
+            colSize = M.colSize;
+            if (M.isInline()) {
+                // The source's data lives inside the source object, so there is
+                // no pointer to steal — copy it across. It is at most
+                // SBO_CAPACITY elements, which is cheaper than an allocation.
+                const long total = rowSize * colSize;
+                grid = sbo;
+                for (long i = 0; i < total; i++) grid[i] = M.grid[i];
+            } else {
+                grid   = M.grid;
+                M.grid = nullptr;   // release() tolerates null
+            }
+            M.rowSize = 0;
+            M.colSize = 0;
+        }
+
         // Copy constructor: deep copies M
         Matrix(const Matrix &M){
             rowSize = M.rowSize;
             colSize = M.colSize;
-            grid = new datatype[rowSize*colSize]();
-            for (long index = 0; index < rowSize*colSize; index++)
+            const long total = rowSize * colSize;
+            allocRaw(total);                       // every element is written below
+            for (long index = 0; index < total; index++)
                 grid[index] = M.grid[index];
         }
 
         // --- Assignment operators ---
 
+        // Move assignment: steals M's buffer. This is the one that matters most
+        // in practice, because `C = A + B;` on an already-existing C used to deep
+        // copy the temporary that operator+ had just built.
+        Matrix& operator=(Matrix &&M) noexcept {
+            if (this == &M) return *this;
+            release();
+            rowSize = M.rowSize;
+            colSize = M.colSize;
+            if (M.isInline()) {          // nothing to steal — see the move ctor
+                const long total = rowSize * colSize;
+                grid = sbo;
+                for (long i = 0; i < total; i++) grid[i] = M.grid[i];
+            } else {
+                grid   = M.grid;
+                M.grid = nullptr;
+            }
+            M.rowSize = 0;
+            M.colSize = 0;
+            return *this;
+        }
+
         // Assigns from another Matrix (deep copy)
         Matrix& operator=(const Matrix &M){
             if (this == &M) return *this;  // self-assignment guard
 
-            delete[] grid; // empty the Matrix
+            release(); // empty the Matrix
             rowSize = M.rowSize;
             colSize = M.colSize;
-            grid = new datatype[rowSize*colSize];
-            for (long index = 0; index < rowSize*colSize; index++)
+            const long total = rowSize * colSize;
+            allocRaw(total);
+            for (long index = 0; index < total; index++)
                 grid[index] = M.grid[index];
             return *this;
         }
@@ -80,13 +819,13 @@ class Matrix{
                 if (M.size() == 0)
                     throw std::invalid_argument("Cannot assign empty initializer list to Matrix");
 
-                delete[] grid;
+                release();
 
                 rowSize = M.size();
                 auto itr = M.begin();
                 colSize = itr->size();
 
-                grid = new datatype[rowSize*colSize];         // deep copy
+                allocZero(rowSize * colSize);                 // deep copy
 
                 int i = 0, j = 0, index = 0;
                 for (auto row : M){
@@ -106,8 +845,9 @@ class Matrix{
         // --- Arithmetic operators ---
 
         // Element-wise addition. Requires identical dimensions. Returns a new Matrix.
-        Matrix operator+(const Matrix &M){
-            Matrix ans = *this;
+        // const so that it works on const operands — matrix functions such as
+        // exp(const Matrix&) accumulate their series with it.
+        Matrix operator+(const Matrix &M) const &{
             try{
                 if (this->colSize != M.colSize)
                     throw std::invalid_argument(
@@ -115,36 +855,66 @@ class Matrix{
                 if (this->rowSize != M.rowSize)
                     throw std::invalid_argument(
                         "Row size mismatch in operator+: " + std::to_string(rowSize) + " != " + std::to_string(M.rowSize));
-
-                for (long index = 0; index < colSize*rowSize; index++)
-                    ans.grid[index] += M.grid[index];
-
             }catch(const std::exception& e){
                 std::cerr << "Matrix addition error: " << e.what() << std::endl;
                 throw;
             }
+            // One pass into an uninitialised buffer. Copy-then-accumulate would
+            // zero the result, copy into it, then read it back to add — three
+            // passes over the data where one will do.
+            Matrix ans(rowSize, colSize, uninit_t{});
+            // restrict-qualified locals: without them the compiler must assume
+            // the result may overlap the operands and cannot vectorise the loop.
+            const long total = rowSize * colSize;
+            const datatype* MATRIXCPP_RESTRICT a = grid;
+            const datatype* MATRIXCPP_RESTRICT b = M.grid;
+            datatype*       MATRIXCPP_RESTRICT r = ans.grid;
+            forEachIndex(total, [=](long i) { r[i] = a[i] + b[i]; });
             return ans;
         }
 
         // Scalar multiplication: multiplies every element by num. Returns a new Matrix.
         template <typename scalar>
-        Matrix operator*(const scalar& num) const {
-            Matrix ans = *this;
-            for (long index = 0; index < rowSize*colSize; index++)
-                ans.grid[index] *= num;
+        Matrix operator*(const scalar& num) const & {
+            Matrix ans(rowSize, colSize, uninit_t{});
+            // restrict-qualified locals: without them the compiler must assume
+            // the result may overlap the operands and cannot vectorise the loop.
+            const long total = rowSize * colSize;
+            const datatype* MATRIXCPP_RESTRICT a = grid;
+            datatype*       MATRIXCPP_RESTRICT r = ans.grid;
+            forEachIndex(total, [=](long i) { r[i] = a[i] * num; });
             return ans;
         }
-        // In-place scalar multiplication
+        template <typename scalar>
+        Matrix operator*(const scalar& num) && {
+            *this *= num;
+            return std::move(*this);
+        }
+
+        // In-place scalar multiplication. Written directly rather than as
+        // `*this = *this * num`, which allocated a whole second matrix and
+        // assigned it back over the first.
         template <typename scalar>
         Matrix& operator*= (const scalar& num) {
-            (*this) = (*this) * num;
-            return (*this);
+            const long total = rowSize * colSize;
+            datatype* MATRIXCPP_RESTRICT r = grid;
+            forEachIndex(total, [=](long i) { r[i] *= num; });
+            return *this;
         }
 
         // Matrix multiplication (dot product). Requires this->cols == M.rows.
         // Uses Strassen-Winograd for square matrices >= STRASSEN_THRESHOLD,
         // falling back to naive O(n³) for smaller or rectangular matrices.
-        Matrix operator*(const Matrix &M) const{
+        // Ref-qualified purely for consistency with the scalar operator* below.
+        // Once ANY overload of a name is ref-qualified, an unqualified sibling
+        // stops competing on equal terms: for an rvalue left operand the
+        // &&-qualified one wins outright, which silently routed `Q.T() * B` into
+        // the scalar path. Matrix multiply cannot reuse either operand's buffer
+        // (the result has different dimensions), so this simply forwards.
+        Matrix operator*(const Matrix &M) && {
+            return static_cast<const Matrix&>(*this) * M;
+        }
+        Matrix operator*(const Matrix &M) const &{
             try{
                 if (this->colSize != M.rowSize)
                     throw std::invalid_argument(
@@ -152,9 +922,36 @@ class Matrix{
                         std::to_string(rowSize) + "x" + std::to_string(colSize) + ") * (" +
                         std::to_string(M.rowSize) + "x" + std::to_string(M.colSize) + ")");
 
-                // Strassen-Winograd path: both operands must be square and same size.
-                // Only pad to the next power of 2 when the overhead is modest (< 2×).
-                // Beyond that, the extra recursion level costs more than naive saves.
+                // ── Strassen-Winograd: OFF by default ──────────────────────
+                //
+                // Measured against the same blocked naive multiply this file
+                // already contains, Strassen is SLOWER at every size tested:
+                //
+                //     n      naive / strassen
+                //     100        0.23x
+                //     128        0.43x
+                //     256        0.42x
+                //     512        0.25x
+                //    1024        0.11x
+                //
+                // The asymptotics are real, but two implementation facts swamp
+                // them here. First, naiveMul is OpenMP-parallel across every
+                // core, while the Strassen recursion is serial — only its
+                // base-case calls enter a parallel region, each on a block small
+                // enough that the thread overhead dominates. Second, every
+                // recursion level heap-allocates about twenty temporaries
+                // (eight sub-blocks, eight sums, seven products), and that
+                // allocation and copy traffic costs more than the one saved
+                // multiply out of eight returns.
+                //
+                // Turning it back on is worth doing once the recursion itself is
+                // parallelised (an OpenMP task per independent product) and the
+                // temporaries come from one preallocated arena instead of the
+                // heap. Until then it is a pessimisation, so it is compiled out
+                // rather than silently costing 2-9x on every product.
+                //
+                // Define MATRIXCPP_ENABLE_STRASSEN to opt back in.
+#ifdef MATRIXCPP_ENABLE_STRASSEN
                 if (rowSize == colSize && M.rowSize == M.colSize && rowSize == M.rowSize
                     && rowSize >= STRASSEN_THRESHOLD) {
                     long sz = nextPow2(rowSize);
@@ -178,7 +975,7 @@ class Matrix{
                         return ans;
                     }
                 }
-
+#endif
                 return naiveMul(*this, M);
 
             }catch(const std::exception& e){
@@ -194,99 +991,338 @@ class Matrix{
         }
 
         // Hadamard (element-wise) product. Requires identical dimensions. Returns a new Matrix.
-        Matrix operator%(const Matrix &M) const{
+        Matrix operator%(const Matrix &M) const &{
+            // The try covers only the check that can throw. Building `ans` and
+            // returning it from inside a try would suppress NRVO and cost a full
+            // extra allocate-zero-copy of the result — 9x on a 2000x2000 product.
             try{
                 if (this->colSize != M.colSize || this->rowSize != M.rowSize)
                     throw std::invalid_argument(
                         "Dimension mismatch in Hadamard product: (" +
                         std::to_string(rowSize) + "x" + std::to_string(colSize) + ") vs (" +
                         std::to_string(M.rowSize) + "x" + std::to_string(M.colSize) + ")");
-                Matrix <datatype> ans(M.rowSize, M.colSize);
-                for (long i = 0; i < M.rowSize * M.colSize; i++){
-                    ans.grid[i] = this->grid[i] * M.grid[i];
-                }
-                return ans;
             }catch(const std::exception& e){
                 std::cerr << "Hadamard product error: " << e.what() << std::endl;
                 throw;
             }
+            // uninit_t, and restrict-qualified locals — the same two points as
+            // operator+ and operator-, both of which this loop was missing.
+            // Zero-filling a result whose every element is written on the next
+            // line costs a whole extra pass over the output: the product moves
+            // 3n² elements, so the wasted n² was a third of the operation. That
+            // was the entire gap against NumPy here.
+            Matrix<datatype> ans(rowSize, colSize, uninit_t{});
+            const long total = rowSize * colSize;
+            const datatype* MATRIXCPP_RESTRICT a = grid;
+            const datatype* MATRIXCPP_RESTRICT b = M.grid;
+            datatype*       MATRIXCPP_RESTRICT r = ans.grid;
+            forEachIndex(total, [=](long i) { r[i] = a[i] * b[i]; });
+            return ans;
         }
+        Matrix operator%(const Matrix &M) && {
+            *this %= M;
+            return std::move(*this);
+        }
+
         // Integer modulo: applies modulo to every element. Returns a new Matrix.
         // e.g. A % 3 gives a matrix where each element is a_ij % 3.
         // Note: n % A has no defined meaning and is not supported.
-        Matrix operator% (const int& modulo) const{
-            Matrix ans;
-            ans = *this;
-            for (long i = 0; i < rowSize*colSize; i++) ans.grid[i] %= modulo;
+        Matrix operator% (const int& modulo) const &{
+            Matrix ans(rowSize, colSize, uninit_t{});
+            // restrict-qualified locals: without them the compiler must assume
+            // the result may overlap the operands and cannot vectorise the loop.
+            const long total = rowSize * colSize;
+            const datatype* MATRIXCPP_RESTRICT a = grid;
+            datatype*       MATRIXCPP_RESTRICT r = ans.grid;
+            for (long i = 0; i < total; i++) r[i] = a[i] % modulo;
             return ans;
+        }
+        // Qualified to match operator%(const Matrix&); reuses the temporary.
+        Matrix operator% (const int& modulo) && {
+            *this %= modulo;
+            return std::move(*this);
         }
 
         // In-place integer modulo
         Matrix& operator%= (const int& modulo){
-            *this = (*this) % modulo;
+            const long total = rowSize * colSize;
+            datatype* MATRIXCPP_RESTRICT r = grid;
+            for (long i = 0; i < total; i++) r[i] %= modulo;
             return *this;
         }
 
-        // In-place Hadamard product (Element-wise Matrix multipication)
+        // In-place Hadamard product (Element-wise Matrix multiplication)
         Matrix& operator%= (const Matrix& M){
-            *this = (*this) % M;
-            return *this;
-        }
-
-        //Element-wise Matrix division
-        Matrix operator/ (const Matrix& M) const{
             try{
                 if (this->colSize != M.colSize || this->rowSize != M.rowSize)
                     throw std::invalid_argument(
-                        "Dimension mismatch in Element-wise division: (" +
+                        "Dimension mismatch in Hadamard product: (" +
                         std::to_string(rowSize) + "x" + std::to_string(colSize) + ") vs (" +
                         std::to_string(M.rowSize) + "x" + std::to_string(M.colSize) + ")");
-                Matrix ans(rowSize, colSize);
-                for (long i = 0; i < rowSize * colSize; i++)
-                    ans.grid[i] = grid[i] / M.grid[i];
-                return ans;
             }catch(const std::exception& e){
-                std::cerr << "Element-wise division error: " << e.what() << std::endl;
+                std::cerr << "Hadamard product error: " << e.what() << std::endl;
+                throw;
+            }
+            const long total = rowSize * colSize;
+            const datatype* MATRIXCPP_RESTRICT b = M.grid;
+            datatype*       MATRIXCPP_RESTRICT r = grid;
+            forEachIndex(total, [=](long i) { r[i] *= b[i]; });
+            return *this;
+        }
+
+        // ── Matrix right division, MATLAB's mrdivide. A / B is the X solving
+        //    X * B = A, i.e. A * inv(B) — WITHOUT ever forming inv(B).
+        //
+        // This used to be element-wise division. It was changed to match MATLAB,
+        // because `A / B` meaning two entirely different things in two systems
+        // that otherwise line up is the kind of difference that produces a wrong
+        // answer rather than an error. Element-wise division is now ediv() — see
+        // below, and the operator table in the header comment.
+        //
+        // Implemented as a solve, not as A * B.inverse(): fewer flops, and better
+        // conditioned. Right division is left division on the transposes,
+        //     X * B = A   <=>   Bᵀ * Xᵀ = Aᵀ   <=>   X = (Bᵀ \ Aᵀ)ᵀ
+        // so it inherits everything solve() already does — LU with partial
+        // pivoting when B is square, least squares via column-pivoted QR when it
+        // is not, which is also what MATLAB's / does.
+        //
+        // Returns Matrix<double> because a solve does; see solve().
+        Matrix<double> operator/ (const Matrix& M) const &{
+            try {
+                if (this->colSize != M.colSize)
+                    throw std::invalid_argument(
+                        "Dimension mismatch in matrix right division X*B=A: A is (" +
+                        std::to_string(rowSize) + "x" + std::to_string(colSize) +
+                        ") and B is (" + std::to_string(M.rowSize) + "x" +
+                        std::to_string(M.colSize) + ") — they must agree in COLUMNS. "
+                        "For element-wise division use A.ediv(B) or A /dot/ B");
+                return M.T().solve(this->T()).T();
+            } catch (const std::exception& e) {
+                std::cerr << "Matrix right division error: " << e.what() << '\n';
                 throw;
             }
         }
 
+        // No buffer to reuse — the result of a solve is a fresh matrix of a
+        // different shape in general — so the rvalue form just forwards. It still
+        // has to exist: once one overload of an operator name is ref-qualified,
+        // every sibling must be, or overload resolution silently picks the wrong
+        // one for rvalue operands. See the note in the header comment.
+        Matrix<double> operator/ (const Matrix& M) && {
+            return static_cast<const Matrix&>(*this) / M;
+        }
+
+        // A /= B is A = A / B, so it inherits the right-division meaning. Only
+        // instantiable for Matrix<double>, since a solve produces doubles and
+        // there is no narrowing conversion back.
         Matrix& operator/= (const Matrix& M){
+            static_assert(std::is_same<datatype, double>::value,
+                "A /= B is matrix RIGHT DIVISION and produces double results, so it\n"
+                "only applies to Matrix<double>. Write B = A / C for other element\n"
+                "types, or A = A.ediv(B) if you meant element-wise division.");
             *this = (*this) / M;
             return *this;
         }
+
+        // ── Element-wise ("dot") operations ─────────────────────────────────
+        // MATLAB spells these .* and ./ — a leading dot on the operator. C++ has
+        // no way to define that, so the element-wise family lives here instead:
+        //
+        //     MATLAB      here
+        //     A .* B      A % B     or  A.emul(B)   or  A *dot* B
+        //     A ./ B      A.ediv(B)                 or  A /dot/ B
+        //     A .^ n      A.pow(n)
+        //
+        // The named forms are the primitives; % and the dot-sugar are spellings
+        // of them. Both are ref-qualified so that a temporary on the left is
+        // reused instead of reallocated, exactly like operator+ and operator-.
+
+        // Element-wise division, MATLAB's ./
+        Matrix ediv(const Matrix& M) const &{
+            requireSameShape(M, "ediv");
+            // uninit_t and restrict, for the reasons given on operator%.
+            Matrix ans(rowSize, colSize, uninit_t{});
+            const long total = rowSize * colSize;
+            const datatype* MATRIXCPP_RESTRICT a = grid;
+            const datatype* MATRIXCPP_RESTRICT b = M.grid;
+            datatype*       MATRIXCPP_RESTRICT r = ans.grid;
+            forEachIndex(total, [=](long i) { r[i] = a[i] / b[i]; });
+            return ans;
+        }
+
+        // Rvalue form: divides in place and hands the same buffer back.
+        Matrix ediv(const Matrix& M) &&{
+            requireSameShape(M, "ediv");
+            const long total = rowSize * colSize;
+            const datatype* MATRIXCPP_RESTRICT b = M.grid;
+            datatype*       MATRIXCPP_RESTRICT r = grid;
+            forEachIndex(total, [=](long i) { r[i] /= b[i]; });
+            return std::move(*this);
+        }
+
+        // Element-wise multiplication, MATLAB's .* — a named spelling of operator%.
+        Matrix emul(const Matrix& M) const &{ return *this % M; }
+        Matrix emul(const Matrix& M) &&{ return std::move(*this) % M; }
         // Scalar division: divides every element by n. Preserves datatype.
         // Note: n / A has no defined meaning and is not supported.
         template <typename scalar>
-        Matrix operator/ (const scalar& n) const{
-            Matrix ans;
-            ans = *this;
-            for(long i = 0; i < rowSize*colSize; i++) ans.grid[i] /= n;
+        Matrix operator/ (const scalar& n) const &{
+            Matrix ans(rowSize, colSize, uninit_t{});
+            // restrict-qualified locals: without them the compiler must assume
+            // the result may overlap the operands and cannot vectorise the loop.
+            const long total = rowSize * colSize;
+            const datatype* MATRIXCPP_RESTRICT a = grid;
+            datatype*       MATRIXCPP_RESTRICT r = ans.grid;
+            forEachIndex(total, [=](long i) { r[i] = a[i] / n; });
             return ans;
+        }
+
+        template <typename scalar>
+        Matrix operator/ (const scalar& n) && {
+            *this /= n;
+            return std::move(*this);
         }
 
         // In-place scalar division
         template <typename scalar>
         Matrix& operator/= (const scalar& n){
-            *this = *this / n;
+            const long total = rowSize * colSize;
+            datatype* MATRIXCPP_RESTRICT r = grid;
+            forEachIndex(total, [=](long i) { r[i] /= n; });
+            return *this;
+        }
+
+        // ── Rvalue-qualified arithmetic ─────────────────────────────────
+        // In a chain like A + B + C, the left operand of the second + is the
+        // temporary that the first + just produced. These overloads recognise
+        // that and write into that temporary's buffer instead of allocating
+        // another one, so a chain of k operations allocates once rather than k
+        // times. Expression templates (Eigen, uBLAS, MTL4) solve the same
+        // problem more completely — they fuse the whole chain into a single
+        // pass — but they change what `A + B` returns, which breaks template
+        // argument deduction in ordinary user code like f(A + B). These keep
+        // every type exactly as it was.
+        //
+        // Note this only catches temporaries on the LEFT. A + (B + C) still
+        // allocates for the inner sum, because there the temporary is the
+        // argument, not the object. Left-to-right is how chains normally parse.
+        Matrix operator+(const Matrix &M) && {
+            *this += M;
+            return std::move(*this);
+        }
+
+        // In-place element-wise addition. Requires identical dimensions.
+        Matrix& operator+= (const Matrix &M){
+            try{
+                if (this->colSize != M.colSize || this->rowSize != M.rowSize)
+                    throw std::invalid_argument(
+                        "Dimension mismatch in operator+=: (" +
+                        std::to_string(rowSize) + "x" + std::to_string(colSize) + ") vs (" +
+                        std::to_string(M.rowSize) + "x" + std::to_string(M.colSize) + ")");
+                for (long index = 0; index < colSize*rowSize; index++)
+                    grid[index] += M.grid[index];
+            }catch(const std::exception& e){
+                std::cerr << "Matrix addition error: " << e.what() << std::endl;
+                throw;
+            }
             return *this;
         }
 
         // Element-wise subtraction. Requires identical dimensions. Returns a new Matrix.
-        Matrix operator-(const Matrix &M){
-            return *this + M*-1;
+        // Subtracts directly rather than going via *this + M*-1: one pass instead of
+        // two, no intermediate matrix, and it stays correct for unsigned datatypes.
+        Matrix operator-(const Matrix &M) const &{
+            try{
+                if (this->colSize != M.colSize || this->rowSize != M.rowSize)
+                    throw std::invalid_argument(
+                        "Dimension mismatch in operator-: (" +
+                        std::to_string(rowSize) + "x" + std::to_string(colSize) + ") vs (" +
+                        std::to_string(M.rowSize) + "x" + std::to_string(M.colSize) + ")");
+            }catch(const std::exception& e){
+                std::cerr << "Matrix subtraction error: " << e.what() << std::endl;
+                throw;
+            }
+            Matrix ans(rowSize, colSize, uninit_t{});
+            // restrict-qualified locals: without them the compiler must assume
+            // the result may overlap the operands and cannot vectorise the loop.
+            const long total = rowSize * colSize;
+            const datatype* MATRIXCPP_RESTRICT a = grid;
+            const datatype* MATRIXCPP_RESTRICT b = M.grid;
+            datatype*       MATRIXCPP_RESTRICT r = ans.grid;
+            forEachIndex(total, [=](long i) { r[i] = a[i] - b[i]; });
+            return ans;
         }
 
+        Matrix operator-(const Matrix &M) && {
+            *this -= M;
+            return std::move(*this);
+        }
+
+        // In-place element-wise subtraction. Requires identical dimensions.
         Matrix& operator-= (const Matrix &M){
-            *this = (*this) - M;
+            try{
+                if (this->colSize != M.colSize || this->rowSize != M.rowSize)
+                    throw std::invalid_argument(
+                        "Dimension mismatch in operator-=: (" +
+                        std::to_string(rowSize) + "x" + std::to_string(colSize) + ") vs (" +
+                        std::to_string(M.rowSize) + "x" + std::to_string(M.colSize) + ")");
+                for (long index = 0; index < colSize*rowSize; index++)
+                    grid[index] -= M.grid[index];
+            }catch(const std::exception& e){
+                std::cerr << "Matrix subtraction error: " << e.what() << std::endl;
+                throw;
+            }
             return *this;
         }
 
         //Agrumented Matrix operator, allows for similar math notation.
         //Note, to preserve predence use with (), EX (A|B)
-        Matrix operator| (const Matrix &M){
+        Matrix operator| (const Matrix &M) const{
             return (*this).concat(M, 1);
         }
+
+        // Unary negation: returns a new Matrix with every element negated.
+        Matrix operator-() const &{
+            Matrix ans(rowSize, colSize, uninit_t{});
+            const long total = rowSize * colSize;
+            for (long i = 0; i < total; i++) ans.grid[i] = -grid[i];
+            return ans;
+        }
+
+        Matrix operator-() && {
+            const long total = rowSize * colSize;
+            for (long i = 0; i < total; i++) grid[i] = -grid[i];
+            return std::move(*this);
+        }
+
+        // --- Comparison operators ---
+
+        // Exact equality: same dimensions and every element compares equal.
+        // For floating-point types prefer allclose() — exact == is rarely what you
+        // want, because two mathematically equal results computed different ways
+        // almost never agree bit-for-bit.
+        bool operator==(const Matrix &M) const{
+            if (rowSize != M.rowSize || colSize != M.colSize) return false;
+            for (long index = 0; index < rowSize*colSize; index++)
+                if (!(grid[index] == M.grid[index])) return false;
+            return true;
+        }
+
+        bool operator!=(const Matrix &M) const{ return !(*this == M); }
+
+        // Approximate equality, mirroring numpy.allclose:
+        //   |a_ij - b_ij| <= atol + rtol * |b_ij|  for every element.
+        // Mismatched dimensions compare false rather than throwing, so it is safe
+        // to use directly as a test assertion. This is what the test suite uses.
+        bool allclose(const Matrix &M, double rtol = 1e-5, double atol = 1e-8) const{
+            if (rowSize != M.rowSize || colSize != M.colSize) return false;
+            for (long index = 0; index < rowSize*colSize; index++) {
+                double diff = magnitude(grid[index] - M.grid[index]);
+                if (!(diff <= atol + rtol * magnitude(M.grid[index]))) return false;
+            }
+            return true;
+        }
+
         // --- Proxy classes for slice assignment ---
         // Returned by non-const slice operators. Holds a reference back to the
         // parent Matrix so that A(i, all) = B writes through to A.
@@ -393,6 +1429,10 @@ class Matrix{
         datatype& operator[](const int& i){
             return grid[i % (rowSize * colSize)];
         }
+        // Const flat index access, so A[i] reads from a const Matrix too.
+        const datatype& operator[](const int& i) const {
+            return grid[i % (rowSize * colSize)];
+        }
 
         // Row extraction — non-const returns RowProxy: supports A(i, all) = B
         RowProxy operator()(const int& i, all_t) {
@@ -450,7 +1490,7 @@ class Matrix{
         // --- Inspection ---
 
         // Returns true if the matrix has no elements (0x0 or any zero dimension)
-        inline bool empty() const { return !(rowSize * colSize); }
+        inline bool empty() const { return rowSize * colSize == 0; }
         // Returns the number of rows
         long rows() const { return rowSize; }
         // Returns the number of columns
@@ -467,7 +1507,9 @@ class Matrix{
             size_t colWidth = 0;
             for (long i = 0; i < rowSize * colSize; i++) {
                 std::ostringstream oss;
-                if (std::is_floating_point<datatype>::value)
+                // is_float_like, not std::is_floating_point: the latter is false for
+                // std::complex<double>, which would silently drop the formatting.
+                if (is_float_like<datatype>::value)
                     oss << std::fixed << std::setprecision(precision);
                 oss << grid[i];
                 cells[i] = oss.str();
@@ -510,71 +1552,220 @@ class Matrix{
         // --- Linear algebra ---
 
         // Returns the transpose of this matrix as a new (cols x rows) Matrix.
+        // NOTE: for complex datatypes this is the PLAIN transpose, which is
+        // usually not the operation you want — see H() below.
         Matrix T() const{
-            Matrix <datatype> ans(colSize, rowSize);
-            for (long i = 0; i < colSize*rowSize; i++){
-                //By definition of transpose.
-                ans.grid[(i % colSize) * rowSize + (i / colSize)] = grid[i];
+            Matrix<datatype> ans(colSize, rowSize, uninit_t{});
+            // Blocked, because a transpose is inherently cache-hostile: one of the
+            // two sides is always striding by a whole row. Walking the matrix in
+            // tiles keeps both the source and destination tile resident in L1 for
+            // the duration of the tile, instead of evicting a cache line per
+            // element. The flat-index version this replaced also paid a division
+            // and a modulo on every single element.
+            constexpr long BLOCK = 32;
+            const datatype* MATRIXCPP_RESTRICT src = grid;
+            datatype*       MATRIXCPP_RESTRICT dst = ans.grid;
+            const long R = rowSize, C = colSize;
+            // Each ii-strip of tiles writes a disjoint set of destination columns,
+            // so the outer loop is independent and parallelises directly. A
+            // transpose is pure memory traffic, and one core cannot saturate the
+            // memory system on its own.
+            auto strip = [=](long ii) {
+                const long iMax = std::min(ii + BLOCK, R);
+                for (long jj = 0; jj < C; jj += BLOCK) {
+                    const long jMax = std::min(jj + BLOCK, C);
+                    for (long i = ii; i < iMax; i++)
+                        for (long j = jj; j < jMax; j++)
+                            dst[j * R + i] = src[i * C + j];
+                }
+            };
+#ifdef _OPENMP
+            if (R * C >= PARALLEL_MIN_WORK) {
+                #pragma omp parallel for schedule(static) num_threads(memoryThreads())
+                for (long ii = 0; ii < R; ii += BLOCK) strip(ii);
+                return ans;
             }
+#endif
+            for (long ii = 0; ii < R; ii += BLOCK) strip(ii);
+            return ans;
+        }
+
+        // --- Complex support (see the COMPLEX NUMBER SUPPORT block at the top) ---
+        // These four are the ones that make Matrix<std::complex<double>> usable.
+        // For real datatypes they degrade gracefully: conj() and real() are the
+        // identity, imag() is all zeros, and H() is exactly T().
+
+        // Conjugate transpose (Hermitian adjoint), A^H = conj(A)^T.
+        // THE important one. For complex matrices this — not T() — is what plays
+        // the role the transpose plays in the real theory: it is the adjoint that
+        // makes <Ax,y> = <x,A^H y>, it is what "orthogonal" becomes ("unitary",
+        // Q^H Q = I), and it is what "symmetric" becomes ("Hermitian", A = A^H).
+        // Every .T() inside QR, schurDecomp and the symmetry checks must become
+        // .H() once complex is supported. Missing one is a silent wrong answer,
+        // never a compile error.
+        Matrix H() const{
+            Matrix<datatype> ans(colSize, rowSize, uninit_t{});
+            constexpr long BLOCK = 32;   // blocked for the same reason as T()
+            for (long ii = 0; ii < rowSize; ii += BLOCK) {
+                const long iMax = std::min(ii + BLOCK, rowSize);
+                for (long jj = 0; jj < colSize; jj += BLOCK) {
+                    const long jMax = std::min(jj + BLOCK, colSize);
+                    for (long i = ii; i < iMax; i++)
+                        for (long j = jj; j < jMax; j++) {
+                            const datatype& v = grid[i * colSize + j];
+                            if constexpr (is_complex<datatype>::value)
+                                ans.grid[j * rowSize + i] = std::conj(v);
+                            else
+                                ans.grid[j * rowSize + i] = v;
+                        }
+                }
+            }
+            return ans;
+        }
+
+        // Element-wise complex conjugate. Identity for real datatypes.
+        Matrix conj() const{
+            Matrix ans(rowSize, colSize, uninit_t{});
+            const long total = rowSize * colSize;
+            if constexpr (is_complex<datatype>::value)
+                for (long i = 0; i < total; i++) ans.grid[i] = std::conj(grid[i]);
+            else
+                for (long i = 0; i < total; i++) ans.grid[i] = grid[i];
+            return ans;
+        }
+
+        // Real parts of every element. The real_of trait keeps the element type
+        // honest: Matrix<complex<float>> gives back Matrix<float>, and for a real
+        // datatype this is the identity, returning the same type it started with.
+        Matrix<real_t<datatype>> real() const{
+            Matrix<real_t<datatype>> ans(rowSize, colSize);
+            for (long i = 0; i < rowSize*colSize; i++) {
+                if constexpr (is_complex<datatype>::value) ans[int(i)] = grid[i].real();
+                else                                       ans[int(i)] = grid[i];
+            }
+            return ans;
+        }
+
+        // Imaginary parts of every element. All zeros for real datatypes.
+        Matrix<real_t<datatype>> imag() const{
+            Matrix<real_t<datatype>> ans(rowSize, colSize);
+            if constexpr (is_complex<datatype>::value)
+                for (long i = 0; i < rowSize*colSize; i++) ans[int(i)] = grid[i].imag();
             return ans;
         }
 
         //element-wise power
         template <typename scalar>
         Matrix pow(scalar num) const{
-            Matrix ans = *this;
-            for (long i = 0; i < (*this).colSize*(*this).rowSize; i++)
-                ans[i] = std::pow(ans[i],num);
-            return ans;
+            return mapElems([=](const datatype& x) { return std::pow(x,num); });
         }  
 
         //element-wise exp
         Matrix exp() const{
-            Matrix ans = *this;
-            for (long i = 0; i < (*this).colSize*(*this).rowSize; i++)
-                ans[i] = std::exp(ans[i]);
-            return ans;
+            return mapElems([=](const datatype& x) { return std::exp(x); });
         }
 
         //element-wise log base 10
         Matrix log10() const{
-            Matrix ans = *this;
-            for (long i = 0; i < (*this).colSize*(*this).rowSize; i++)
-                ans[i] = std::log10(ans[i]);
-            return ans;
+            return mapElems([=](const datatype& x) { return std::log10(x); });
         }
 
         //element-wise log base 2, using computer science notation.
         Matrix lg() const{
-            Matrix ans = *this;
-            for (long i = 0; i < (*this).colSize*(*this).rowSize; i++)
-                ans[i] = std::log2(ans[i]);
-            return ans;
+            return mapElems([=](const datatype& x) { return std::log2(x); });
         }
 
         //element-wise natural log
         Matrix ln() const{
-            Matrix ans = *this;
-            for (long i = 0; i < (*this).colSize*(*this).rowSize; i++)
-                ans[i] = std::log(ans[i]);
-            return ans;
+            return mapElems([=](const datatype& x) { return std::log(x); });
         }
 
         //element-wise log with arbitrary base
         template <typename scalar>
         Matrix log(scalar base) const{
-            Matrix ans = *this;
-            for (long i = 0; i < (*this).colSize*(*this).rowSize; i++)
-                ans[i] = std::log2(ans[i])/std::log2(base);
-            return ans;
+            const auto invLogBase = 1.0 / std::log2(base);   // loop-invariant
+            return mapElems([=](const datatype& x) { return std::log2(x) * invLogBase; });
+        }
+
+        // --- Element-wise trigonometry ---
+        // Each applies std::<fn> to every element independently, exactly like
+        // exp()/ln() above. These are NOT the matrix trig functions — for those
+        // see the free functions sin(A)/cos(A)/... near the bottom of this header.
+        // All follow the same shape: copy *this, map every element, return.
+
+        //element-wise sine
+        Matrix sin() const{
+            return mapElems([=](const datatype& x) { return std::sin(x); });
+        }
+
+        //element-wise cosine
+        Matrix cos() const{
+            return mapElems([=](const datatype& x) { return std::cos(x); });
+        }
+
+        //element-wise tangent
+        Matrix tan() const{
+            return mapElems([=](const datatype& x) { return std::tan(x); });
+        }
+
+        //element-wise arcsine
+        Matrix asin() const{
+            return mapElems([=](const datatype& x) { return std::asin(x); });
+        }
+
+        //element-wise arccosine
+        Matrix acos() const{
+            return mapElems([=](const datatype& x) { return std::acos(x); });
+        }
+
+        //element-wise arctangent
+        Matrix atan() const{
+            return mapElems([=](const datatype& x) { return std::atan(x); });
+        }
+
+        //element-wise hyperbolic sine
+        Matrix sinh() const{
+            return mapElems([=](const datatype& x) { return std::sinh(x); });
+        }
+
+        //element-wise hyperbolic cosine
+        Matrix cosh() const{
+            return mapElems([=](const datatype& x) { return std::cosh(x); });
+        }
+
+        //element-wise hyperbolic tangent
+        Matrix tanh() const{
+            return mapElems([=](const datatype& x) { return std::tanh(x); });
+        }
+
+        //element-wise square root
+        Matrix sqrt() const{
+            return mapElems([=](const datatype& x) { return std::sqrt(x); });
+        }
+
+        //element-wise absolute value
+        Matrix abs() const{
+            return mapElems([=](const datatype& x) { return std::abs(x); });
         }
 
         // Returns whether a matrix is diagonal: all off-diagonal elements are zero.
         // Works for non-square matrices. Single flat loop — no allocations, early exit.
         bool IsDiagonal() const{
-            for (long k = 0; k < rowSize * colSize; k++)
-                if (k / colSize != k % colSize && grid[k] != datatype(0))
-                    return false;
+            // The flat version this replaced recovered (i,j) from k with
+            // k / colSize and k % colSize — two integer divisions for every
+            // element of the matrix, which dominated the loop completely: the
+            // scan ran at 6.5 GB/s against a machine that streams at ~45.
+            // Walking rows explicitly makes the row/column comparison free and
+            // splits each row into two runs the compiler can vectorise, since
+            // neither contains the diagonal and so neither needs a test on j.
+            const datatype* MATRIXCPP_RESTRICT g = grid;
+            const datatype zero = datatype(0);
+            for (long i = 0; i < rowSize; i++) {
+                const datatype* MATRIXCPP_RESTRICT row = g + i * colSize;
+                const long d = (i < colSize) ? i : colSize;   // diagonal, or past the end
+                for (long j = 0; j < d; j++)      if (row[j] != zero) return false;
+                for (long j = d + 1; j < colSize; j++) if (row[j] != zero) return false;
+            }
             return true;
         }
 
@@ -586,10 +1777,27 @@ class Matrix{
                     throw std::invalid_argument(
                         "tr() requires a square non-empty matrix, got " +
                         std::to_string(rowSize) + "x" + std::to_string(colSize));
-                datatype sum = datatype(0);
-                for (long i = 0; i < rowSize; i++) sum += (*this)(int(i), int(i));
-
-                return sum;
+                // Indexed straight into grid rather than through operator(),
+                // which wraps negative indices and so runs a modulo on BOTH
+                // coordinates — two integer divisions (~20-40 cycles each) per
+                // element, for indices the loop bounds already prove in range.
+                // The stride is colSize+1, so this is a diagonal walk with one
+                // cache miss per element and nothing else to do; four
+                // accumulators keep those misses in flight concurrently instead
+                // of serialising on the add.
+                const datatype* MATRIXCPP_RESTRICT g = grid;
+                const long step = colSize + 1;
+                datatype s0 = datatype(0), s1 = datatype(0),
+                         s2 = datatype(0), s3 = datatype(0);
+                long i = 0;
+                for (; i + 3 < rowSize; i += 4) {
+                    s0 += g[i * step];
+                    s1 += g[(i + 1) * step];
+                    s2 += g[(i + 2) * step];
+                    s3 += g[(i + 3) * step];
+                }
+                for (; i < rowSize; i++) s0 += g[i * step];
+                return (s0 + s1) + (s2 + s3);
             }
             catch(const std::exception& e)
             {
@@ -599,80 +1807,339 @@ class Matrix{
         }
         // Returns the sum of all elements in the matrix.
         datatype sum() const{
-            datatype total = datatype(0);
-            for (long i = 0; i < rowSize * colSize; i++) total += grid[i];
-            return total;
+            // Defers to pairwiseSum — NumPy's reduction algorithm — which is both
+            // faster (eight independent accumulator chains instead of one
+            // latency-bound one) and more accurate (O(log n · eps) error growth
+            // instead of O(n · eps)). See its definition near the top of the file.
+            return pairwiseSum(grid, rowSize * colSize);
         }
         // Dimensional sum. addcol=0: returns a (1 x cols) row matrix of column sums.
         //                  addcol=1: returns a (rows x 1) column matrix of row sums.
         Matrix sum(const bool& addcol) const{
-            try{
-                if (!addcol) {
-                    Matrix<datatype> total_vec(1, colSize);
-                    for (long i = 0; i < colSize; i++)
-                        total_vec[i] = (*this)(all, int(i)).sum();
-                    return total_vec;
-                } else {
-                    Matrix<datatype> total_vec(rowSize, 1);
-                    for (long i = 0; i < rowSize; i++)
-                        total_vec[i] = (*this)(int(i), all).sum();
-                    return total_vec;
+            // Accumulates straight out of grid. The slice-based version this
+            // replaced built a whole temporary Matrix per row/column, so a
+            // (n x n) sum cost n allocations and n copies on top of the arithmetic.
+            const datatype* MATRIXCPP_RESTRICT g = grid;
+            if (!addcol) {
+                // Column sums. The accumulator is the whole output row, so this
+                // is already a vector operation — but only if the compiler can
+                // prove the output does not alias the input. It cannot: both are
+                // datatype* from the same allocator, so without __restrict every
+                // store to out[j] has to be re-loaded before the next row. The
+                // restrict qualifiers are what let this run at memory bandwidth.
+                Matrix<datatype> total_vec(1, colSize);
+                datatype* MATRIXCPP_RESTRICT out = total_vec.grid;
+                for (long i = 0; i < rowSize; i++) {
+                    const datatype* MATRIXCPP_RESTRICT row = g + i * colSize;
+                    for (long j = 0; j < colSize; j++) out[j] += row[j];
                 }
-            }catch(const std::exception& e){
-                std::cerr << "Matrix summation error: " << e.what() << std::endl;
-                throw;
+                return total_vec;
             }
+            // Row sums. Each row is a contiguous run, so this is exactly the
+            // reduction pairwiseSum exists for: the single-accumulator loop this
+            // replaced was latency-bound and read 32 MB at 15 GB/s on a machine
+            // that streams at 45.
+            Matrix<datatype> total_vec(rowSize, 1);
+            datatype* MATRIXCPP_RESTRICT out = total_vec.grid;
+            for (long i = 0; i < rowSize; i++)
+                out[i] = pairwiseSum(g + i * colSize, colSize);
+            return total_vec;
         }
+
+        // --- Reductions ---
+        // Every reduction comes in two forms, mirroring sum() / sum(bool) above:
+        //   f()      → scalar over all elements
+        //   f(bool)  → addcol=0: (1 x cols) row matrix of per-column results
+        //              addcol=1: (rows x 1) column matrix of per-row results
+        // The axis versions can reuse the (*this)(all, i) / (*this)(i, all) slice
+        // pattern that sum(bool) already uses.
+
+        // min/max and the arg- variants order their elements with <, which
+        // std::complex deliberately does not provide. Instantiating them on a
+        // complex Matrix is a compile-time error rather than a silent choice of
+        // some arbitrary ordering; every other reduction here works for complex.
+
+        // Smallest element in the matrix.
+        datatype min() const{
+            static_assert(!is_complex<datatype>::value,
+                "min() needs an ordering; std::complex has none. Use A.abs().min().");
+            requireNonEmpty("min");
+            datatype best = grid[0];
+            for (long i = 1; i < rowSize*colSize; i++)
+                if (grid[i] < best) best = grid[i];
+            return best;
+        }
+
+        // Per-column (addcol=0) or per-row (addcol=1) minima.
+        Matrix min(const bool& addcol) const{
+            static_assert(!is_complex<datatype>::value,
+                "min() needs an ordering; std::complex has none. Use A.abs().min().");
+            requireNonEmpty("min");
+            if (!addcol) {
+                Matrix<datatype> out(1, colSize);
+                for (long j = 0; j < colSize; j++) out.grid[j] = grid[j];
+                for (long i = 1; i < rowSize; i++)
+                    for (long j = 0; j < colSize; j++) {
+                        const datatype& v = grid[i * colSize + j];
+                        if (v < out.grid[j]) out.grid[j] = v;
+                    }
+                return out;
+            }
+            Matrix<datatype> out(rowSize, 1);
+            for (long i = 0; i < rowSize; i++) {
+                datatype best = grid[i * colSize];
+                for (long j = 1; j < colSize; j++)
+                    if (grid[i * colSize + j] < best) best = grid[i * colSize + j];
+                out.grid[i] = best;
+            }
+            return out;
+        }
+
+        // Largest element in the matrix.
+        datatype max() const{
+            static_assert(!is_complex<datatype>::value,
+                "max() needs an ordering; std::complex has none. Use A.abs().max().");
+            requireNonEmpty("max");
+            datatype best = grid[0];
+            for (long i = 1; i < rowSize*colSize; i++)
+                if (best < grid[i]) best = grid[i];
+            return best;
+        }
+
+        // Per-column (addcol=0) or per-row (addcol=1) maxima.
+        Matrix max(const bool& addcol) const{
+            static_assert(!is_complex<datatype>::value,
+                "max() needs an ordering; std::complex has none. Use A.abs().max().");
+            requireNonEmpty("max");
+            if (!addcol) {
+                Matrix<datatype> out(1, colSize);
+                for (long j = 0; j < colSize; j++) out.grid[j] = grid[j];
+                for (long i = 1; i < rowSize; i++)
+                    for (long j = 0; j < colSize; j++) {
+                        const datatype& v = grid[i * colSize + j];
+                        if (out.grid[j] < v) out.grid[j] = v;
+                    }
+                return out;
+            }
+            Matrix<datatype> out(rowSize, 1);
+            for (long i = 0; i < rowSize; i++) {
+                datatype best = grid[i * colSize];
+                for (long j = 1; j < colSize; j++)
+                    if (best < grid[i * colSize + j]) best = grid[i * colSize + j];
+                out.grid[i] = best;
+            }
+            return out;
+        }
+
+        // Arithmetic mean of all elements. Returns double so integral matrices
+        // do not truncate — note this differs from sum(), which preserves datatype.
+        double mean() const{
+            static_assert(!is_complex<datatype>::value,
+                "mean(): returns double, which cannot hold a complex mean — it would "
+                "silently average only the real parts. Use A.real().mean() if that is "
+                "what you want.");
+            requireNonEmpty("mean");
+            double acc = 0.0;
+            for (long i = 0; i < rowSize*colSize; i++) acc += double(std::real(grid[i]));
+            return acc / double(rowSize * colSize);
+        }
+
+        // Per-column (addcol=0) or per-row (addcol=1) means.
+        Matrix<double> mean(const bool& addcol) const{
+            static_assert(!is_complex<datatype>::value,
+                "mean(): returns double, which cannot hold a complex mean. "
+                "Use A.real().mean(addcol).");
+            requireNonEmpty("mean");
+            if (!addcol) {
+                Matrix<double> out(1, colSize);
+                for (long i = 0; i < rowSize; i++)
+                    for (long j = 0; j < colSize; j++)
+                        out[int(j)] += double(std::real(grid[i * colSize + j]));
+                for (long j = 0; j < colSize; j++) out[int(j)] /= double(rowSize);
+                return out;
+            }
+            Matrix<double> out(rowSize, 1);
+            for (long i = 0; i < rowSize; i++) {
+                double acc = 0.0;
+                for (long j = 0; j < colSize; j++) acc += double(std::real(grid[i * colSize + j]));
+                out[int(i)] = acc / double(colSize);
+            }
+            return out;
+        }
+
+        // Variance of all elements. sample=false divides by N (population variance),
+        // sample=true divides by N-1 (Bessel-corrected sample variance).
+        // Two-pass: the mean first, then the squared deviations from it. The
+        // one-pass E[x²]-E[x]² shortcut loses most of its significant digits when
+        // the mean is large relative to the spread, so it is not used here.
+        double var(bool sample = false) const{
+            static_assert(!is_complex<datatype>::value,
+                "var(): defined here for real datatypes only — it would silently use "
+                "only the real parts. Use A.real().var() or A.abs().var().");
+            requireNonEmpty("var");
+            long N = rowSize * colSize;
+            if (sample && N < 2)
+                throw std::invalid_argument(
+                    "var(sample=true) needs at least 2 elements, got " + std::to_string(N));
+            double mu = mean(), acc = 0.0;
+            for (long i = 0; i < N; i++) {
+                double d = double(std::real(grid[i])) - mu;
+                acc += d * d;
+            }
+            return acc / double(sample ? N - 1 : N);
+        }
+
+        // Standard deviation of all elements — sqrt of var(sample).
+        double stddev(bool sample = false) const{ return std::sqrt(var(sample)); }
+
+        // Position {row, col} of the smallest element. Ties resolve to the first
+        // encountered in row-major order.
+        std::pair<long, long> argmin() const{
+            static_assert(!is_complex<datatype>::value,
+                "argmin() needs an ordering; std::complex has none.");
+            requireNonEmpty("argmin");
+            long best = 0;
+            for (long i = 1; i < rowSize*colSize; i++)
+                if (grid[i] < grid[best]) best = i;
+            return {best / colSize, best % colSize};
+        }
+
+        // Position {row, col} of the largest element. Ties resolve to the first
+        // encountered in row-major order.
+        std::pair<long, long> argmax() const{
+            static_assert(!is_complex<datatype>::value,
+                "argmax() needs an ordering; std::complex has none.");
+            requireNonEmpty("argmax");
+            long best = 0;
+            for (long i = 1; i < rowSize*colSize; i++)
+                if (grid[best] < grid[i]) best = i;
+            return {best / colSize, best % colSize};
+        }
+
         // Concatenates M to this matrix. concatCol=0: vertical (stack rows, cols must match).
         //                               concatCol=1: horizontal (stack cols, rows must match).
         // If this matrix is empty, returns M directly.
         Matrix concat(const Matrix& M, const bool& concatCol) const{
+            if (this->empty()) return M;
             try{
-                if (this->empty()) return M;
-                if (!concatCol) {
-                    // vertical concat: stack rows, columns must match
-                    if (this->colSize != M.colSize) throw std::invalid_argument(
-                        "concat: column size mismatch: " + std::to_string(colSize) +
-                        " != " + std::to_string(M.colSize));
-                    Matrix<datatype> argumentMatrix(this->rowSize + M.rowSize, colSize);
-                    for (long i = 0; i < this->rowSize; i++)
-                        for (long j = 0; j < colSize; j++)
-                            argumentMatrix(int(i), int(j)) = (*this)(int(i), int(j));
-                    for (long i = 0; i < M.rowSize; i++)
-                        for (long j = 0; j < M.colSize; j++)
-                            argumentMatrix(int(i + this->rowSize), int(j)) = M(int(i), int(j));
-                    return argumentMatrix;
-                } else {
-                    // horizontal concat: stack columns, rows must match
-                    if (this->rowSize != M.rowSize) throw std::invalid_argument(
-                        "concat: row size mismatch: " + std::to_string(rowSize) +
-                        " != " + std::to_string(M.rowSize));
-                    Matrix<datatype> argumentMatrix(rowSize, this->colSize + M.colSize);
-                    for (long i = 0; i < this->rowSize; i++)
-                        for (long j = 0; j < this->colSize; j++)
-                            argumentMatrix(int(i), int(j)) = (*this)(int(i), int(j));
-                    for (long i = 0; i < M.rowSize; i++)
-                        for (long j = 0; j < M.colSize; j++)
-                            argumentMatrix(int(i), int(j + this->colSize)) = M(int(i), int(j));
-                    return argumentMatrix;
-                }
+                if (!concatCol && this->colSize != M.colSize) throw std::invalid_argument(
+                    "concat: column size mismatch: " + std::to_string(colSize) +
+                    " != " + std::to_string(M.colSize));
+                if (concatCol && this->rowSize != M.rowSize) throw std::invalid_argument(
+                    "concat: row size mismatch: " + std::to_string(rowSize) +
+                    " != " + std::to_string(M.rowSize));
             }catch(const std::exception& e){
                 std::cerr << "Matrix concat error: " << e.what() << std::endl;
                 throw;
             }
+            // Both branches used to go through operator(), which wraps negative
+            // indices and therefore runs a modulo on BOTH coordinates — four
+            // integer divisions per element copied, for indices already known to
+            // be in range. These are plain contiguous copies instead.
+            // std::copy rather than a hand-written loop: for a trivially copyable
+            // element type it lowers to memmove, which the C library implements
+            // with wide vector loads and non-temporal stores. concat is purely
+            // memory-bound, so that is the whole cost of the operation.
+            if (!concatCol) {
+                // Vertical: rows stack and the row length is unchanged, so the
+                // two source blocks are already contiguous runs.
+                Matrix<datatype> out(rowSize + M.rowSize, colSize, uninit_t{});
+                const long a = rowSize * colSize;
+                std::copy(grid, grid + a, out.grid);
+                std::copy(M.grid, M.grid + M.rowSize * colSize, out.grid + a);
+                return out;
+            }
+            // Horizontal: rows interleave, so copy one row segment at a time.
+            const long outCols = colSize + M.colSize;
+            Matrix<datatype> out(rowSize, outCols, uninit_t{});
+            for (long i = 0; i < rowSize; i++) {
+                datatype* dst = out.grid + i * outCols;
+                std::copy(grid + i * colSize, grid + (i + 1) * colSize, dst);
+                std::copy(M.grid + i * M.colSize, M.grid + (i + 1) * M.colSize, dst + colSize);
+            }
+            return out;
         }
 
         // Kronecker (tensor) product: replaces every element A_ij with the block A_ij * M.
         // Returns a (rows*M.rows x cols*M.cols) Matrix.
         Matrix tensor(const Matrix& M) const{
-            long rM = M.rowSize, cM = M.colSize;
-            long cOut = colSize * cM;
-            Matrix<datatype> ans(rowSize * rM, cOut);
-            for (long idx = 0; idx < ans.rowSize * ans.colSize; idx++){
-                long r = idx / cOut, c = idx % cOut;
-                ans[idx] = (*this)(int(r / rM), int(c / cM)) * M(int(r % rM), int(c % cM));
+            const long rM = M.rowSize, cM = M.colSize;
+            const long cOut = colSize * cM;
+            Matrix<datatype> ans(rowSize * rM, cOut, uninit_t{});
+            // Iterating by output block rather than by flat index. The flat-index
+            // version cost six integer divisions per element — two to split idx
+            // into (r, c), two more to split those into block and offset, and two
+            // more inside operator() — for a loop whose structure already knows
+            // every one of those values. Nested loops carry them for free, and
+            // the A element is loaded once per block instead of per element.
+            for (long i = 0; i < rowSize; i++) {
+                for (long j = 0; j < colSize; j++) {
+                    const datatype a = grid[i * colSize + j];
+                    for (long p = 0; p < rM; p++) {
+                        datatype* dst = ans.grid + (i * rM + p) * cOut + j * cM;
+                        const datatype* src = M.grid + p * cM;
+                        for (long q = 0; q < cM; q++) dst[q] = a * src[q];
+                    }
+                }
             }
             return ans;
+        }
+
+        // --- Structural extraction and reshaping ---
+
+        // Extracts the main diagonal as a (min(rows,cols) x 1) column vector.
+        // Works for non-square matrices. To go the other way — build a diagonal
+        // matrix FROM a vector — use the free function diag(v) near the bottom.
+        Matrix diag() const{
+            long d = std::min(rowSize, colSize);
+            Matrix<datatype> out(d, 1);
+            for (long i = 0; i < d; i++) out.grid[i] = grid[i * colSize + i];
+            return out;
+        }
+
+        // Upper triangle: copies elements on and above the k-th diagonal, zeros the rest.
+        // k=0 is the main diagonal, k>0 moves above it, k<0 below. Mirrors numpy.triu.
+        Matrix triu(int k = 0) const{
+            Matrix<datatype> out(rowSize, colSize);
+            for (long i = 0; i < rowSize; i++)
+                for (long j = std::max(0L, i + k); j < colSize; j++)
+                    out.grid[i * colSize + j] = grid[i * colSize + j];
+            return out;
+        }
+
+        // Lower triangle: copies elements on and below the k-th diagonal, zeros the rest.
+        // k=0 is the main diagonal, k>0 moves above it, k<0 below. Mirrors numpy.tril.
+        Matrix tril(int k = 0) const{
+            Matrix<datatype> out(rowSize, colSize);
+            for (long i = 0; i < rowSize; i++) {
+                long hi = std::min(colSize - 1, i + k);
+                for (long j = 0; j <= hi; j++)
+                    out.grid[i * colSize + j] = grid[i * colSize + j];
+            }
+            return out;
+        }
+
+        // Reinterprets the elements as a (newRows x newCols) matrix in row-major order.
+        // Requires newRows * newCols == rows * cols. Returns a new Matrix; the
+        // underlying data is copied, not aliased.
+        Matrix reshape(long newRows, long newCols) const{
+            if (newRows < 0 || newCols < 0)
+                throw std::invalid_argument(
+                    "reshape: dimensions must be non-negative, got " +
+                    std::to_string(newRows) + "x" + std::to_string(newCols));
+            if (newRows * newCols != rowSize * colSize)
+                throw std::invalid_argument(
+                    "reshape: cannot reshape " + std::to_string(rowSize) + "x" +
+                    std::to_string(colSize) + " (" + std::to_string(rowSize*colSize) +
+                    " elements) into " + std::to_string(newRows) + "x" +
+                    std::to_string(newCols) + " (" + std::to_string(newRows*newCols) + ")");
+            // uninit_t, not the zeroing constructor: every element is about to
+            // be overwritten, so zero-filling first writes the whole buffer twice.
+            // std::copy rather than an element loop, so a trivially copyable type
+            // lowers to memmove and its wide vector stores.
+            Matrix<datatype> out(newRows, newCols, uninit_t{});
+            std::copy(grid, grid + rowSize * colSize, out.grid);
+            return out;
         }
 
         // --- Random initialisation ---
@@ -746,10 +2213,22 @@ class Matrix{
                 int m = (int)rowSize, n = (int)colSize;
                 int r = std::min(m, n);
 
-                // Working copy in double (row-major flat array)
-                std::vector<double> work(m * n);
-                for (int k = 0; k < m * n; k++) work[k] = double(grid[k]);
-                auto W = [&](int i, int j) -> double& { return work[i * n + j]; };
+                // Working copy in double, stored COLUMN BY COLUMN — Wt[j*m + i]
+                // is A(i,j). Every step of a Householder QR works down columns: the
+                // reflector is built from a column, applied to each trailing column,
+                // and the pivot search swaps whole columns. Row-major storage makes
+                // all of that stride by n, one cache line per element, which is why
+                // the factorisation ran at ~0.3 GFLOP/s. LAPACK's dgeqp3 never has
+                // this problem because Fortran arrays are column-major; storing the
+                // transpose gets the same contiguity here, and the reflector
+                // application becomes a plain dot product followed by an axpy.
+                // Q is already accumulated transposed for exactly this reason —
+                // see the Q block below.
+                std::vector<double> Wt((size_t)n * m);
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < n; j++)
+                        Wt[(size_t)j * m + i] = double(grid[(size_t)i * n + j]);
+                double* MATRIXCPP_RESTRICT wt = Wt.data();
 
                 // Column pivot tracking — pivots[k] = original column index at position k
                 std::vector<int> pivots(n);
@@ -758,7 +2237,7 @@ class Matrix{
                 // Squared column norms for Bischof-Pan pivot selection
                 std::vector<double> sqNorms(n, 0.0);
                 for (int j = 0; j < n; j++)
-                    for (int i = 0; i < m; i++) sqNorms[j] += W(i, j) * W(i, j);
+                    sqNorms[j] = pairwiseSum_sq(wt + (size_t)j * m, m);
 
                 // Householder taus + vectors stored for Q accumulation
                 std::vector<double>              taus(r, 0.0);
@@ -770,22 +2249,25 @@ class Matrix{
                     for (int j = k + 1; j < n; j++)
                         if (sqNorms[j] > sqNorms[jmax]) jmax = j;
                     if (jmax != k) {
-                        for (int i = 0; i < m; i++) std::swap(W(i, k), W(i, jmax));
+                        // A column is a contiguous run now, so the swap is one
+                        // memory-to-memory exchange instead of m strided ones.
+                        std::swap_ranges(wt + (size_t)k * m, wt + (size_t)k * m + m,
+                                         wt + (size_t)jmax * m);
                         std::swap(pivots[k],  pivots[jmax]);
                         std::swap(sqNorms[k], sqNorms[jmax]);
                     }
 
+                    double* MATRIXCPP_RESTRICT colk = wt + (size_t)k * m;
+                    const int sz = m - k;
+
                     // ── Householder reflector for column k, rows k:m-1 ──
                     // Choose alpha opposite in sign to x[0] to avoid cancellation.
-                    double xnorm = 0.0;
-                    for (int i = k; i < m; i++) xnorm += W(i, k) * W(i, k);
-                    xnorm = std::sqrt(xnorm);
+                    double xnorm = std::sqrt(pairwiseSum_sq(colk + k, sz));
 
-                    if (xnorm == 0.0) { hvecs[k].assign(m - k, 0.0); continue; }
+                    if (xnorm == 0.0) { hvecs[k].assign(sz, 0.0); continue; }
 
-                    double alpha = (W(k, k) >= 0.0 ? -1.0 : 1.0) * xnorm;
-                    std::vector<double> v(m - k);
-                    for (int i = 0; i < m - k; i++) v[i] = W(k + i, k);
+                    double alpha = (colk[k] >= 0.0 ? -1.0 : 1.0) * xnorm;
+                    std::vector<double> v(colk + k, colk + m);
                     v[0] -= alpha;  // v = x - alpha*e_1
 
                     double vTv = 0.0;
@@ -794,17 +2276,43 @@ class Matrix{
                     taus[k]  = tau;
                     hvecs[k] = v;
 
-                    // Apply H_k = I - tau*v*v^T to trailing block W(k:m-1, k:n-1)
-                    for (int j = k; j < n; j++) {
-                        double vTw = 0.0;
-                        for (int i = 0; i < m - k; i++) vTw += v[i] * W(k + i, j);
-                        for (int i = 0; i < m - k; i++) W(k + i, j) -= tau * v[i] * vTw;
+                    // Apply H_k = I - tau*v*v^T to trailing block W(k:m-1, k:n-1).
+                    // Every column j is updated independently of every other, so
+                    // this — the O(mn²) bulk of the factorisation — is embarrassingly
+                    // parallel. It is also the loop that column pivoting forces to
+                    // stay at BLAS level 2: the norms have to be downdated before
+                    // the next pivot can be chosen, so unlike LAPACK's unpivoted
+                    // blocked dgeqrf there is no way to batch several reflectors
+                    // into one matrix-matrix product.
+                    const double* MATRIXCPP_RESTRICT vp = v.data();
+                    auto applyCol = [=](int j) {
+                        double* MATRIXCPP_RESTRICT wj = wt + (size_t)j * m + k;
+                        double d0 = 0.0, d1 = 0.0;
+                        int i = 0;
+                        for (; i + 1 < sz; i += 2) { d0 += vp[i] * wj[i]; d1 += vp[i+1] * wj[i+1]; }
+                        for (; i < sz; i++) d0 += vp[i] * wj[i];
+                        const double f = tau * (d0 + d1);
+                        for (i = 0; i < sz; i++) wj[i] -= f * vp[i];
+                    };
+                    const long applyWork = (long)(n - k) * sz;
+                    (void)applyWork;   // only read on the OpenMP path
+#ifdef _OPENMP
+                    if (applyWork >= 32768) {
+                        const int th = (int)std::min<long>(
+                            std::max<long>(applyWork / 8192, 1), omp_get_max_threads());
+                        #pragma omp parallel for schedule(static) num_threads(th)
+                        for (int j = k; j < n; j++) applyCol(j);
+                    } else
+#endif
+                    {
+                        for (int j = k; j < n; j++) applyCol(j);
                     }
 
                     // Bischof-Pan downdate: H_k is orthogonal so column norms are
                     // preserved; the squared norm below row k shrinks by W(k,j)^2.
                     for (int j = k + 1; j < n; j++) {
-                        sqNorms[j] -= W(k, j) * W(k, j);
+                        const double wkj = wt[(size_t)j * m + k];
+                        sqNorms[j] -= wkj * wkj;
                         if (sqNorms[j] < 0.0) sqNorms[j] = 0.0;
                     }
                 }
@@ -813,24 +2321,56 @@ class Matrix{
                 Matrix<double> R(m, n);
                 for (int i = 0; i < m; i++)
                     for (int j = i; j < n; j++)
-                        R(i, j) = W(i, j);
+                        R(i, j) = wt[(size_t)j * m + i];
 
                 // ── Accumulate Q = H_0 * H_1 * … * H_{r-1} ──
                 // Apply reflectors in reverse order to the m×m identity.
                 // At descending step k, columns 0:k-1 of Q are zero in rows k:m-1,
                 // so only columns k:m-1 need updating.
-                Matrix<double> Q(m, m);
-                for (int i = 0; i < m; i++) Q(i, i) = 1.0;
+                //
+                // Accumulated TRANSPOSED. Each reflector touches rows k..m-1 of a
+                // fixed column, which in row-major storage strides by a whole row
+                // — a cache miss per element, and this loop is the bulk of the
+                // factorisation. Working on Qt makes the same update contiguous;
+                // it is transposed back once at the end, which is O(m²) against
+                // the O(m³) it saves. Same reasoning as the Q accumulation in
+                // schurDecomp().
+                std::vector<double> Qt((size_t)m * m, 0.0);
+                for (int i = 0; i < m; i++) Qt[(size_t)i * m + i] = 1.0;
+                double* MATRIXCPP_RESTRICT qt = Qt.data();
                 for (int k = r - 1; k >= 0; k--) {
                     if (taus[k] == 0.0) continue;
-                    const auto& v = hvecs[k];
-                    int sz = (int)v.size();
-                    for (int j = k; j < m; j++) {
-                        double vTq = 0.0;
-                        for (int i = 0; i < sz; i++) vTq += v[i] * Q(k + i, j);
-                        for (int i = 0; i < sz; i++) Q(k + i, j) -= taus[k] * v[i] * vTq;
+                    const double* MATRIXCPP_RESTRICT v = hvecs[k].data();
+                    const int sz = (int)hvecs[k].size();
+                    const double tau = taus[k];
+                    // Independent per column j, exactly like the panel update, so
+                    // it parallelises the same way.
+                    auto applyQ = [=](int j) {
+                        double* MATRIXCPP_RESTRICT qj = qt + (size_t)j * m + k;  // Q(k.., j)
+                        double d0 = 0.0, d1 = 0.0;
+                        int i = 0;
+                        for (; i + 1 < sz; i += 2) { d0 += v[i] * qj[i]; d1 += v[i+1] * qj[i+1]; }
+                        for (; i < sz; i++) d0 += v[i] * qj[i];
+                        const double f = tau * (d0 + d1);
+                        for (i = 0; i < sz; i++) qj[i] -= f * v[i];
+                    };
+                    const long qWork = (long)(m - k) * sz;
+                    (void)qWork;       // only read on the OpenMP path
+#ifdef _OPENMP
+                    if (qWork >= 32768) {
+                        const int th = (int)std::min<long>(
+                            std::max<long>(qWork / 8192, 1), omp_get_max_threads());
+                        #pragma omp parallel for schedule(static) num_threads(th)
+                        for (int j = k; j < m; j++) applyQ(j);
+                    } else
+#endif
+                    {
+                        for (int j = k; j < m; j++) applyQ(j);
                     }
                 }
+                Matrix<double> Q(m, m, Matrix<double>::uninit_t{});
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < m; j++) Q(i, j) = Qt[(size_t)j * m + i];
 
                 // ── Materialise P: A*P = Q*R, so P[pivots[k], k] = 1 ──
                 Matrix<datatype> P(n, n);
@@ -841,6 +2381,163 @@ class Matrix{
             } catch (const std::exception& e) {
                 std::cerr << "QR factorization error: " << e.what() << '\n';
                 throw;
+            }
+        }
+
+        // Matrix norm. Works for any m×n.
+        //   NormType::Fro — sqrt(sum of squares of every element)
+        //   NormType::One — max absolute column sum
+        //   NormType::Inf — max absolute row sum
+        //   NormType::Two — largest singular value; needs svd(), so implement that first
+        // Usage: double e = (A*x - b).norm();
+        double norm(NormType type = NormType::Fro) const{
+            if (rowSize * colSize == 0) return 0.0;
+            switch (type) {
+                case NormType::One: {
+                    double best = 0.0;
+                    for (long j = 0; j < colSize; j++) {
+                        double acc = 0.0;
+                        for (long i = 0; i < rowSize; i++) acc += magnitude(grid[i * colSize + j]);
+                        if (acc > best) best = acc;
+                    }
+                    return best;
+                }
+                case NormType::Inf: {
+                    double best = 0.0;
+                    for (long i = 0; i < rowSize; i++) {
+                        double acc = 0.0;
+                        for (long j = 0; j < colSize; j++) acc += magnitude(grid[i * colSize + j]);
+                        if (acc > best) best = acc;
+                    }
+                    return best;
+                }
+                case NormType::Two: {
+                    // if constexpr, not a plain if: svd() static_asserts against
+                    // complex, and a runtime branch would still instantiate it —
+                    // which would make even A.norm() (Frobenius) fail to compile
+                    // for a complex matrix, though Fro/One/Inf are perfectly well
+                    // defined there via the complex modulus.
+                    if constexpr (is_complex<datatype>::value) {
+                        throw std::invalid_argument(
+                            "norm(Two): the spectral norm needs svd(), which is not yet "
+                            "implemented for complex datatypes. Fro/One/Inf all work.");
+                    } else {
+                        auto [U, S, V] = svd();
+                        (void)U; (void)V;
+                        return S.rows() && S.cols() ? S(0, 0) : 0.0;   // sorted descending
+                    }
+                }
+                case NormType::Fro:
+                default: {
+                    // Fast path: one pass, four accumulators, tracking the largest
+                    // magnitude alongside the sum so the safety of the result can
+                    // be decided by arithmetic rather than by inspecting it.
+                    //
+                    // Deliberately NOT std::isfinite(acc): -ffast-math implies
+                    // -ffinite-math-only, under which that folds to a constant
+                    // true and the guard silently disappears. Comparing the
+                    // tracked maximum against a bound no optimisation flag can
+                    // reason away keeps this correct under every build line.
+                    const long total = rowSize * colSize;
+                    double a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0, mx = 0.0;
+                    long i = 0;
+                    // Squared magnitudes throughout — the overflow guard compares
+                    // against the squared bound, so no square root is needed here
+                    // either. For a complex matrix that removes one sqrt per element.
+                    // The accumulators may overflow to infinity here; that is
+                    // harmless, because whether to trust them is decided by mx,
+                    // which tracks the largest COMPONENT and so cannot itself
+                    // overflow. Testing the accumulated square would be too late.
+                    for (; i + 3 < total; i += 4) {
+                        a0 += magnitudeSq(grid[i]);     a1 += magnitudeSq(grid[i + 1]);
+                        a2 += magnitudeSq(grid[i + 2]); a3 += magnitudeSq(grid[i + 3]);
+                        const double c0 = maxComponent(grid[i]),     c1 = maxComponent(grid[i + 1]);
+                        const double c2 = maxComponent(grid[i + 2]), c3 = maxComponent(grid[i + 3]);
+                        const double p0 = c0 > c1 ? c0 : c1, p1 = c2 > c3 ? c2 : c3;
+                        const double p = p0 > p1 ? p0 : p1;
+                        if (p > mx) mx = p;
+                    }
+                    for (; i < total; i++) {
+                        a0 += magnitudeSq(grid[i]);
+                        const double c = maxComponent(grid[i]);
+                        if (c > mx) mx = c;
+                    }
+                    // Safe when total * mx^2 cannot overflow, and when the squares
+                    // are still above the subnormal floor. Outside that window the
+                    // scaled pass below is the only way to get the right answer.
+                    // Safe when total * 2 * mx^2 stays inside double's range (the
+                    // 2 covers re^2 + im^2 for a complex element), and when the
+                    // squares stay above the subnormal floor.
+                    const double hiBound = std::sqrt(std::numeric_limits<double>::max()
+                                                     / (2.0 * double(total > 0 ? total : 1)));
+                    const double loBound = std::sqrt(std::numeric_limits<double>::min()) * 1e3;
+                    if (mx == 0.0) return 0.0;
+                    if (mx < hiBound && mx > loBound) return std::sqrt((a0 + a1) + (a2 + a3));
+
+                    // Slow path: rescale by the largest magnitude so the squares
+                    // stay representable. Reached only for matrices whose entries
+                    // sit near the top or bottom of double's range.
+                    double sc = 0.0;
+                    for (long k = 0; k < total; k++) {
+                        double t = magnitude(grid[k]) / mx;
+                        sc += t * t;
+                    }
+                    return mx * std::sqrt(sc);
+                }
+            }
+        }
+
+        // Numerical rank: the number of linearly independent columns.
+        // The column-pivoted QR above is already the rank-revealing tool — count the
+        // diagonal entries of R whose magnitude exceeds tol. Passing tol < 0 selects
+        // the LAPACK-style default, max(m,n) * eps * |R(0,0)|.
+        long rank(double tol = -1.0) const{
+            if (rowSize * colSize == 0) return 0;
+            auto [Q, R, P] = QR();
+            (void)Q; (void)P;
+            long d = std::min(rowSize, colSize);
+            // Column pivoting orders |R(i,i)| non-increasingly, so the first entry
+            // is the largest and the count can stop at the first one below tol.
+            if (tol < 0.0)
+                tol = double(std::max(rowSize, colSize)) *
+                      std::numeric_limits<double>::epsilon() * std::abs(R(0, 0));
+            long r = 0;
+            for (long i = 0; i < d; i++) {
+                if (std::abs(R(int(i), int(i))) <= tol) break;
+                r++;
+            }
+            return r;
+        }
+
+        // Condition number ||A|| * ||A^-1|| in the given norm — how much a relative
+        // error in b is amplified when solving A*x = b. Large means ill-conditioned.
+        // NormType::Two is the usual choice and equals sigma_max / sigma_min from svd().
+        //
+        // A singular matrix returns infinity. CAUTION under this project's compile
+        // line: -ffast-math implies -ffinite-math-only, which lets the compiler
+        // assume infinities never occur, and std::isinf() then folds to false. The
+        // value returned is still infinity; it is the TEST that stops working. Use
+        // a magnitude threshold (c > 1e15) rather than std::isinf() if you build
+        // with -ffast-math, or drop the flag.
+        double cond(NormType type = NormType::Two) const{
+            const double inf = std::numeric_limits<double>::infinity();
+            if (rowSize * colSize == 0) return 0.0;
+            if (type == NormType::Two) {
+                auto [U, S, V] = svd();
+                (void)U; (void)V;
+                long d = std::min(S.rows(), S.cols());
+                double smax = S(0, 0), smin = S(int(d - 1), int(d - 1));
+                return smin == 0.0 ? inf : smax / smin;   // singular, infinitely ill-conditioned
+            }
+            if (rowSize != colSize)
+                throw std::invalid_argument(
+                    "cond: the One/Inf/Fro condition number needs a square matrix, got " +
+                    std::to_string(rowSize) + "x" + std::to_string(colSize) +
+                    " — use NormType::Two, which is defined for any shape");
+            try {
+                return norm(type) * inverse().norm(type);
+            } catch (const std::exception&) {
+                return inf;   // inverse() throws on a singular matrix
             }
         }
 
@@ -876,6 +2573,103 @@ class Matrix{
             }
         }
 
+        // Cholesky factorisation A = L * L^T for symmetric positive-definite A.
+        // Roughly half the work of LU since it exploits symmetry — the reason it is
+        // the default for covariance matrices, normal equations, Kalman filters and
+        // GP kernels. Returns the lower-triangular L (upper triangle zeroed).
+        // Throws if A is not square, not symmetric, or not positive definite —
+        // a failed Cholesky is in fact the standard *test* for positive definiteness.
+        // Usage: auto L = A.cholesky();
+        Matrix<double> cholesky() const {
+            static_assert(!is_complex<datatype>::value,
+                "cholesky: not yet implemented for complex datatypes. It would compile by\n"
+                "taking std::real() of each entry and silently discard the imaginary\n"
+                "part — a wrong answer, not a limitation. See roadmap item 1 (work_t).");
+            try {
+                if (rowSize != colSize)
+                    throw std::invalid_argument(
+                        "cholesky: matrix must be square, got " +
+                        std::to_string(rowSize) + "x" + std::to_string(colSize));
+                if (rowSize == 0)
+                    throw std::invalid_argument("cholesky: matrix must be non-empty");
+                int n = (int)rowSize;
+
+                // Symmetry check, relative to the size of the entries involved.
+                double scale = norm(NormType::Inf);
+                double symTol = std::numeric_limits<double>::epsilon() * 100.0 *
+                                (scale > 0.0 ? scale : 1.0);
+                for (int i = 0; i < n; i++)
+                    for (int j = 0; j < i; j++)
+                        if (magnitude(grid[i * n + j] - grid[j * n + i]) > symTol)
+                            throw std::domain_error(
+                                "cholesky: matrix is not symmetric — A(" + std::to_string(i) +
+                                "," + std::to_string(j) + ") != A(" + std::to_string(j) +
+                                "," + std::to_string(i) + ")");
+
+                // Right-looking Cholesky in the shape of LAPACK's unblocked dpotf2:
+                // row i of L is built from dot products of two ALREADY-COMPLETED
+                // rows of L, which are contiguous runs in row-major order. Two
+                // things were costing far more than the arithmetic:
+                //
+                //   * L(i,k) and L(j,k) went through operator(), which wraps
+                //     negative indices and therefore runs a modulo on both
+                //     coordinates — four integer divisions in the innermost loop
+                //     of an O(n³/6) algorithm. This alone held the factorisation
+                //     to 0.78 GFLOP/s.
+                //   * one accumulator makes each multiply-add wait for the
+                //     previous one, so the dot product ran at the latency of an
+                //     FMA rather than its throughput. Four independent chains fix
+                //     that, exactly as sum() does.
+                //
+                // The i==j case is split out of the j loop rather than tested
+                // inside it: the diagonal needs L(i,k)² and a square root, the
+                // off-diagonal needs a division, and branching on that in the
+                // hot loop blocks vectorisation for both.
+                Matrix<double> L(n, n);
+                double* MATRIXCPP_RESTRICT Lg = L.grid;
+                for (long i = 0; i < n; i++) {
+                    double* MATRIXCPP_RESTRICT Li = Lg + i * n;
+                    for (long j = 0; j < i; j++) {
+                        const double* MATRIXCPP_RESTRICT Lj = Lg + j * n;
+                        double a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+                        long k = 0;
+                        for (; k + 3 < j; k += 4) {
+                            a0 += Li[k]     * Lj[k];
+                            a1 += Li[k + 1] * Lj[k + 1];
+                            a2 += Li[k + 2] * Lj[k + 2];
+                            a3 += Li[k + 3] * Lj[k + 3];
+                        }
+                        for (; k < j; k++) a0 += Li[k] * Lj[k];
+                        const double acc = double(std::real(grid[i * n + j]))
+                                         - ((a0 + a1) + (a2 + a3));
+                        Li[j] = acc / Lj[j];
+                    }
+                    double d0 = 0.0, d1 = 0.0, d2 = 0.0, d3 = 0.0;
+                    long k = 0;
+                    for (; k + 3 < i; k += 4) {
+                        d0 += Li[k]     * Li[k];
+                        d1 += Li[k + 1] * Li[k + 1];
+                        d2 += Li[k + 2] * Li[k + 2];
+                        d3 += Li[k + 3] * Li[k + 3];
+                    }
+                    for (; k < i; k++) d0 += Li[k] * Li[k];
+                    const double piv = double(std::real(grid[i * n + i]))
+                                     - ((d0 + d1) + (d2 + d3));
+                    // A non-positive pivot IS the proof that A is not positive
+                    // definite — this failure is the standard PD test.
+                    if (piv <= 0.0)
+                        throw std::domain_error(
+                            "cholesky: matrix is not positive definite — non-positive "
+                            "pivot " + std::to_string(piv) + " at index " + std::to_string(i));
+                    Li[i] = std::sqrt(piv);
+                }
+                return L;
+            } catch (const std::exception& e) {
+                std::cerr << "cholesky() error: " << e.what() << '\n';
+                throw;
+            }
+        }
+
         // Returns the determinant via LU factorisation.
         // Integer types are rounded to avoid floating-point drift (e.g. 2.9999 → 3).
         datatype det() const {
@@ -905,6 +2699,18 @@ class Matrix{
         //   eigenvalues — n×1 column vector (diagonal of Schur form)
         //   Q           — n×n orthogonal matrix (eigenvectors for symmetric A,
         //                 Schur vectors for general A)
+        //
+        // REAL eigenvalues only. schurDecomp() returns a REAL Schur form, in which
+        // a complex-conjugate pair a±bi occupies a 2x2 diagonal block rather than
+        // a single entry; reading the bare diagonal there yields `a` twice and
+        // discards ±bi. This used to happen silently — a plain 2D rotation matrix
+        // is enough to trigger it — so eig() now detects such a block and THROWS
+        // rather than returning a plausible-looking wrong answer.
+        //
+        // If the matrix may have complex eigenvalues, call eigvals() below, which
+        // is block-aware and returns Matrix<std::complex<double>>. Symmetric
+        // matrices are always real-eigenvalued, so eig() is safe for those by
+        // construction. schurDecomp() remains available for the raw factors.
         std::pair<Matrix<double>, Matrix<double>> eig() const {
             try {
                 if (rowSize != colSize)
@@ -915,6 +2721,13 @@ class Matrix{
                     throw std::invalid_argument("eig: matrix must be non-empty");
                 int n = (int)rowSize;
                 auto [H, Qv] = schurDecomp();
+                for (int i = 0; i + 1 < n; i++)
+                    if (isSchurBlock(H, n, i))
+                        throw std::domain_error(
+                            "eig: the Schur form has a 2x2 block at index " + std::to_string(i) +
+                            ", i.e. a complex-conjugate eigenvalue pair. Real eigenvalues "
+                            "cannot represent it — use eigvals(), which returns "
+                            "Matrix<std::complex<double>>");
                 Matrix<double> eigenvals(n, 1), eigenvecs(n, n);
                 for (int i = 0; i < n; i++) eigenvals(i, 0) = H[i * n + i];
                 for (int i = 0; i < n; i++)
@@ -927,55 +2740,789 @@ class Matrix{
             }
         }
 
-        // Computes A^(-1) via LU factorisation and back-substitution.
-        // Solves A * X = I column by column. Requires square, non-singular matrix.
+        // Every eigenvalue, complex ones included, as an n×1 complex column vector.
+        // This is the block-aware counterpart to eig(): it walks the real Schur
+        // form and, wherever a 2x2 block sits on the diagonal, takes both roots of
+        // that block's characteristic polynomial λ² − tr·λ + det instead of reading
+        // the diagonal entry. Ordering follows the Schur form, not magnitude.
+        // Usage: auto lambda = A.eigvals();   // lambda(k,0) is std::complex<double>
+        Matrix<std::complex<double>> eigvals() const {
+            try {
+                if (rowSize != colSize)
+                    throw std::invalid_argument(
+                        "eigvals: matrix must be square, got " +
+                        std::to_string(rowSize) + "x" + std::to_string(colSize));
+                if (rowSize == 0)
+                    throw std::invalid_argument("eigvals: matrix must be non-empty");
+                int n = (int)rowSize;
+                Matrix<std::complex<double>> out(n, 1);
+                if (n == 1) { out(0, 0) = std::complex<double>(double(std::real(grid[0])), 0.0); return out; }
+
+                auto [H, Qv] = schurDecomp();
+                (void)Qv;
+                for (int i = 0; i < n; ) {
+                    if (i + 1 < n && isSchurBlock(H, n, i)) {
+                        double a = H[i*n + i],       b = H[i*n + (i+1)];
+                        double c = H[(i+1)*n + i],   d = H[(i+1)*n + (i+1)];
+                        double half = (a + d) / 2.0;
+                        double disc = half * half - (a * d - b * c);
+                        if (disc >= 0.0) {          // block did not actually pair up
+                            double rt = std::sqrt(disc);
+                            out(i,   0) = std::complex<double>(half + rt, 0.0);
+                            out(i+1, 0) = std::complex<double>(half - rt, 0.0);
+                        } else {
+                            double im = std::sqrt(-disc);
+                            out(i,   0) = std::complex<double>(half,  im);
+                            out(i+1, 0) = std::complex<double>(half, -im);
+                        }
+                        i += 2;
+                    } else {
+                        out(i, 0) = std::complex<double>(H[i*n + i], 0.0);
+                        i++;
+                    }
+                }
+                return out;
+            } catch (const std::exception& e) {
+                std::cerr << "eigvals() error: " << e.what() << '\n';
+                throw;
+            }
+        }
+
+        // Singular value decomposition A = U * S * V^T. Works for any m×n.
+        //   U — m×m orthogonal (left singular vectors)
+        //   S — m×n diagonal, singular values in descending order, all >= 0
+        //   V — n×n orthogonal (right singular vectors; note this returns V, not V^T)
+        // The last major decomposition missing. Once it exists, norm(Two), cond(Two),
+        // pinv() and a more robust rank() all fall out of it, as does PCA and
+        // low-rank approximation.
+        // Method: one-sided Jacobi, not the bidiagonalise-then-QR route. It
+        // rotates pairs of columns of A until they are mutually orthogonal; at that
+        // point A*V = U*S, so the column norms ARE the singular values and the
+        // normalised columns ARE the left singular vectors. It is chosen here
+        // because it computes the small singular values to high *relative*
+        // accuracy, which is exactly what cond() and pinv() depend on, and because
+        // it needs no shift strategy to converge.
+        // Usage: auto [U, S, V] = A.svd();
+        std::tuple<Matrix<double>, Matrix<double>, Matrix<double>> svd() const {
+            static_assert(!is_complex<datatype>::value,
+                "svd: not yet implemented for complex datatypes. It would compile by\n"
+                "taking std::real() of each entry and silently discard the imaginary\n"
+                "part — a wrong answer, not a limitation. See roadmap item 1 (work_t).");
+            try {
+                if (rowSize == 0 || colSize == 0)
+                    throw std::invalid_argument("svd: matrix must be non-empty");
+
+                int m = (int)rowSize, n = (int)colSize;
+
+                // One-sided Jacobi orthogonalises COLUMNS, so it needs at least as
+                // many rows as columns. For a wide matrix, factor the transpose and
+                // read the result back: A = (Aᵀ)ᵀ = (U'S'V'ᵀ)ᵀ = V' S'ᵀ U'ᵀ.
+                if (m < n) {
+                    Matrix<double> At(n, m);
+                    for (int i = 0; i < m; i++)
+                        for (int j = 0; j < n; j++)
+                            At(j, i) = double(std::real(grid[i * n + j]));
+                    auto [U2, S2, V2] = At.svd();
+                    return std::make_tuple(V2, S2.T(), U2);
+                }
+
+                // ---- Layout: everything is stored TRANSPOSED. ----
+                // One-sided Jacobi does all its work on COLUMNS: every rotation
+                // reads and writes two whole columns of W and two of V. In a
+                // row-major array a column is strided by n, so each rotation
+                // touched one cache line per element, nothing vectorised, and the
+                // whole factorisation ran at ~1.1 GFLOP/s. LAPACK does not have
+                // this problem because Fortran is column-major — dgesvj's columns
+                // are contiguous by construction.
+                //
+                // Storing the TRANSPOSES gets the same property here: row p of Wt
+                // is column p of W, so a rotation is now two contiguous runs and
+                // the compiler can vectorise it. This is the single biggest change
+                // in the function.
+                std::vector<double> Wt(std::size_t(n) * m), Vt(std::size_t(n) * n, 0.0);
+                for (long i = 0; i < m; i++)
+                    for (long j = 0; j < n; j++)
+                        Wt[j * m + i] = double(std::real(grid[i * n + j]));
+                for (long j = 0; j < n; j++) Vt[j * n + j] = 1.0;
+                double* MATRIXCPP_RESTRICT wt = Wt.data();
+                double* MATRIXCPP_RESTRICT vt = Vt.data();
+
+                // ---- Cached column norms, as in dgesvj's sva[] array. ----
+                // The version this replaced recomputed all THREE inner products
+                // (p·p, q·q, p·q) for every one of the n(n-1)/2 pairs in every
+                // sweep. Only the cross term p·q actually changes unpredictably:
+                // the two squared norms can be carried forward through the
+                // rotation exactly, because zeroing the cross term means
+                //     alpha' = alpha - t*gamma,   beta' = beta + t*gamma
+                // (substitute s = c*t and 1 - t^2 = 2*zeta*t into the 2x2 Gram
+                // update to check this). That drops the per-pair cost from three
+                // dot products to one — and a pair that is already converged now
+                // costs one dot product and no rotation at all.
+                std::vector<double> sva(n);
+                auto refreshNorms = [&]() {
+                    for (long j = 0; j < n; j++) {
+                        const double* MATRIXCPP_RESTRICT wj = wt + j * m;
+                        double a0 = 0.0, a1 = 0.0;
+                        long i = 0;
+                        for (; i + 1 < m; i += 2) { a0 += wj[i] * wj[i]; a1 += wj[i+1] * wj[i+1]; }
+                        for (; i < m; i++) a0 += wj[i] * wj[i];
+                        sva[j] = a0 + a1;
+                    }
+                };
+                refreshNorms();
+
+                const double eps = std::numeric_limits<double>::epsilon();
+                const int maxSweeps = 60;
+
+                // One pair of columns: orthogonalise them and record how far from
+                // orthogonal they were. Returns that relative off-diagonal size so
+                // the sweep can decide whether it has converged.
+                auto processPair = [&](long p, long q) -> double {
+                    const double alpha = sva[p], beta = sva[q];
+                    if (alpha == 0.0 || beta == 0.0) return 0.0;
+                    double* MATRIXCPP_RESTRICT wp = wt + p * m;
+                    double* MATRIXCPP_RESTRICT wq = wt + q * m;
+
+                    double g0 = 0.0, g1 = 0.0;
+                    long i = 0;
+                    for (; i + 1 < m; i += 2) {
+                        g0 += wp[i]     * wq[i];
+                        g1 += wp[i + 1] * wq[i + 1];
+                    }
+                    for (; i < m; i++) g0 += wp[i] * wq[i];
+                    const double gamma = g0 + g1;
+                    if (gamma == 0.0) return 0.0;
+
+                    // Relative, not absolute: this is what buys the small
+                    // singular values their relative accuracy.
+                    const double conv = std::abs(gamma) / std::sqrt(alpha * beta);
+                    if (conv <= eps) return conv;
+
+                    // Jacobi rotation zeroing the p-q inner product.
+                    const double zeta = (beta - alpha) / (2.0 * gamma);
+                    const double t = (zeta >= 0.0 ? 1.0 : -1.0) /
+                                     (std::abs(zeta) + std::sqrt(1.0 + zeta * zeta));
+                    const double c = 1.0 / std::sqrt(1.0 + t * t), sn = c * t;
+                    for (long k = 0; k < m; k++) {
+                        const double a = wp[k], b = wq[k];
+                        wp[k] = c * a - sn * b;
+                        wq[k] = sn * a + c * b;
+                    }
+                    double* MATRIXCPP_RESTRICT vp = vt + p * n;
+                    double* MATRIXCPP_RESTRICT vq = vt + q * n;
+                    for (long k = 0; k < n; k++) {
+                        const double a = vp[k], b = vq[k];
+                        vp[k] = c * a - sn * b;
+                        vq[k] = sn * a + c * b;
+                    }
+                    sva[p] = alpha - t * gamma;
+                    sva[q] = beta  + t * gamma;
+                    return conv;
+                };
+
+                // ---- Brent-Luk round-robin ("chess tournament") pair ordering. ----
+                // The natural p<q double loop visits pairs in an order where
+                // consecutive pairs share a column, so no two can be done at the
+                // same time. The round-robin schedule instead splits a sweep into
+                // np-1 ROUNDS of np/2 pairs each, where the pairs within a round
+                // are column-disjoint by construction — seat the columns around a
+                // circle, pair each seat with the one opposite, then rotate all but
+                // one seat by a position. Every pair still occurs exactly once per
+                // sweep, so this is a legitimate cyclic ordering with the same
+                // convergence behaviour, but now a whole round runs in parallel.
+                //
+                // Being column-disjoint also makes the result DETERMINISTIC: no two
+                // pairs in a round read or write the same column of W, V or sva, so
+                // the answer does not depend on the thread count or the schedule.
+                //
+                // An odd number of columns gets one padding seat whose pairs are
+                // skipped — the standard way to handle a bye in a round-robin.
+                const long np = n + (n & 1);
+                std::vector<long> ring(np);
+                const long half = np / 2;
+
+                // A sweep is np-1 rounds, so a 256-column matrix enters ~2000
+                // parallel regions per factorisation. That makes the thread count
+                // matter more than usual: too few and the cores idle, too many and
+                // the ~360 ns region entry plus the barrier at the end of each
+                // round costs more than the round does. Measured at n = 256:
+                //
+                //     threads   1     2     4     8    16    32
+                //     ms       78.4  38.0  21.4  19.1  35.0  63.4
+                //
+                // so the useful range ends once a thread has fewer than ~8k
+                // element-updates to do. Requesting that many threads and no more
+                // tracks the optimum at every size. Below one thread's worth of
+                // work the serial path runs with no OpenMP construct anywhere near
+                // it — an `if` clause on the pragma is not enough, the runtime
+                // still charges for evaluating it.
+                const long roundWork = half * (m + n);
+                const long WORK_PER_THREAD = 8192;
+                (void)roundWork; (void)WORK_PER_THREAD;   // only read on the OpenMP path
+#ifdef _OPENMP
+                const int sweepThreads = (int)std::min<long>(
+                    std::max<long>(roundWork / WORK_PER_THREAD, 1), omp_get_max_threads());
+#else
+                const int sweepThreads = 1;
+#endif
+                const bool parallelSweep = (sweepThreads > 1);
+
+                for (int sweep = 0; sweep < maxSweeps; sweep++) {
+                    double offMax = 0.0;
+                    for (long i = 0; i < np; i++) ring[i] = i;
+                    for (long round = 0; round < np - 1; round++) {
+#ifdef _OPENMP
+                        if (parallelSweep) {
+                            #pragma omp parallel for schedule(static) \
+                                    reduction(max:offMax) num_threads(sweepThreads)
+                            for (long i = 0; i < half; i++) {
+                                const long a = ring[i], b = ring[np - 1 - i];
+                                if (a >= n || b >= n) continue;     // padding seat
+                                const double conv = processPair(a < b ? a : b, a < b ? b : a);
+                                if (conv > offMax) offMax = conv;
+                            }
+                        } else
+#endif
+                        {
+                            for (long i = 0; i < half; i++) {
+                                const long a = ring[i], b = ring[np - 1 - i];
+                                if (a >= n || b >= n) continue;     // padding seat
+                                const double conv = processPair(a < b ? a : b, a < b ? b : a);
+                                if (conv > offMax) offMax = conv;
+                            }
+                        }
+                        // Rotate every seat but the first, so each column meets a
+                        // different partner next round.
+                        const long last = ring[np - 1];
+                        for (long i = np - 1; i > 1; i--) ring[i] = ring[i - 1];
+                        ring[1] = last;
+                    }
+                    // The incremental norm update inside processPair is exact in
+                    // real arithmetic but drifts in floating point over many
+                    // sweeps. Recomputing once per sweep costs O(mn) against the
+                    // sweep's O(mn²), so it is free, and it keeps the convergence
+                    // test honest — dgesvj refreshes for the same reason.
+                    refreshNorms();
+                    if (offMax <= eps) break;
+                }
+                (void)parallelSweep;
+
+                auto w = [&](long i, long j) -> double& { return wt[j * m + i]; };
+
+                // Column norms are the singular values; sort them descending and
+                // carry the same permutation through the columns of W and V.
+                std::vector<double> sigma(n, 0.0);
+                for (long j = 0; j < n; j++) sigma[j] = std::sqrt(sva[j]);
+                std::vector<int> order(n);
+                std::iota(order.begin(), order.end(), 0);
+                std::sort(order.begin(), order.end(),
+                          [&](int a, int b) { return sigma[a] > sigma[b]; });
+
+                Matrix<double> S(m, n), Vm(n, n), U(m, m);
+                for (int j = 0; j < n; j++) {
+                    S(j, j) = sigma[order[j]];
+                    // Vt is stored transposed, so column order[j] of V is a
+                    // contiguous row of Vt.
+                    const double* MATRIXCPP_RESTRICT vsrc = vt + (long)order[j] * n;
+                    for (long i = 0; i < n; i++) Vm(int(i), j) = vsrc[i];
+                }
+
+                // Left singular vectors: the normalised columns of W, for every
+                // singular value that is numerically non-zero.
+                double sTol = double(std::max(m, n)) * eps * (n ? sigma[order[0]] : 0.0);
+                int r = 0;
+                while (r < n && sigma[order[r]] > sTol) r++;
+                for (int j = 0; j < r; j++) {
+                    double sj = sigma[order[j]];
+                    for (int i = 0; i < m; i++) U(i, j) = w(i, order[j]) / sj;
+                }
+
+                // U must come back m×m orthogonal, but only r of its columns are
+                // determined by A. Fill the remaining ones with any orthonormal
+                // completion: push each canonical basis vector through modified
+                // Gram-Schmidt and keep the ones with a surviving component.
+                // Twice — one pass loses orthogonality when the residual is small.
+                int filled = r;
+                for (int cand = 0; cand < m && filled < m; cand++) {
+                    std::vector<double> x(m, 0.0);
+                    x[cand] = 1.0;
+                    for (int pass = 0; pass < 2; pass++)
+                        for (int j = 0; j < filled; j++) {
+                            double dot = 0.0;
+                            for (int i = 0; i < m; i++) dot += U(i, j) * x[i];
+                            for (int i = 0; i < m; i++) x[i] -= dot * U(i, j);
+                        }
+                    double nx = 0.0;
+                    for (int i = 0; i < m; i++) nx += x[i] * x[i];
+                    nx = std::sqrt(nx);
+                    if (nx < 1e-8) continue;   // already spanned; try the next one
+                    for (int i = 0; i < m; i++) U(i, filled) = x[i] / nx;
+                    filled++;
+                }
+
+                return std::make_tuple(U, S, Vm);
+            } catch (const std::exception& e) {
+                std::cerr << "svd() error: " << e.what() << '\n';
+                throw;
+            }
+        }
+
+        // Computes A^(-1) by solving A * X = I. Requires a square, non-singular
+        // matrix. The factor-and-substitute machinery this used to inline now lives
+        // in solve(), so there is one copy of it to get right rather than two. The
+        // flop count is unchanged: both versions factor once and substitute n times.
+        //
+        // If you are about to write A.inverse() * b, write A.solve(b) instead:
+        // fewer flops and better conditioned. See the note on solve().
         Matrix<double> inverse() const {
             try {
                 if (rowSize != colSize)
                     throw std::invalid_argument(
                         "inverse: matrix must be square, got " +
                         std::to_string(rowSize) + "x" + std::to_string(colSize));
-                auto [packed, pivots] = luPacked();
                 int n = (int)rowSize;
-                Matrix<double> inv(n, n);
-                for (int col = 0; col < n; col++) {
-                    std::vector<double> b(n, 0.0);
-                    b[col] = 1.0;
-                    // Apply row permutations from LU pivoting
-                    for (int i = 0; i < n; i++)
-                        if (pivots[i] != i) std::swap(b[i], b[pivots[i]]);
-                    // Forward substitution: L y = b  (L has unit diagonal)
-                    for (int i = 0; i < n; i++)
-                        for (int j = 0; j < i; j++)
-                            b[i] -= packed[i * n + j] * b[j];
-                    // Backward substitution: U x = y
-                    for (int i = n - 1; i >= 0; i--) {
-                        for (int j = i + 1; j < n; j++)
-                            b[i] -= packed[i * n + j] * b[j];
-                        b[i] /= packed[i * n + i];
-                    }
-                    for (int i = 0; i < n; i++) inv(i, col) = b[i];
-                }
-                return inv;
+                Matrix<double> Id(n, n);
+                for (int i = 0; i < n; i++) Id(i, i) = 1.0;
+                return solve(Id);
             } catch (const std::exception& e) {
                 std::cerr << "inverse() error: " << e.what() << '\n';
                 throw;
             }
         }
 
+        // Solves A * X = B for X. B may be a single column or several at once.
+        //
+        // Prefer this over A.inverse() * B: about a third of the flops and
+        // numerically better conditioned. Forming an explicit inverse just to
+        // multiply by it is the classic mistake this method exists to prevent.
+        //
+        // Square A       → exact solve via LU with partial pivoting.
+        // rows > cols    → the least-squares solution argmin ||A*X - B||₂, via the
+        //                  column-pivoted QR above: back-substitute R*y = (Qᵀ*B)
+        //                  over the numerically non-zero diagonal of R, then undo
+        //                  the column permutation. Rank-deficient input gives a
+        //                  basic solution (free variables set to zero), not the
+        //                  minimum-norm one — use pinv() if you need that.
+        // rows < cols    → under-determined; throws, since "the" solution is not
+        //                  unique. pinv() gives the minimum-norm one.
+        //
+        // Templated on B's element type so A.solve(b) works whatever b holds.
+        // Usage: auto x = A.solve(b);
+        template <typename dtB>
+        Matrix<double> solve(const Matrix<dtB>& B) const {
+            try {
+                int m = (int)rowSize, n = (int)colSize, nrhs = (int)B.cols();
+                if (B.rows() != rowSize)
+                    throw std::invalid_argument(
+                        "solve: B must have one row per row of A — A is " +
+                        std::to_string(rowSize) + "x" + std::to_string(colSize) +
+                        " but B is " + std::to_string(B.rows()) + "x" + std::to_string(B.cols()));
+                if (m == 0 || n == 0 || nrhs == 0)
+                    throw std::invalid_argument("solve: matrices must be non-empty");
+                if (m < n)
+                    throw std::invalid_argument(
+                        "solve: system is under-determined (" + std::to_string(m) +
+                        " equations, " + std::to_string(n) + " unknowns) — infinitely many "
+                        "solutions. Use pinv() for the minimum-norm one");
+
+                // ── Square: LU with partial pivoting ────────────────────────────
+                if (m == n) {
+                    if (n == 1) {   // luPacked() requires 2x2; handle the scalar case here
+                        double a = double(std::real(grid[0]));
+                        if (a == 0.0)
+                            throw std::runtime_error("solve: 1x1 matrix is singular");
+                        Matrix<double> X(1, nrhs);
+                        for (int j = 0; j < nrhs; j++) X(0, j) = double(std::real(B(0, j))) / a;
+                        return X;
+                    }
+                    auto [packed, pivots] = luPacked();
+                    Matrix<double> X(n, nrhs);
+                    const double* MATRIXCPP_RESTRICT LU = packed.data();
+                    double* MATRIXCPP_RESTRICT Xg = X.grid;
+                    const dtB* MATRIXCPP_RESTRICT Bg = B.grid;
+
+                    // One right-hand side: permute, forward-substitute through L,
+                    // back-substitute through U. Both substitutions walk a row of
+                    // the packed factor, which is contiguous, and four accumulators
+                    // keep the dot product running at FMA throughput rather than
+                    // FMA latency.
+                    auto solveOne = [&](int col) {
+                        std::vector<double> bv(n);
+                        double* MATRIXCPP_RESTRICT b = bv.data();
+                        for (int i = 0; i < n; i++)
+                            b[i] = double(std::real(Bg[(size_t)i * nrhs + col]));
+                        // Row permutations recorded by the factorisation
+                        for (int i = 0; i < n; i++)
+                            if (pivots[i] != i) std::swap(b[i], b[pivots[i]]);
+                        // Forward substitution: L y = b  (L has unit diagonal)
+                        for (int i = 0; i < n; i++) {
+                            const double* MATRIXCPP_RESTRICT row = LU + (size_t)i * n;
+                            double a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+                            int j = 0;
+                            for (; j + 3 < i; j += 4) {
+                                a0 += row[j]     * b[j];     a1 += row[j + 1] * b[j + 1];
+                                a2 += row[j + 2] * b[j + 2]; a3 += row[j + 3] * b[j + 3];
+                            }
+                            for (; j < i; j++) a0 += row[j] * b[j];
+                            b[i] -= (a0 + a1) + (a2 + a3);
+                        }
+                        // Back substitution: U x = y
+                        for (int i = n - 1; i >= 0; i--) {
+                            const double* MATRIXCPP_RESTRICT row = LU + (size_t)i * n;
+                            double a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+                            int j = i + 1;
+                            for (; j + 3 < n; j += 4) {
+                                a0 += row[j]     * b[j];     a1 += row[j + 1] * b[j + 1];
+                                a2 += row[j + 2] * b[j + 2]; a3 += row[j + 3] * b[j + 3];
+                            }
+                            for (; j < n; j++) a0 += row[j] * b[j];
+                            b[i] = (b[i] - ((a0 + a1) + (a2 + a3))) / row[i];
+                        }
+                        for (int i = 0; i < n; i++) Xg[(size_t)i * nrhs + col] = b[i];
+                    };
+
+                    // Every right-hand side is solved against the SAME factors and
+                    // writes a different column of X, so the columns are completely
+                    // independent. LAPACK exploits this differently — dgetrs hands
+                    // all the right-hand sides to dtrsm at once and gets a level-3
+                    // blocked triangular solve out of it — but the parallelism is
+                    // the same parallelism, and it is what makes inverse() (which
+                    // is solve against n columns of the identity) worth anything:
+                    // one column at a time, a 512x512 inverse cost 83 ms against
+                    // 7.6 ms for a single solve of the same matrix.
+                    const long solveWork = (long)nrhs * n * n;
+                    (void)solveWork;   // only read on the OpenMP path
+#ifdef _OPENMP
+                    if (solveWork >= PARALLEL_MIN_WORK && nrhs > 1) {
+                        #pragma omp parallel for schedule(static)
+                        for (int col = 0; col < nrhs; col++) solveOne(col);
+                        return X;
+                    }
+#endif
+                    for (int col = 0; col < nrhs; col++) solveOne(col);
+                    return X;
+                }
+
+                // ── Over-determined: least squares via column-pivoted QR ────────
+                // A*P = Q*R, so ||A x - b|| = ||R (Pᵀx) - Qᵀb||.
+                auto [Q, R, P] = QR();
+                Matrix<double> Bd(m, nrhs);
+                for (int i = 0; i < m; i++)
+                    for (int j = 0; j < nrhs; j++) Bd(i, j) = double(std::real(B(i, j)));
+                Matrix<double> QtB = Q.T() * Bd;
+
+                double rTol = double(std::max(m, n)) *
+                              std::numeric_limits<double>::epsilon() * std::abs(R(0, 0));
+                int rk = 0;
+                while (rk < n && std::abs(R(rk, rk)) > rTol) rk++;
+
+                Matrix<double> Y(n, nrhs);
+                for (int col = 0; col < nrhs; col++) {
+                    // Back-substitute over the leading rk×rk block; the trailing
+                    // unknowns are the free variables and stay at zero.
+                    for (int i = rk - 1; i >= 0; i--) {
+                        double acc = QtB(i, col);
+                        for (int j = i + 1; j < rk; j++) acc -= R(i, j) * Y(j, col);
+                        Y(i, col) = acc / R(i, i);
+                    }
+                }
+                // x = P*y — undo the column permutation.
+                Matrix<double> X(n, nrhs);
+                for (int i = 0; i < n; i++)
+                    for (int k = 0; k < n; k++) {
+                        double pik = double(std::real(P(i, k)));
+                        if (pik == 0.0) continue;
+                        for (int col = 0; col < nrhs; col++) X(i, col) += pik * Y(k, col);
+                    }
+                return X;
+            } catch (const std::exception& e) {
+                std::cerr << "solve() error: " << e.what() << '\n';
+                throw;
+            }
+        }
+
+        // Moore-Penrose pseudo-inverse. Defined for any m×n, singular matrices
+        // included, and coincides with inverse() when A is square and non-singular.
+        // From the SVD: pinv(A) = V * S^+ * U^T, where S^+ inverts every singular
+        // value above tol and leaves the rest at zero. Requires svd() first.
+        Matrix<double> pinv(double tol = -1.0) const {
+            try {
+                if (rowSize == 0 || colSize == 0)
+                    throw std::invalid_argument("pinv: matrix must be non-empty");
+                auto [U, S, V] = svd();
+                int m = (int)rowSize, n = (int)colSize;
+                int d = std::min(m, n);
+
+                if (tol < 0.0)
+                    tol = double(std::max(m, n)) *
+                          std::numeric_limits<double>::epsilon() * S(0, 0);
+
+                // pinv(A) = V · S⁺ · Uᵀ, where S⁺ inverts the singular values above
+                // tol and leaves the rest at zero. Folding S⁺ into V first keeps
+                // this to one matrix product.
+                Matrix<double> VS(n, m);
+                for (int j = 0; j < d; j++) {
+                    double sj = S(j, j);
+                    if (sj <= tol) continue;
+                    double inv = 1.0 / sj;
+                    for (int i = 0; i < n; i++) VS(i, j) = V(i, j) * inv;
+                }
+                return VS * U.T();
+            } catch (const std::exception& e) {
+                std::cerr << "pinv() error: " << e.what() << '\n';
+                throw;
+            }
+        }
+
+        // Adjugate (classical adjoint): the transpose of the cofactor matrix.
+        // Satisfies A * adj(A) = det(A) * I, which is the identity behind the
+        // textbook formula inverse(A) = adj(A) / det(A). Requires square A.
+        // Mainly of symbolic/theoretical interest — inverse() and solve() are the
+        // right tools numerically, since the cofactor route is O(n!) if done naively.
+        Matrix<double> adjugate() const {
+            try {
+                if (rowSize != colSize)
+                    throw std::invalid_argument(
+                        "adjugate: matrix must be square, got " +
+                        std::to_string(rowSize) + "x" + std::to_string(colSize));
+                if (rowSize == 0)
+                    throw std::invalid_argument("adjugate: matrix must be non-empty");
+                int n = (int)rowSize;
+
+                // adj of a 1x1 is [1] by convention: A·adj(A) = det(A)·I = a·I.
+                if (n == 1) { Matrix<double> out(1, 1); out(0, 0) = 1.0; return out; }
+
+                Matrix<double> Ad(n, n);
+                for (int i = 0; i < n; i++)
+                    for (int j = 0; j < n; j++) Ad(i, j) = double(std::real(grid[i * n + j]));
+
+                // Non-singular: adj(A) = det(A)·A⁻¹ directly from the identity
+                // A·adj(A) = det(A)·I. Two O(n³) steps instead of n² minors.
+                double scale = norm(NormType::Inf);
+                double dTol = std::numeric_limits<double>::epsilon() *
+                              std::pow(scale > 0.0 ? scale : 1.0, n) * 100.0;
+                double d = Ad.det();
+                if (std::abs(d) > dTol)
+                    return Ad.inverse() * d;
+
+                // Singular: the identity above says nothing, so fall back to the
+                // definition — adj(A)[j,i] = (-1)^(i+j) · det(A with row i, col j
+                // deleted). O(n⁵), but it is the only route that stays correct here.
+                Matrix<double> out(n, n);
+                Matrix<double> minor(n - 1, n - 1);
+                for (int i = 0; i < n; i++)
+                    for (int j = 0; j < n; j++) {
+                        for (int r = 0, mr = 0; r < n; r++) {
+                            if (r == i) continue;
+                            for (int c = 0, mc = 0; c < n; c++) {
+                                if (c == j) continue;
+                                minor(mr, mc) = Ad(r, c);
+                                mc++;
+                            }
+                            mr++;
+                        }
+                        double md = (n == 2) ? minor(0, 0) : minor.det();
+                        out(j, i) = ((i + j) % 2 ? -1.0 : 1.0) * md;
+                    }
+                return out;
+            } catch (const std::exception& e) {
+                std::cerr << "adjugate() error: " << e.what() << '\n';
+                throw;
+            }
+        }
+
         //deconstructor
         ~Matrix(){
-            if (grid) delete[] grid;
+            release();
         }
     private:
+        // Lets Matrix<double> reach into Matrix<int>'s internals and vice versa,
+        // which real()/imag() and the mixed-type paths need.
+        template<typename> friend class Matrix;
+
+        // Tag type selecting the constructor below.
+        struct uninit_t {};
+
+        // Allocates without value-initialising. `new T[n]()` zero-fills, which is
+        // pure waste when the very next thing the caller does is overwrite every
+        // element — about 16% of the cost of an element-wise operation at
+        // n = 2000. Only ever use this when the buffer is fully written before
+        // it can be read.
+        Matrix(long i, long j, uninit_t) {
+            rowSize = i;
+            colSize = j;
+            allocRaw(i * j);   // deliberately not zeroed
+        }
+
+        // ── Small-buffer storage ────────────────────────────────────────
+        // Matrices of up to SBO_CAPACITY elements live inside the object; only
+        // larger ones touch the heap. Measured on this machine, a 2x2 A+B cost
+        // 19 ns of which 19 ns was new/delete — the arithmetic was free and the
+        // allocator was the entire operation. Eigen solves this with fixed-size
+        // types; this is the runtime equivalent, and it costs one branch on the
+        // sizing path.
+        //
+        // 16 elements covers every matrix up to 4x4, which is where small-matrix
+        // work actually concentrates: 2x2 and 4x4 gates for the quantum-circuit
+        // goal, 3x3 and 4x4 for geometry.
+        static constexpr long SBO_CAPACITY = 16;
+
+        // True when grid points at the inline buffer rather than the heap.
+        // Compared against the pointer rather than recomputed from the sizes, so
+        // it stays correct even while the sizes are mid-update.
+        bool isInline() const { return grid == sbo; }
+
+        // Points grid at storage for n elements WITHOUT initialising it.
+        void allocRaw(long n) {
+            if (n <= SBO_CAPACITY) { grid = sbo; return; }
+            grid = rawAlloc(n);
+        }
+
+        // Points grid at zero-initialised storage for n elements.
+        void allocZero(long n) {
+            if (n <= SBO_CAPACITY) {
+                grid = sbo;
+                for (long i = 0; i < n; i++) grid[i] = datatype();
+            } else {
+                grid = rawAlloc(n);
+                for (long i = 0; i < n; i++) grid[i] = datatype();
+            }
+        }
+
+        // Storage that holds only bytes, with no per-element constructor call —
+        // the strategy Eigen and Armadillo both use for their scalar types.
+        //
+        // `new datatype[n]` looks equivalent but is not, and the difference is
+        // large for complex matrices. double has no default constructor, so
+        // `new double[n]` leaves the pages untouched and adviseHuge() below gets
+        // to apply before anything faults them in. std::complex<double> DOES have
+        // a user-provided default constructor, so `new std::complex<double>[n]`
+        // writes a zero to every element first — which faults in the whole buffer
+        // with 4 KB pages, defeating the madvise entirely, and then costs a second
+        // full pass when the caller immediately overwrites it. Measured on a
+        // 2000x2000 complex concat: 281k minor faults and 45 ms, against 6.7 ms
+        // for a raw copy of the same 128 MB.
+        //
+        // The trait test keeps this to types where "storage is just bytes" is
+        // actually true; anything else keeps the ordinary array new.
+        static constexpr bool RAW_STORAGE_OK =
+            std::is_trivially_copyable<datatype>::value &&
+            std::is_trivially_destructible<datatype>::value;
+
+        static datatype* rawAlloc(long n) {
+            const std::size_t bytes = std::size_t(n) * sizeof(datatype);
+            datatype* p;
+            if constexpr (RAW_STORAGE_OK) {
+                p = static_cast<datatype*>(::operator new(bytes));
+            } else {
+                p = new datatype[n];
+            }
+            adviseHuge(p, bytes);
+            return p;
+        }
+
+        static void rawFree(datatype* p) {
+            if (!p) return;
+            if constexpr (RAW_STORAGE_OK) ::operator delete(static_cast<void*>(p));
+            else                          delete[] p;
+        }
+
+        // Ask the kernel to back a large buffer with 2 MB transparent huge pages
+        // instead of 4 KB ones. Lifted directly from NumPy, which does exactly
+        // this in PyDataMem_NEW (numpy/_core/src/multiarray/alloc.c) above the
+        // same 4 MB threshold, and exposes it as _set_madvise_hugepage.
+        //
+        // Why it matters so much: a freshly allocated buffer is not really
+        // resident until it is written, and the first write to each page traps
+        // into the kernel. Writing a 64 MB result therefore costs 16384 page
+        // faults with 4 KB pages, but only 32 with 2 MB pages. That fault
+        // traffic — not the copy — was the entire gap on the memory-bound
+        // operations. Measured on this machine by toggling NumPy's own switch:
+        //
+        //     np.hstack of two 2000x2000 doubles, hugepages ON   6.5 ms
+        //                                         hugepages OFF 26.8 ms
+        //     our concat, before this change                    24.8 ms
+        //
+        // i.e. our copy loop was already as good as NumPy's; the whole
+        // difference was here. Advisory only: if the kernel is built without
+        // transparent huge pages, or /sys/kernel/mm/transparent_hugepage/enabled
+        // is "never", madvise fails harmlessly and nothing changes.
+        //
+        // Define MATRIXCPP_NO_HUGEPAGE to opt out (huge pages round the resident
+        // size up to a 2 MB multiple, which matters if you hold very many
+        // medium-sized matrices at once).
+        static void adviseHuge(void* p, std::size_t bytes) {
+#if defined(__linux__) && defined(MADV_HUGEPAGE) && !defined(MATRIXCPP_NO_HUGEPAGE)
+            constexpr std::size_t HUGE_MIN  = std::size_t(4) << 20;   // NumPy's threshold
+            constexpr std::size_t PAGE_SIZE = 4096;
+            if (bytes < HUGE_MIN) return;
+            // madvise needs a page-aligned start; new[] gives us 16-byte
+            // alignment, so round up and shorten the range to match.
+            const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(p);
+            const std::size_t off = std::size_t((PAGE_SIZE - base % PAGE_SIZE) % PAGE_SIZE);
+            if (bytes > off)
+                ::madvise(reinterpret_cast<void*>(base + off), bytes - off, MADV_HUGEPAGE);
+#else
+            (void)p; (void)bytes;
+#endif
+        }
+
+        // Frees heap storage if that is what grid points at. Safe to call twice.
+        void release() {
+            if (grid && grid != sbo) rawFree(grid);
+            grid = nullptr;
+        }
+
         long rowSize;
         long colSize;
         datatype *grid;
+        datatype sbo[SBO_CAPACITY];
+
+        // True when rows i..i+1 of a real Schur form T are a genuine 2x2 block —
+        // the signature of a complex-conjugate eigenvalue pair — rather than two
+        // separate real eigenvalues. The QR iteration drives converged
+        // sub-diagonal entries towards zero without always setting them exactly
+        // to zero, so the test has to be relative to the neighbouring diagonal.
+        static bool isSchurBlock(const std::vector<double>& T, int n, int i) {
+            double sub = std::abs(T[(i + 1) * n + i]);
+            double nbr = std::abs(T[i * n + i]) + std::abs(T[(i + 1) * n + (i + 1)]);
+            return sub > std::numeric_limits<double>::epsilon() * 100.0 *
+                         (nbr > 0.0 ? nbr : 1.0);
+        }
+
+        // Shared guard for the reductions, which have no meaningful answer on an
+        // empty matrix and would otherwise read grid[0] off a null pointer.
+        void requireNonEmpty(const char* who) const {
+            if (rowSize * colSize == 0)
+                throw std::invalid_argument(
+                    std::string(who) + "(): matrix is empty (" +
+                    std::to_string(rowSize) + "x" + std::to_string(colSize) + ")");
+        }
+
+        // Shared dimension check for the element-wise operations.
+        void requireSameShape(const Matrix& M, const char* who) const {
+            if (rowSize != M.rowSize || colSize != M.colSize)
+                throw std::invalid_argument(
+                    std::string(who) + "(): element-wise operations need identical "
+                    "shapes, got (" + std::to_string(rowSize) + "x" +
+                    std::to_string(colSize) + ") and (" + std::to_string(M.rowSize) +
+                    "x" + std::to_string(M.colSize) + ")");
+        }
 
         // Computes the real Schur decomposition of this matrix.
         // Returns {T_flat, Q_flat} where A = Q * T * Q^T,
         // T is upper (quasi-)triangular and Q is orthogonal (both n×n, row-major double).
         // Public so that the free pow() function can access it; also useful on its own.
+        //
+        // NOTE — "quasi-triangular" is the word carrying all the weight here.
+        // T is triangular except for 2x2 blocks on the diagonal, one per pair of
+        // complex-conjugate eigenvalues. Every caller in this header currently
+        // assumes those blocks do not exist: eig() reads the bare diagonal, and
+        // pow()/log() sidestep the issue by demanding positive eigenvalues.
+        // Any block-aware consumer (a correct eig, exp(A), the matrix trig
+        // functions) needs a Parlett recurrence that solves a small Sylvester
+        // equation per block rather than dividing scalars. This is the single
+        // change that unblocks the most of the roadmap at the top of the file.
         public:
         std::pair<std::vector<double>, std::vector<double>> schurDecomp() const {
             int n = (int)rowSize;
@@ -1018,17 +3565,110 @@ class Matrix{
             }
 
             // ── QR iteration with Wilkinson shift and deflation ───────────────
+            // Two things this loop has to handle that a plain "iterate until the
+            // sub-diagonal vanishes" version does not:
+            //
+            //  1. A complex-conjugate eigenvalue pair NEVER drives its
+            //     sub-diagonal entry to zero. That is not a convergence failure,
+            //     it is the definition of a real Schur form: the pair lives in a
+            //     2x2 block. So once a trailing 2x2 is isolated it is deflated as
+            //     a block rather than iterated on. Without this, a plain rotation
+            //     matrix spins until the step limit and throws.
+            //  2. An isolated 2x2 whose eigenvalues turn out to be REAL is split
+            //     by one Givens rotation, so it does not then masquerade as a
+            //     complex pair to eig()/eigvals() downstream.
+            //
+            // A block that stalls also gets a periodic exceptional shift — the
+            // standard escape from the matrices a Wilkinson shift cycles on.
             const double eps = std::numeric_limits<double>::epsilon();
-            int maxSteps = 30 * n, ihi = n - 1;
+
+            // The QR iteration below updates COLUMNS k and k+1 of Q on every
+            // rotation. In row-major storage a column walk strides by a whole row,
+            // so that is one cache miss per row, n of them per rotation — and it
+            // was the dominant cost of the whole routine once the O(n^4) work was
+            // gone. Transposing Q once here turns each of those column updates
+            // into two contiguous row updates; it is transposed back at the end.
+            std::vector<double> Qt(n * n);
+            for (int i = 0; i < n; i++)
+                for (int j = 0; j < n; j++) Qt[j * n + i] = Q[i * n + j];
+
+            // Relative test for "this sub-diagonal entry has converged to zero".
+            auto negligible = [&](int i) {
+                double nbr = std::abs(h(i - 1, i - 1)) + std::abs(h(i, i));
+                if (nbr == 0.0) nbr = 1.0;
+                return std::abs(h(i, i - 1)) <= eps * nbr;
+            };
+
+            // Triangularises the 2x2 block at rows/cols k, k+1 if its eigenvalues
+            // are real; leaves it intact if they are a conjugate pair. The
+            // rotation is chosen so its first column is an eigenvector, which
+            // sends the sub-diagonal entry to exactly zero.
+            auto split2x2 = [&](int k) {
+                double a = h(k, k),     b = h(k, k + 1);
+                double c = h(k + 1, k), d = h(k + 1, k + 1);
+                if (c == 0.0) return;
+                double half = (a + d) / 2.0;
+                double disc = half * half - (a * d - b * c);
+                if (disc < 0.0) return;          // genuine complex pair — keep the block
+
+                // Take the root of larger magnitude directly and the other from
+                // the product, so the small one does not lose digits to cancellation.
+                double rt  = std::sqrt(disc);
+                double lam = half + (half >= 0.0 ? rt : -rt);
+                if (lam == 0.0) lam = half;
+
+                double x = lam - d, y = c;       // eigenvector direction for lam
+                if (std::abs(x) + std::abs(y) < eps * (std::abs(a) + std::abs(d))) {
+                    x = b; y = lam - a;          // the other spelling, when that one degenerates
+                }
+                double r = std::hypot(x, y);
+                if (r == 0.0) return;
+                double cs = x / r, sn = y / r;
+
+                for (int j = 0; j < n; j++) {    // rows: H <- G^T H
+                    double t1 = h(k, j), t2 = h(k + 1, j);
+                    h(k, j)     =  cs * t1 + sn * t2;
+                    h(k + 1, j) = -sn * t1 + cs * t2;
+                }
+                for (int i = 0; i < n; i++) {    // cols: H <- H G
+                    double t1 = h(i, k), t2 = h(i, k + 1);
+                    h(i, k)     =  cs * t1 + sn * t2;
+                    h(i, k + 1) = -sn * t1 + cs * t2;
+                }
+                {                                // accumulate: Q <- Q G, on Qt
+                    double* qk = &Qt[k * n];
+                    double* qn = &Qt[(k + 1) * n];
+                    for (int i = 0; i < n; i++) {
+                        double t1 = qk[i], t2 = qn[i];
+                        qk[i] =  cs * t1 + sn * t2;
+                        qn[i] = -sn * t1 + cs * t2;
+                    }
+                }
+                h(k + 1, k) = 0.0;
+            };
+
+            int maxSteps = 60 * n, ihi = n - 1, itersOnBlock = 0;
+            // Rotation scratch, sized once. The previous code allocated a fresh
+            // std::vector per reflector per sweep.
+            std::vector<double> csv(n > 0 ? n : 1), snv(n > 0 ? n : 1);
             while (ihi >= 1) {
                 int ilo = ihi;
-                while (ilo > 0 &&
-                       std::abs(h(ilo, ilo - 1)) >
-                       eps * (std::abs(h(ilo - 1, ilo - 1)) + std::abs(h(ilo, ilo))))
-                    ilo--;
-                if (ilo == ihi) { ihi--; continue; }
+                while (ilo > 0 && !negligible(ilo)) ilo--;
+
+                if (ilo == ihi) {                       // isolated 1x1: real eigenvalue
+                    if (ihi > 0) h(ihi, ihi - 1) = 0.0;
+                    ihi--; itersOnBlock = 0; continue;
+                }
+                if (ilo == ihi - 1) {                   // isolated 2x2: deflate as a block
+                    if (ilo > 0) h(ilo, ilo - 1) = 0.0;
+                    split2x2(ilo);
+                    ihi -= 2; itersOnBlock = 0; continue;
+                }
                 if (maxSteps-- < 0)
-                    throw std::runtime_error("schurDecomp: QR iteration did not converge");
+                    throw std::runtime_error(
+                        "schurDecomp: QR iteration did not converge after " +
+                        std::to_string(60 * n) + " steps");
+
                 double a = h(ihi-1,ihi-1), b = h(ihi-1,ihi);
                 double c = h(ihi,ihi-1),   d = h(ihi,ihi);
                 double tr2 = (a+d)/2.0, disc = tr2*tr2 - (a*d - b*c);
@@ -1036,53 +3676,79 @@ class Matrix{
                     ? (std::abs(tr2+std::sqrt(disc)-d) < std::abs(tr2-std::sqrt(disc)-d)
                        ? tr2+std::sqrt(disc) : tr2-std::sqrt(disc))
                     : d;
-                int sz = ihi - ilo + 1;
-                std::vector<double> tv(sz, 0.0);
-                std::vector<std::vector<double>> hv(sz);
+                // Exceptional shift: break out of a cycling block every 10 steps.
+                if (++itersOnBlock % 10 == 0)
+                    sigma = std::abs(h(ihi, ihi-1)) + std::abs(h(ihi-1, ihi-2));
+                // ── Shifted QR step, Givens instead of Householder ──────────
+                //
+                // This is the step that dominates the whole routine, and the
+                // Hessenberg structure is what makes it cheap. Column k has
+                // exactly ONE entry below the diagonal — everything from row k+2
+                // down is already zero — so zeroing it needs a 2x2 rotation
+                // touching two rows, not a Householder reflector spanning
+                // rows k..ihi.
+                //
+                // The reflector version this replaced built a vector of length
+                // (ihi-k+1) and applied it across that many rows, making each
+                // sweep O(n * sz^2) and the whole decomposition O(n^4). Rotations
+                // bring the sweep to O(n * sz) and the decomposition to O(n^3),
+                // which is what LAPACK's dlahqr does. It also drops the
+                // std::vector allocated per reflector per sweep.
+                //
+                // Factor H - sigma*I = Q*R with Q = (G_ilo ... G_{ihi-1})^T,
+                // then form H <- R*Q + sigma*I.
                 for (int i = ilo; i <= ihi; i++) h(i,i) -= sigma;
+
+                const int sz = ihi - ilo;
+                if ((int)csv.size() < sz) { csv.resize(sz); snv.resize(sz); }
+
+                // Left sweep: G_k zeroes h(k+1,k). By the time we reach column k,
+                // G_{k-1} has already zeroed h(k,k-1), so starting at column k
+                // leaves the earlier columns untouched and Hessenberg intact.
                 for (int k = ilo; k < ihi; k++) {
-                    int ki = k-ilo, rows = ihi-k+1;
-                    double xn = 0.0;
-                    for (int i = k; i <= ihi; i++) xn += h(i,k)*h(i,k);
-                    xn = std::sqrt(xn);
-                    if (xn < 1e-14) { hv[ki].assign(rows,0.0); continue; }
-                    double alpha = (h(k,k)>=0.0?-1.0:1.0)*xn;
-                    std::vector<double> v(rows);
-                    for (int i = 0; i < rows; i++) v[i] = h(k+i,k);
-                    v[0] -= alpha;
-                    double vv = 0.0;
-                    for (double vi : v) vv += vi*vi;
-                    if (vv < 1e-28) { hv[ki].assign(rows,0.0); continue; }
-                    double tau = 2.0/vv;
-                    tv[ki] = tau; hv[ki] = v;
+                    double a = h(k, k), b = h(k + 1, k);
+                    double r = std::hypot(a, b);
+                    double c, sn2;
+                    if (r == 0.0) { c = 1.0; sn2 = 0.0; }
+                    else          { c = a / r; sn2 = b / r; }
+                    csv[k - ilo] = c; snv[k - ilo] = sn2;
                     for (int j = k; j < n; j++) {
-                        double s = 0.0;
-                        for (int i = 0; i < rows; i++) s += v[i]*h(k+i,j);
-                        for (int i = 0; i < rows; i++) h(k+i,j) -= tau*v[i]*s;
+                        double t1 = h(k, j), t2 = h(k + 1, j);
+                        h(k,     j) =  c * t1 + sn2 * t2;
+                        h(k + 1, j) = -sn2 * t1 + c * t2;
                     }
                 }
-                for (int ki = 0; ki < sz-1; ki++) {
-                    int k = ilo+ki;
-                    if (tv[ki] == 0.0) continue;
-                    const auto& v = hv[ki];
-                    int rows = (int)v.size();
-                    for (int i = 0; i < n; i++) {
-                        double s = 0.0;
-                        for (int j = 0; j < rows; j++) s += h(i,k+j)*v[j];
-                        for (int j = 0; j < rows; j++) h(i,k+j) -= tv[ki]*v[j]*s;
+
+                // Right sweep: H <- R * G_k^T, and accumulate Q <- Q * G_k^T.
+                // Columns k and k+1 of R are zero below row k+1, so the update
+                // stops at row k+2 — rows above ilo are still included, since
+                // they hold the off-block part of H.
+                for (int k = ilo; k < ihi; k++) {
+                    const double c = csv[k - ilo], sn2 = snv[k - ilo];
+                    const int iMax = std::min(ihi, k + 2);
+                    for (int i = 0; i <= iMax; i++) {
+                        double t1 = h(i, k), t2 = h(i, k + 1);
+                        h(i, k)     =  c * t1 + sn2 * t2;
+                        h(i, k + 1) = -sn2 * t1 + c * t2;
                     }
+                    // Contiguous, because Qt holds Q transposed — see the note
+                    // where Qt is built.
+                    double* qk = &Qt[k * n];
+                    double* qn = &Qt[(k + 1) * n];
                     for (int i = 0; i < n; i++) {
-                        double s = 0.0;
-                        for (int j = 0; j < rows; j++) s += qv(i,k+j)*v[j];
-                        for (int j = 0; j < rows; j++) qv(i,k+j) -= tv[ki]*v[j]*s;
+                        double t1 = qk[i], t2 = qn[i];
+                        qk[i] =  c * t1 + sn2 * t2;
+                        qn[i] = -sn2 * t1 + c * t2;
                     }
                 }
+
                 for (int i = ilo; i <= ihi; i++) h(i,i) += sigma;
-                if (std::abs(h(ihi,ihi-1)) <= eps*(std::abs(h(ihi-1,ihi-1))+std::abs(h(ihi,ihi)))) {
-                    h(ihi,ihi-1) = 0.0;
-                    ihi--;
-                }
+                // Deflation is decided by the scan at the top of the loop, which
+                // also recognises the isolated-2x2 case this used to miss.
             }
+
+            for (int i = 0; i < n; i++)          // undo the transpose
+                for (int j = 0; j < n; j++) Q[i * n + j] = Qt[j * n + i];
             return {H, Q};
         }
 
@@ -1135,6 +3801,104 @@ class Matrix{
         // the asymptotic benefit.
         static constexpr long STRASSEN_THRESHOLD = 64;
 
+        // Below this much work (multiply-accumulate count) a product runs
+        // serially: the parallel region costs more to set up than it saves.
+        static constexpr long PARALLEL_MIN_WORK = 65536;
+
+        // Element count above which the element-wise maps (exp, ln, sin, ...) are
+        // worth handing to OpenMP. Much lower than PARALLEL_MIN_WORK because the
+        // work per element is completely different: a transcendental is 20-40
+        // cycles, against the ~1 cycle of a multiply-accumulate, so the fixed
+        // ~360 ns cost of entering a parallel region is repaid far sooner.
+        static constexpr long MAP_MIN_WORK = 4096;
+
+        // Thread count for a loop that is limited by memory bandwidth rather than
+        // arithmetic — a transpose, a bulk copy. These saturate the memory system
+        // with far fewer threads than a compute-bound loop needs, and past that
+        // point extra threads only add contention. Measured on a 16-core / 32-
+        // thread machine, transposing a 2000x2000 complex matrix:
+        //
+        //     threads   1     4     8    16    32
+        //     ms      13.1   6.4   5.8   6.7  12.1
+        //
+        // Halving the reported maximum lands on the physical core count wherever
+        // SMT is two-way, which is the usual case; it is a heuristic, not a
+        // guarantee, but erring low costs little here and erring high costs a lot.
+        static int memoryThreads() {
+#ifdef _OPENMP
+            const int t = omp_get_max_threads();
+            return t > 1 ? t / 2 : 1;
+#else
+            return 1;
+#endif
+        }
+
+        // Element count above which an element-wise loop is worth parallelising.
+        // Entering a parallel region costs ~360 ns; at this size the loop itself
+        // is tens of microseconds, so the overhead is around a percent.
+        static constexpr long ELEMENTWISE_MIN_WORK = 32768;
+
+        // Runs body(i) for every i in [0, total), in parallel once the range is
+        // large enough. Element-wise operators are limited by memory bandwidth,
+        // not arithmetic, and one core cannot saturate the memory system:
+        // measured on a 2000x2000 Hadamard product (three arrays, 96 MB touched)
+        //
+        //     threads   1     4     8    16    32
+        //     GB/s     44    72   102   112   113
+        //
+        // NumPy's ufuncs are SIMD but strictly single-threaded, so this is a gap
+        // that simply is not available to it. Small matrices take the serial path
+        // with no OpenMP construct in sight — an `if` clause on the pragma still
+        // charges for the runtime call that evaluates it.
+        //
+        // body is taken BY VALUE and callers pass restrict-qualified pointers
+        // captured by value: capturing them by reference instead costs about half
+        // the throughput, because the compiler can no longer prove the pointers do
+        // not alias once they live in the enclosing frame.
+        template<class F>
+        static void forEachIndex(long total, F body) {
+#ifdef _OPENMP
+            if (total >= ELEMENTWISE_MIN_WORK) {
+                #pragma omp parallel for schedule(static) num_threads(memoryThreads())
+                for (long i = 0; i < total; i++) body(i);
+                return;
+            }
+#endif
+            for (long i = 0; i < total; i++) body(i);
+        }
+
+        // Shared body of every element-wise map. Two reasons this exists rather
+        // than seventeen copies of the same loop:
+        //
+        //   * NumPy's ufuncs are SIMD but strictly SINGLE-THREADED — np.exp on a
+        //     2000x2000 array uses one core. Its vectorised kernels beat a scalar
+        //     std::exp call by roughly 6x, which is why elem_exp was one of the
+        //     worst gaps in the comparison. We cannot easily match the kernels
+        //     from a header, but we can use the cores NumPy leaves idle, and a
+        //     transcendental map is perfectly parallel.
+        //   * __restrict on both pointers. Without it the compiler must assume
+        //     the destination aliases the source and re-loads after every store.
+        //
+        // Small matrices take the serial path with no OpenMP construct anywhere
+        // near them — an `if` clause on the pragma is NOT enough, the runtime
+        // still charges a few hundred nanoseconds just to evaluate it.
+        template<class F>
+        Matrix mapElems(F fn) const {
+            Matrix ans(rowSize, colSize, uninit_t{});
+            const long total = rowSize * colSize;
+            const datatype* MATRIXCPP_RESTRICT a = grid;
+            datatype*       MATRIXCPP_RESTRICT r = ans.grid;
+#ifdef _OPENMP
+            if (total >= MAP_MIN_WORK) {
+                #pragma omp parallel for schedule(static)
+                for (long i = 0; i < total; i++) r[i] = fn(a[i]);
+                return ans;
+            }
+#endif
+            for (long i = 0; i < total; i++) r[i] = fn(a[i]);
+            return ans;
+        }
+
         // Returns the smallest power of 2 >= n.
         static long nextPow2(long n) {
             long p = 1;
@@ -1153,25 +3917,62 @@ class Matrix{
             Matrix ans(M, N);
             constexpr long BLOCK = 64;
 
-            #pragma omp parallel for schedule(dynamic) shared(ans)
-            for (long ii = 0; ii < M; ii += BLOCK)
+            // Raw pointers, hoisted out and captured BY VALUE. Capturing the
+            // matrices by reference instead cost about half the throughput at
+            // n = 2048: the compiler then has to reload A.grid/B.grid/ans.grid
+            // through the captured references on every iteration and cannot
+            // prove they do not alias, so the inner loop stops vectorising.
+            const datatype* MATRIXCPP_RESTRICT Ag = A.grid;
+            const datatype* MATRIXCPP_RESTRICT Bg = B.grid;
+            datatype*       MATRIXCPP_RESTRICT Cg = ans.grid;
+
+            // One ii-tile of the product. Each tile writes only its own rows of
+            // `ans`, so tiles are independent and can be handed to threads.
+            auto tile = [=](long ii) {
                 for (long kk = 0; kk < K; kk += BLOCK)
                     for (long jj = 0; jj < N; jj += BLOCK)
                         for (long i = ii; i < std::min(ii + BLOCK, M); i++)
                             for (long k = kk; k < std::min(kk + BLOCK, K); k++) {
-                                const datatype aik = A.grid[i * K + k];
-                                for (long j = jj; j < std::min(jj + BLOCK, N); j++)
-                                    ans.grid[i * N + j] += aik * B.grid[k * N + j];
+                                const datatype aik = Ag[i * K + k];
+                                const datatype* MATRIXCPP_RESTRICT brow = Bg + k * N;
+                                datatype*       MATRIXCPP_RESTRICT crow = Cg + i * N;
+                                const long jEnd = std::min(jj + BLOCK, N);
+                                for (long j = jj; j < jEnd; j++)
+                                    crow[j] += aik * brow[j];
                             }
+            };
+
+            // Small products take a path that never touches the OpenMP runtime.
+            //
+            // An `if` clause on the pragma is NOT enough: measured here, entering
+            // a parallel region costs ~3.3 us with 32 threads, and even with the
+            // condition false the runtime is still entered for ~360 ns. A 2x2
+            // multiply — four multiply-adds — went from 29 ns without OpenMP to
+            // 3290 ns with it. Branching around the construct entirely restores
+            // the 29 ns, which matters for the small-matrix work (2x2 and 4x4
+            // gates) the quantum-circuit goal is built on.
+            //
+            // The threshold is on total work M*N*K rather than on n, because a
+            // tall thin product and a square one of the same n are different jobs.
+            if (M * N * K <= PARALLEL_MIN_WORK) {
+                for (long ii = 0; ii < M; ii += BLOCK) tile(ii);
+                return ans;
+            }
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(dynamic)
+#endif
+            for (long ii = 0; ii < M; ii += BLOCK) tile(ii);
             return ans;
         }
 
         // Extract the h×h sub-block of M starting at (r0, c0).
         static Matrix subBlock(const Matrix& M, long r0, long c0, long h) {
-            Matrix out(h, h);
-            for (long i = 0; i < h; i++)
-                for (long j = 0; j < h; j++)
-                    out.grid[i * h + j] = M.grid[(r0 + i) * M.colSize + (c0 + j)];
+            Matrix out(h, h, uninit_t{});   // fully overwritten below
+            for (long i = 0; i < h; i++) {
+                const datatype* src = M.grid + (r0 + i) * M.colSize + c0;
+                datatype* dst = out.grid + i * h;
+                for (long j = 0; j < h; j++) dst[j] = src[j];
+            }
             return out;
         }
 
@@ -1184,17 +3985,17 @@ class Matrix{
 
         // Element-wise addition of two same-size matrices.
         static Matrix addMat(const Matrix& A, const Matrix& B) {
-            Matrix out(A.rowSize, A.colSize);
-            for (long k = 0; k < A.rowSize * A.colSize; k++)
-                out.grid[k] = A.grid[k] + B.grid[k];
+            Matrix out(A.rowSize, A.colSize, uninit_t{});
+            const long total = A.rowSize * A.colSize;
+            for (long k = 0; k < total; k++) out.grid[k] = A.grid[k] + B.grid[k];
             return out;
         }
 
         // Element-wise subtraction.
         static Matrix subMat(const Matrix& A, const Matrix& B) {
-            Matrix out(A.rowSize, A.colSize);
-            for (long k = 0; k < A.rowSize * A.colSize; k++)
-                out.grid[k] = A.grid[k] - B.grid[k];
+            Matrix out(A.rowSize, A.colSize, uninit_t{});
+            const long total = A.rowSize * A.colSize;
+            for (long k = 0; k < total; k++) out.grid[k] = A.grid[k] - B.grid[k];
             return out;
         }
 
@@ -1202,36 +4003,31 @@ class Matrix{
         //
         // Requires A and B to be square with size = power of 2.
         // Recursively splits into h×h quadrants and computes 7 recursive products
-        // (versus 8 for standard multiplication).
+        // (versus 8 for standard multiplication), which is what buys the
+        // O(n^2.807) exponent. Winograd's variant additionally cuts the additions
+        // from 18 to 15 by sharing the auxiliary sums below.
         //
-        // Winograd's variant saves 4 additions over the original Strassen formulation
-        // by precomputing row/column auxiliary sums:
-        //
-        //   s1 = A21 + A22        t1 = B12 - B11
-        //   s2 = s1  - A11        t2 = B22 - t1
-        //   s3 = A11 - A21        t3 = B22 - B12
-        //   s4 = A12 - s2         t4 = B21 - t2
+        //   S1 = A21 + A22        T1 = B12 - B11
+        //   S2 = S1  - A11        T2 = B22 - T1
+        //   S3 = A11 - A21        T3 = B22 - B12
+        //   S4 = A12 - S2         T4 = T2  - B21
         //
         //   P1 = A11 * B11        P2 = A12 * B21
-        //   P3 = s4   * B22       P4 = A22 * t4
-        //   P5 = s1   * t1        P6 = s2  * t2
-        //   P7 = s3   * t3
+        //   P3 = S4  * B22        P4 = A22 * T4
+        //   P5 = S1  * T1         P6 = S2  * T2
+        //   P7 = S3  * T3
         //
-        //   C11 = P1 + P2
-        //   C12 = P1 + P6 + P5 + P3
-        //   C21 = P1 + P4 + P7 - P6   (note: P1 shared by all quadrants)
-        //   Wait — the exact Winograd recurrence uses U1..U7 combinations below.
-        //
-        // Using the standard Winograd-Strassen combination table:
-        //   U1 = P1 + P2
-        //   U2 = P1 + P6
-        //   U3 = U2 + P7
+        //   U1 = P1 + P2          U5 = U4 + P3
+        //   U2 = P1 + P6          U6 = U3 - P4
+        //   U3 = U2 + P7          U7 = U3 + P5
         //   U4 = U2 + P5
-        //   U5 = U4 + P3
-        //   C11 = U1            C12 = U5
-        //   C21 = U3 - P4       C22 = U4 + P4  -- wait, let me use the canonical form
         //
-        // Using Coppersmith-Winograd / Laderman variant as commonly implemented:
+        //   C11 = U1   C12 = U5   C21 = U6   C22 = U7
+        //
+        // Both T4 and U7 are easy to get subtly wrong, and a wrong version still
+        // returns plausible-looking numbers of the right magnitude — the error is
+        // only visible against a reference product. validate.cpp checks this path
+        // against a naive multiply at every size class that reaches it.
         static Matrix strassenWinograd(const Matrix& A, const Matrix& B) {
             long n = A.rowSize;
 
@@ -1261,7 +4057,7 @@ class Matrix{
             Matrix T1  = subMat(B12, B11);          // B12 - B11
             Matrix T2  = subMat(B22, T1);           // B22 - T1
             Matrix T3  = subMat(B22, B12);          // B22 - B12
-            Matrix T4  = subMat(B21, T2);           // B21 - T2
+            Matrix T4  = subMat(T2,  B21);          // T2 - B21
 
             // 7 recursive multiplications
             Matrix P1  = strassenWinograd(A11, B11);
@@ -1272,27 +4068,14 @@ class Matrix{
             Matrix P6  = strassenWinograd(S2,  T2);
             Matrix P7  = strassenWinograd(S3,  T3);
 
-            // Combine into result quadrants
-            //   C11 = P1 + P2
-            //   C12 = P1 + P3 + P5 + P6
-            //   C21 = P1 + P4 - P6 + P7   (equivalently U3 - P4 with a sign flip variant)
-            //   C22 = P1 + P3 + P4 - P5 + (sign variant) -- use the standard table:
-            // Standard Winograd-Strassen result quadrants:
-            //   U1  = P1 + P2
-            //   U2  = P1 + P6
-            //   U3  = U2 + P7
-            //   U4  = U2 + P5
-            //   U5  = U4 + P3
-            //   U6  = U3 - P4
-            //   U7  = U4 + P4
-            //   C11 = U1,  C12 = U5,  C21 = U6,  C22 = U7
+            // Combine into result quadrants — see the table in the comment above.
             Matrix U1  = addMat(P1, P2);
             Matrix U2  = addMat(P1, P6);
             Matrix U3  = addMat(U2, P7);
             Matrix U4  = addMat(U2, P5);
             Matrix U5  = addMat(U4, P3);
             Matrix U6  = subMat(U3, P4);
-            Matrix U7  = addMat(U4, P4);
+            Matrix U7  = addMat(U3, P5);
 
             // Assemble the n×n result from its four h×h quadrants
             Matrix C(n, n);
@@ -1484,6 +4267,307 @@ Matrix<double> log(const Matrix<datatype>& A, scalar base) {
     return Qmat * Fm * Qmat.T();
 }
 
+// ─── Matrix functions (free) ────────────────────────────────────────────────
+// Reminder on the convention this header follows:
+//   A.exp()  → element-wise, e^(a_ij) for each element independently
+//   exp(A)   → MATRIX exponential, the power series I + A + A²/2! + A³/3! + ...
+// These are completely different results. The two above and the two below
+// (A.sin() vs sin(A)) are the pairs most likely to be confused, so each doc
+// comment says which one it is.
+//
+// All of these evaluate a Taylor series, and all of them accept an optional
+// trailing TaylorOpts controlling how far that series runs — see TaylorOpts at
+// the top of this header for the four call forms.
+
+// Shared machinery for the Taylor-series matrix functions. Kept in a namespace
+// because these are implementation details, not part of the Matrix API, and the
+// names (eye, halvings) are ones a caller might reasonably want for themselves.
+namespace taylor_detail {
+
+    // n×n identity as Matrix<double>.
+    inline Matrix<double> eye(int n) {
+        Matrix<double> E(n, n);
+        for (int i = 0; i < n; i++) E(i, i) = 1.0;
+        return E;
+    }
+
+    // Validated double copy of A — every matrix function needs the same square,
+    // non-empty check and the same conversion, so they share one.
+    template<typename datatype>
+    Matrix<double> squareAsDouble(const Matrix<datatype>& A, const char* who) {
+        static_assert(!is_complex<datatype>::value,
+            "The matrix functions (exp/sin/cos/tan/sinh/cosh/tanh) are not yet "
+            "implemented for complex datatypes. They would compile by taking "
+            "std::real() of each entry and silently discard the imaginary part. "
+            "See roadmap item 1 (work_t) at the top of this header.");
+        if (A.rows() != A.cols())
+            throw std::invalid_argument(
+                std::string(who) + ": matrix must be square, got " +
+                std::to_string(A.rows()) + "x" + std::to_string(A.cols()));
+        if (A.rows() == 0)
+            throw std::invalid_argument(std::string(who) + ": matrix must be non-empty");
+        int n = (int)A.rows();
+        Matrix<double> Ad(n, n);
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++) Ad(i, j) = double(std::real(A(i, j)));
+        return Ad;
+    }
+
+    // How many times to halve A so that ||A/2^s|| lands inside `radius`.
+    //
+    // This is the step that makes a Taylor series usable at all. The series for
+    // e^A converges for every A in theory, but for ||A|| = 20 the terms grow to
+    // about 20^20/20! ≈ 4e7 before they start shrinking, so the sum loses every
+    // significant digit it had to cancellation. Halving first keeps every term
+    // smaller than the last, and squaring afterwards costs only s extra products.
+    inline int halvings(double nrm, double radius, bool enabled) {
+        if (!enabled || !(nrm > radius)) return 0;
+        int s = (int)std::ceil(std::log2(nrm / radius));
+        if (s < 0)  s = 0;
+        if (s > 64) s = 64;   // beyond this the squarings cost more than they buy
+        return s;
+    }
+
+    // Evaluates {sin(A), cos(A)} — or {sinh(A), cosh(A)} when hyper is true.
+    //
+    // They are computed together on purpose: the double-angle identity that
+    // undoes the scaling for sine, sin(2Y) = 2·sin(Y)·cos(Y), needs the cosine
+    // anyway, so computing one alone would cost the same as computing both.
+    //
+    // Both series advance by a recurrence on the previous term:
+    //     sin:  t₀ = X,  tₖ = tₖ₋₁ · X² / ( -(2k)(2k+1) )
+    //     cos:  t₀ = I,  tₖ = tₖ₋₁ · X² / ( -(2k-1)(2k) )
+    // with the sign folded into the denominator, and dropped for the hyperbolic
+    // pair. One matrix product per term, and no factorial is ever formed — 171!
+    // already overflows a double, so any implementation that divides by an
+    // explicit factorial returns NaN long before 300 terms.
+    inline std::pair<Matrix<double>, Matrix<double>>
+    sincosSeries(Matrix<double> X, TaylorOpts opts, bool hyper) {
+        int n = (int)X.rows();
+        int s = halvings(X.norm(NormType::Inf), 1.0, opts.scaling);
+        if (s) X = X / std::ldexp(1.0, s);
+
+        Matrix<double> X2 = X * X;
+        Matrix<double> Id = eye(n);
+        Matrix<double> S  = X,  sTerm = X;
+        Matrix<double> C  = Id, cTerm = Id;
+
+        const double tol = opts.epsTol();
+        bool sDone = false, cDone = false;
+        for (long k = 1; k <= opts.maxTerms && !(sDone && cDone); k++) {
+            double sDen = double(2*k) * double(2*k + 1);
+            double cDen = double(2*k - 1) * double(2*k);
+            if (!hyper) { sDen = -sDen; cDen = -cDen; }
+            if (!sDone) { sTerm = sTerm * X2 / sDen; S += sTerm; }
+            if (!cDone) { cTerm = cTerm * X2 / cDen; C += cTerm; }
+            if (tol > 0.0) {
+                if (sTerm.norm(NormType::Inf) <= tol * S.norm(NormType::Inf)) sDone = true;
+                if (cTerm.norm(NormType::Inf) <= tol * C.norm(NormType::Inf)) cDone = true;
+            }
+        }
+
+        // Undo the halving. The circular and hyperbolic identities have the same
+        // shape, which is why one loop serves both:
+        //   sin(2Y) = 2·sin·cos      sinh(2Y) = 2·sinh·cosh
+        //   cos(2Y) = 2·cos² − I     cosh(2Y) = 2·cosh² − I
+        for (int i = 0; i < s; i++) {
+            Matrix<double> Snew = (S * C) * 2.0;
+            C = (C * C) * 2.0 - Id;
+            S = Snew;
+        }
+        return {S, C};
+    }
+
+} // namespace taylor_detail
+
+// exp(A) — the matrix exponential, sum of A^k / k!.
+//
+// The most valuable of the missing matrix functions: it is the closed-form
+// solution of the linear ODE x' = A*x, the transition operator of a continuous
+// Markov chain, the map from a Lie algebra to its Lie group, and — once complex
+// support lands — exp(-i*H*t), the time-evolution operator the quantum-circuit
+// goal in the README is built on.
+//
+// Unlike pow() and log() this does NOT need the Schur form, so it is unaffected
+// by the 2x2 real-Schur block problem and is defined for every square matrix
+// with no eigenvalue restrictions.
+//
+// Scaling and squaring around a Taylor series:
+//   1. halve A until ||A/2^s||∞ <= 1/2, where the series converges fast and
+//      monotonically
+//   2. sum I + X + X²/2! + … by the recurrence tₖ = tₖ₋₁·X/k — one matrix
+//      product per term, stopping as soon as a term stops contributing
+//   3. square s times to undo the scaling, since e^A = (e^(A/2^s))^(2^s)
+//
+// Usage: auto E = exp(A);                  // defaults
+//        auto E = exp(A, 25);              // at most 25 terms
+//        auto E = exp(A, {25, 1e-12});     // ... or until terms fall below 1e-12
+//        auto E = exp(A, {25, 1e-12, false});  // ... with scaling disabled
+template<typename datatype>
+Matrix<double> exp(const Matrix<datatype>& A, TaylorOpts opts = {}) {
+    try {
+        Matrix<double> X = taylor_detail::squareAsDouble(A, "exp");
+        int n = (int)X.rows();
+
+        int s = taylor_detail::halvings(X.norm(NormType::Inf), 0.5, opts.scaling);
+        if (s) X = X / std::ldexp(1.0, s);
+
+        Matrix<double> E = taylor_detail::eye(n);
+        Matrix<double> term = E;
+        const double tol = opts.epsTol();
+        for (long k = 1; k <= opts.maxTerms; k++) {
+            term = term * X / double(k);
+            E += term;
+            if (tol > 0.0 &&
+                term.norm(NormType::Inf) <= tol * E.norm(NormType::Inf)) break;
+        }
+
+        for (int i = 0; i < s; i++) E = E * E;
+        return E;
+    } catch (const std::exception& e) {
+        std::cerr << "exp(A) error: " << e.what() << std::endl;
+        throw;
+    }
+}
+
+// ─── Matrix trigonometry (free) ─────────────────────────────────────────────
+// sin(A), cos(A) and the hyperbolic pair are ENTIRE functions: their power
+// series converge for every square matrix. So unlike log(A, base) — which
+// requires positive eigenvalues — these have no domain restriction at all.
+//
+// That mattered for the route not taken. Evaluating them through the Schur form
+// the way pow() and log() do would run straight into the 2x2 blocks that a real
+// Schur form carries for complex-conjugate eigenvalue pairs, and a plain 2D
+// rotation matrix — complex eigenvalues, perfectly ordinary real cos(A) — is
+// enough to trigger it. Summing the series directly sidesteps the Schur form
+// altogether, so these are correct for rotations today, with no dependency on
+// the block-aware Parlett recurrence described at schurDecomp().
+//
+// Identities the test suite checks (matrix products, not element-wise):
+//   sin(A)² + cos(A)²  == I
+//   cosh(A)² − sinh(A)² == I
+//   sin(A) is NOT A.sin(); the two agree only for diagonal A
+//
+// ACCURACY, and what to expect from those identities. If A has an eigenvalue
+// with a large imaginary part, sin(A) and cos(A) genuinely grow like
+// e^|Im(λ)| — for ||A||∞ ≈ 40 that is around 1e11 per entry. sin²+cos² then
+// asks for ~1e22 of cancellation to land back on I, so the ABSOLUTE residual
+// is bounded below by conditioning, not by the algorithm: no implementation in
+// double precision returns a small one. The error relative to those
+// intermediate magnitudes stays at machine epsilon, which is the meaningful
+// measure. Symmetric A has real eigenvalues, so sin/cos stay bounded by 1 and
+// the identity does hold to full absolute accuracy there.
+
+// sin(A) — matrix sine, sum of (-1)^k A^(2k+1) / (2k+1)!.
+// Optional TaylorOpts as for exp(): sin(A, 25), sin(A, {25, 1e-12}), etc.
+template<typename datatype>
+Matrix<double> sin(const Matrix<datatype>& A, TaylorOpts opts = {}) {
+    try {
+        auto [S, C] = taylor_detail::sincosSeries(
+            taylor_detail::squareAsDouble(A, "sin"), opts, false);
+        (void)C;
+        return S;
+    } catch (const std::exception& e) {
+        std::cerr << "sin(A) error: " << e.what() << std::endl;
+        throw;
+    }
+}
+
+// cos(A) — matrix cosine, sum of (-1)^k A^(2k) / (2k)!.
+// Optional TaylorOpts as for exp().
+template<typename datatype>
+Matrix<double> cos(const Matrix<datatype>& A, TaylorOpts opts = {}) {
+    try {
+        auto [S, C] = taylor_detail::sincosSeries(
+            taylor_detail::squareAsDouble(A, "cos"), opts, false);
+        (void)S;
+        return C;
+    } catch (const std::exception& e) {
+        std::cerr << "cos(A) error: " << e.what() << std::endl;
+        throw;
+    }
+}
+
+// tan(A) — matrix tangent, the X solving cos(A)·X = sin(A).
+//
+// NOTE the operation: this is a linear SOLVE, cos(A)⁻¹·sin(A) — a LEFT division.
+// sin(A)/cos(A) would now give the right division sin(A)·cos(A)⁻¹, which happens
+// to be the same matrix here (sin(A) and cos(A) commute, both being functions of
+// A) but is the wrong operation in general, and goes through an extra pair of
+// transposes to get there. Undefined where cos(A) is singular.
+template<typename datatype>
+Matrix<double> tan(const Matrix<datatype>& A, TaylorOpts opts = {}) {
+    try {
+        auto [S, C] = taylor_detail::sincosSeries(
+            taylor_detail::squareAsDouble(A, "tan"), opts, false);
+        return C.solve(S);
+    } catch (const std::exception& e) {
+        std::cerr << "tan(A) error: " << e.what() << std::endl;
+        throw;
+    }
+}
+
+// sinh(A) — matrix hyperbolic sine, sum of A^(2k+1) / (2k+1)!.
+//
+// Summed directly rather than as (exp(A) − exp(−A))/2: that identity costs two
+// matrix exponentials, and it cancels catastrophically for large ||A||, where
+// exp(A) and exp(−A) agree to many digits before the subtraction throws them away.
+template<typename datatype>
+Matrix<double> sinh(const Matrix<datatype>& A, TaylorOpts opts = {}) {
+    try {
+        auto [S, C] = taylor_detail::sincosSeries(
+            taylor_detail::squareAsDouble(A, "sinh"), opts, true);
+        (void)C;
+        return S;
+    } catch (const std::exception& e) {
+        std::cerr << "sinh(A) error: " << e.what() << std::endl;
+        throw;
+    }
+}
+
+// cosh(A) — matrix hyperbolic cosine, sum of A^(2k) / (2k)!.
+template<typename datatype>
+Matrix<double> cosh(const Matrix<datatype>& A, TaylorOpts opts = {}) {
+    try {
+        auto [S, C] = taylor_detail::sincosSeries(
+            taylor_detail::squareAsDouble(A, "cosh"), opts, true);
+        (void)S;
+        return C;
+    } catch (const std::exception& e) {
+        std::cerr << "cosh(A) error: " << e.what() << std::endl;
+        throw;
+    }
+}
+
+// tanh(A) — matrix hyperbolic tangent, the X solving cosh(A)·X = sinh(A).
+// A solve, not an element-wise division — see the note on tan(A).
+template<typename datatype>
+Matrix<double> tanh(const Matrix<datatype>& A, TaylorOpts opts = {}) {
+    try {
+        auto [S, C] = taylor_detail::sincosSeries(
+            taylor_detail::squareAsDouble(A, "tanh"), opts, true);
+        return C.solve(S);
+    } catch (const std::exception& e) {
+        std::cerr << "tanh(A) error: " << e.what() << std::endl;
+        throw;
+    }
+}
+
+// sqrt(A) — principal matrix square root, the X with X*X = A.
+// Already reachable as pow(A, 0.5); this is the conventional spelling. Note this
+// one goes through the Schur form, not a Taylor series, so it takes no
+// TaylorOpts and it does inherit pow()'s positive-eigenvalue requirement.
+template<typename datatype>
+Matrix<double> sqrt(const Matrix<datatype>& A) {
+    if (A.rows() != A.cols())
+        throw std::invalid_argument(
+            "sqrt: matrix must be square, got " +
+            std::to_string(A.rows()) + "x" + std::to_string(A.cols()));
+    return pow(A, 0.5);
+}
+
+// ─── Free-function spellings that mirror mathematical notation ──────────────
+
 // tr(A) — sum of the main diagonal elements. Mirrors mathematical notation.
 template<typename datatype>
 datatype tr(const Matrix<datatype>& A) { return A.tr(); }
@@ -1492,10 +4576,84 @@ datatype tr(const Matrix<datatype>& A) { return A.tr(); }
 template<typename datatype>
 datatype det(const Matrix<datatype>& A) { return A.det(); }
 
+// Thin wrappers over the members of the same name, for the callers who prefer
+// f(A) notation. Each is a one-liner like tr/det above.
+
+// solve(A, B) — solves A * X = B. See Matrix::solve.
+template<typename datatype, typename dtB>
+Matrix<double> solve(const Matrix<datatype>& A, const Matrix<dtB>& B) { return A.solve(B); }
+
+// norm(A, type) — matrix norm. See Matrix::norm.
+template<typename datatype>
+double norm(const Matrix<datatype>& A, NormType type = NormType::Fro) { return A.norm(type); }
+
+// rank(A) — numerical rank. See Matrix::rank.
+template<typename datatype>
+long rank(const Matrix<datatype>& A, double tol = -1.0) { return A.rank(tol); }
+
+// cond(A, type) — condition number. See Matrix::cond.
+template<typename datatype>
+double cond(const Matrix<datatype>& A, NormType type = NormType::Two) { return A.cond(type); }
+
+// inverse(A) — matrix inverse. See Matrix::inverse.
+template<typename datatype>
+Matrix<double> inverse(const Matrix<datatype>& A) { return A.inverse(); }
+
+// pinv(A) — Moore-Penrose pseudo-inverse. See Matrix::pinv.
+template<typename datatype>
+Matrix<double> pinv(const Matrix<datatype>& A, double tol = -1.0) { return A.pinv(tol); }
+
+// adj(A) — adjugate. See Matrix::adjugate.
+template<typename datatype>
+Matrix<double> adj(const Matrix<datatype>& A) { return A.adjugate(); }
+
+// eigvals(A) — every eigenvalue, complex ones included. See Matrix::eigvals.
+template<typename datatype>
+Matrix<std::complex<double>> eigvals(const Matrix<datatype>& A) { return A.eigvals(); }
+
+// diag(v) — builds a square diagonal matrix FROM a vector, the inverse
+// direction of the member A.diag() which extracts a diagonal into a vector.
+// v must be a row or column vector; an (n x 1) or (1 x n) input gives n x n.
+template<typename datatype>
+Matrix<datatype> diag(const Matrix<datatype>& v) {
+    long n = v.rows() * v.cols();
+    if (v.rows() != 1 && v.cols() != 1)
+        throw std::invalid_argument(
+            "diag(v): expected a row or column vector, got " +
+            std::to_string(v.rows()) + "x" + std::to_string(v.cols()) +
+            " — to extract a diagonal from a matrix use the member A.diag()");
+    if (n == 0)
+        throw std::invalid_argument("diag(v): vector must be non-empty");
+    Matrix<datatype> out(n, n);
+    for (long i = 0; i < n; i++) out(int(i), int(i)) = v[int(i)];
+    return out;
+}
+
 
 
 // Scalar multiplication with scalar on the left: k * A.
 // Complements the member operator A * k so both orderings work.
+// --- Element-wise dot-operator sugar (see dot_t above) ---
+// Deliberately a distinct type per side so that a stray `A * dot` cannot be
+// mistaken for anything else, and so the second operand is checked at compile
+// time rather than silently deducing scalar = dot_t in Matrix::operator*.
+template<typename datatype> struct ElemMulLhs { const Matrix<datatype>* a; };
+template<typename datatype> struct ElemDivLhs { const Matrix<datatype>* a; };
+
+template<typename datatype>
+ElemMulLhs<datatype> operator*(const Matrix<datatype>& A, dot_t) { return {&A}; }
+template<typename datatype>
+ElemDivLhs<datatype> operator/(const Matrix<datatype>& A, dot_t) { return {&A}; }
+
+template<typename datatype>
+Matrix<datatype> operator*(ElemMulLhs<datatype> lhs, const Matrix<datatype>& B) {
+    return lhs.a->emul(B);
+}
+template<typename datatype>
+Matrix<datatype> operator/(ElemDivLhs<datatype> lhs, const Matrix<datatype>& B) {
+    return lhs.a->ediv(B);
+}
+
 template<typename datatype, typename scalar>
 Matrix<datatype> operator*(const scalar k, Matrix<datatype> A) {
     return A * k;
