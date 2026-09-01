@@ -103,6 +103,10 @@ SHARED_OPS = {
     "scalar_mul":     lambda n, cx: (lambda a: (lambda: a * 1.0000001))(rand(n, n, cx)),
     "scalar_div":     lambda n, cx: (lambda a: (lambda: a / 1.0000001))(rand(n, n, cx)),
     "elem_exp":       lambda n, cx: (lambda a: (lambda: np.exp(a)))(rand(n, n, cx)),
+    # The C++ side rounds the size down to a power of two, so match that here or
+    # the two would be transforming different lengths.
+    "fft":            lambda n, cx: (lambda a: (lambda: np.fft.fft(a)))(
+                          rand(1, 1 << (int(n).bit_length() - 1), cx).ravel()),
     "elem_ln":        lambda n, cx: (lambda a: (lambda: np.log(a)))(rand(n, n, cx) + 2),
     "elem_pow":       lambda n, cx: (lambda a: (lambda: a ** 2.5))(rand(n, n, cx) + 2),
     # ascontiguousarray forces the copy; bare .T would time a no-op view.
@@ -119,7 +123,7 @@ SHARED_OPS = {
                           np.diag(np.diag(rand(n, n, cx)))),
     "trace":          lambda n, cx: (lambda a: (lambda: np.trace(a)))(rand(n, n, cx)),
     "multiply":       lambda n, cx: (lambda a, b: (lambda: a @ b))(*_two(n, cx)),
-    "tensor":         lambda n, cx: (lambda a, b: (lambda: np.kron(a, b)))(*_two(n, cx)),
+    "kron":         lambda n, cx: (lambda a, b: (lambda: np.kron(a, b)))(*_two(n, cx)),
 }
 
 REAL_ONLY_OPS = {

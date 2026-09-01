@@ -209,7 +209,7 @@ int main(){
     Matrix<int> T2(2, 2);  T2.set_Ran_values(1, 4, -88);
     cout << "T1 (2x2):\n" << T1 << "\n";
     cout << "T2 (2x2):\n" << T2 << "\n";
-    cout << "T1.tensor(T2) (4x4):\n" << T1.tensor(T2) << "\n";
+    cout << "T1.kron(T2) (4x4):\n" << T1.kron(T2) << "\n";
 
     // -------------------------------------------------------
     // Identity matrix

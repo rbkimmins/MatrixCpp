@@ -23,3 +23,7 @@ numpy_running_time.txt
 
 # Julia
 Manifest.toml
+
+validate_tensor
+tensor_numpy_validate
+tensor_cases.txt

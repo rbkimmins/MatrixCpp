@@ -43,26 +43,316 @@ and works without it.
 
 ## Operators, and how they map to MATLAB
 
-The library follows MATLAB where C++ allows it. `A / B` is **matrix right
-division** — the `X` solving `X * B = A` — not element-wise division, and it is
-computed as a solve rather than by forming `inv(B)`.
+**The member dot is the element-wise marker.** `A.sin()` is element-wise,
+`sin(A)` is the matrix function. `A.pow(n)` is element-wise, `pow(A, n)` is the
+matrix power. That is MATLAB's leading dot, moved to where C++ can hold it — and
+it is why the element-wise members are `mul` and `div` rather than `emul` and
+`ediv`: being a member has already said "element-wise", so the `e` would say it
+twice. It also keeps them the same three-letter shape as `sin`, `cos`, `exp`,
+`abs` and `pow`.
+
+`A / B` is **matrix right division** — the `X` solving `X * B = A` — not
+element-wise division, and it's computed as a solve rather than by forming
+`inv(B)`.
 
 | MATLAB | here | |
 |---|---|---|
 | `A * B` | `A * B` | matrix product |
-| `A .* B` | `A % B`, `A.emul(B)`, `A *dot* B` | element-wise product |
+| `A .* B` | `A.mul(B)`, `A % B`, `A *dot* B` | element-wise product |
 | `A / B` | `A / B` | right division, `X*B = A` |
-| `A ./ B` | `A.ediv(B)`, `A /dot/ B` | element-wise division |
+| `A ./ B` | `A.div(B)`, `A /dot/ B` | element-wise division |
 | `A \ B` | `A.solve(B)` | left division — C++ has no `operator\` |
 | `A ^ n` | `pow(A, n)` | matrix power — `^` has the wrong precedence in C++ |
 | `A .^ n` | `A.pow(n)` | element-wise power |
+| `sin(A)` | `sin(A)` | matrix function (free) |
+| element-wise `sin` | `A.sin()` | element-wise (member) |
 | `A'` | `A.H()` | conjugate transpose |
 | `A.'` | `A.T()` | plain transpose |
+| `kron(A,B)` | `A.kron(B)`, `kron(A,B)` | Kronecker — no operator, deliberately |
 
-C++ cannot define an operator with a leading dot, so the element-wise family is
-named (`emul`, `ediv`) with `%` and the `*dot*` / `/dot/` spellings as sugar.
-`A /dot/ B` parses as `(A / dot) / B` — `*` and `/` share a precedence level and
-associate left to right — so it composes correctly with surrounding `+` and `-`.
+`kron` keeps a name rather than getting an operator (`%` was considered) because
+operators should go to frequent, cheap operations. Hadamard is O(n²) and
+everywhere; Kronecker is O(n⁴) and rare — two 1000×1000 matrices produce 10¹²
+elements, 8 TB. That cost should be visible at the call site. It's also why the
+benchmark takes `kron` to n = 48 while everything else runs to 512 or 2000.
+
+`T()` and `H()` are members that aren't element-wise, which bends the rule — but
+harmlessly, since there's no such thing as an element-wise transpose for them to
+be confused with.
+
+For the operator spellings, `A /dot/ B` parses as `(A / dot) / B` — `*` and `/`
+share a precedence level and associate left to right — so it composes correctly
+with surrounding `+` and `-`.
+
+## FFT
+
+```cpp
+fft(x)        fft(x, n)        fft(A, n, addcol)     // MATLAB semantics
+ifft(X)       fftshift(X)      ifftshift(X)
+```
+
+A vector transforms along its own length, a matrix column by column, `n` pads or
+truncates, and the whole `1/n` sits on the inverse — all as MATLAB does, which is
+what makes the results checkable against `numpy.fft` rather than merely
+self-consistent.
+
+**Correct for every length.** Radix-2 where `n` is a power of two, Bluestein's
+chirp-z otherwise. The tempting shortcut — zero-padding up to the next power of
+two — computes the transform of a *different, longer* signal: right for a
+convolution, silently wrong for a spectrum. So it isn't done.
+
+| | vs NumPy |
+|---|---|
+| one 1-D transform, n = 2048 … 2²⁰ | 0.43× – 0.89× |
+| **1024 × 64 columns** | **1.98×** |
+| **1024 × 512 columns** | **2.59×** |
+
+NumPy uses pocketfft — mixed-radix with hand-written codelets for radices
+2/3/4/5/7/11. A single-radix-2 kernel won't beat that on one transform. But
+pocketfft doesn't *thread*, and transforming the columns of a matrix is perfect
+parallelism, so that case is simply not available to it.
+
+## Sequences, shape and test matrices
+
+```cpp
+linspace(0, 1, 101)   logspace(-1, 2, 7)   range(0, 9, 2)     // a:step:b
+hilb(5)  pascal(4)  wilkinson(7)  magic(4)  toeplitz(c)  vander(v)
+randn(m, n, -seed)    randi(1, 6, m, n, -seed)   randperm(n, -seed)
+
+A.numel()  A.repmat(2,3)  A.fliplr()  A.flipud()  A.rot90(-1)
+A.circshift(1, 0)  A.blkdiag(B)
+```
+
+Sequences go through **`std::iota`**, the standard library's own sequence
+generator, so the index run is exact and the only floating point in a `linspace`
+is the single multiply that scales it — accumulating `v += step` would drift, and
+drift further the longer the vector. `linspace` also **sets** its endpoint rather
+than computing it, because `a + i*(b-a)/(n-1)` doesn't reliably land on `b`.
+
+Every random constructor uses **`ran2` from `random.hpp`**, never `std::rand`.
+Seeds stay negative, matching `set_Ran_values`. `randn` is Box–Muller, `randperm`
+is Fisher–Yates. ⚠ `ran2` keeps static state, so these are deliberately **serial**
+— the one place the OpenMP treatment the rest of the header gets would be wrong.
+
+## General matrix functions and generalized eigenvalues
+
+```cpp
+funm(A, [](std::complex<double> z){ return 1.0/(1.0 + z); })   // any callable
+eig(A, B)        // symmetric-definite:  A x = lambda B x
+eigvals(A, B)    // general pencil, guarded
+polyeig({A0, A1, A2})                                          // matrix polynomial
+```
+
+`funm` is **numeric, not symbolic** — `f` is a lambda called on complex numbers;
+nothing differentiates or expands it. That boundary has a price and it's stated
+rather than hidden: the robust Schur–Parlett algorithm needs `f'`, `f''` to
+handle clustered eigenvalues, so this one **detects** that case and throws,
+naming the two eigenvalues. `exp`, `log`, `sqrt`, `sin`, `cos`, `sinh`, `cosh`,
+`tanh` and `pow` have dedicated implementations that don't go through Parlett and
+have no separation requirement at all — the error message says so.
+
+`eig(A, B)` returns eigenvalues ascending and eigenvectors that are
+**B-orthonormal** (`XᵀBX = I`), which is the right normalisation for this problem
+and what LAPACK's `dsygv` gives.
+
+`eigvals(A, B)` reduces via `B⁻¹A` and is **guarded by a condition estimate** — it
+refuses a near-singular `B` outright rather than returning plausible numbers, and
+names QZ as what would be needed. QZ itself isn't implemented; that's the one
+remaining gap in this tier.
+
+## Factor once, solve many times
+
+`A.solve(b)` factors `A` from scratch every call — right for a one-off, wrong in
+a loop. `factorize()` returns a reusable object:
+
+```cpp
+auto dA = A.factorize();          // or decomposition(A), MATLAB's spelling
+Matrix<double> x1 = dA.solve(b1);
+Matrix<double> x2 = dA.solve(b2);
+double d = dA.det();              // free from the factors already held
+```
+
+| 100 right-hand sides | `A.solve()` each time | factor once | |
+|---|---|---|---|
+| n = 256 | 104 ms | **3.1 ms** | 33× |
+| n = 512 | 810 ms | **16.3 ms** | 50× |
+
+It picks the factorisation from the **structure**, not from a flag you have to
+get right — symmetric positive definite → Cholesky (half the flops, and the
+attempt *is* the definiteness test), square otherwise → LU, rectangular →
+column-pivoted QR. `kindName()` reports which. The object owns its factors, so it
+outlives the matrix it came from.
+
+```cpp
+rcond(A)      condest(A)          // Hager–Higham 1-norm estimate
+lsqminnorm(A, b)                  // minimum-norm least squares
+```
+
+`rcond`/`condest` estimate the condition number from those same factors in a
+handful of solves rather than forming an inverse — 9.6 ms against 302 ms for a
+full `cond(Two)` at n = 512. It's a **lower** bound, never pessimistic; on a 5×5
+Hilbert matrix it lands on the true value exactly.
+
+## Reductions and scans
+
+```cpp
+A.sum()   A.prod()   A.mean()   A.median()   A.mode()   A.min()   A.max()
+A.var()   A.stddev()  A.argmin()  A.argmax()  A.nnz()
+A.sum(false)      // per column        A.sum(true)      // per row
+A.cumsum(false)   A.cumprod(true)      // scans — same shape as the input
+A.diff(false)     // (rows-1 x cols)   A.diff(true)     // (rows x cols-1)
+A.sort(false)     A.sort(true, /*descending=*/true)
+A.sortrows(0)     A.unique()
+```
+
+One convention throughout: **`false` works down columns, `true` along rows** — so
+`prod(false)` pairs with `sum(false)`, and `cumsum(false)` accumulates down the
+axis `sum(false)` totals. Scans keep the input shape; `diff` shrinks the scanned
+axis by one; `median` returns `double` because an even count averages the middle
+two. `prod`/`cumsum`/`cumprod` work for complex; anything that has to *order*
+elements refuses to compile for it, the same as `min`/`max`.
+
+## Logical masks
+
+Comparisons produce a `Matrix<bool>`, which is an ordinary matrix — it gets
+shape, printing, `T()` and the rest for free.
+
+```cpp
+Matrix<double> A(2, 3);  A = {{-1, 2, -3}, {4, -5, 6}};
+
+A > 0.0            A <= B           A.eq(B)      A.ne(0.0)     // masks
+m1 && m2           m1 || m2         m1 ^ m2      !m1           // combine
+m1.land(m2)        m1.lor(m2)       m1.lxor(m2)  m1.lnot()     // same, named
+A.any()   A.all()   A.nnz()   A.find()                          // reduce
+A.any(false)                                                    // per column
+
+Matrix<double> pos = A(A > 0.0);   // read  -> column vector, row-major
+A(A < 0.0) = 0.0;                  // write through the mask
+A(A > 0.0) = repl;                 // one value per selected element
+```
+
+**`<` `>` `<=` `>=` are element-wise; `==` and `!=` are not.** That's not an
+oversight. The rule is that the member dot marks element-wise *where both
+meanings exist* — and for the orderings only one meaning exists, since matrices
+have no ordering for `A < B` to be confused with. For `==` the other meaning very
+much does exist, and `if (A == B)` is the idiom every C++ programmer reaches for,
+so the operator keeps whole-matrix equality and `.eq()` is the element-wise form.
+This is the one place the comparison family diverges from MATLAB.
+
+**Logic is spelled in C: `&&`, `||`, `!`** — not NumPy's and MATLAB's `&` and
+`|`, because `|` isn't available: `A | B` is the augmented-matrix operator here.
+Taking `&` for *and* while *or* had to be a named function would have left the
+pair lopsided, so the whole triple goes to C syntax instead. ⚠ The trap is still
+there for anyone typing from NumPy habit — `(A > 0) | (B > 0)` compiles and
+quietly returns a mask of twice the width. Use `||`.
+
+`^` is C's exclusive-or, so that one *is* the language's own spelling. Its low
+precedence is an argument against ever using `^` for a **power** — `A * B ^ 2`
+would silently group as `(A*B) ^ 2`, which is why the matrix power here is
+`pow(A, n)` and never an operator. For xor the precedence is harmless and in fact
+convenient: relational operators bind tighter, so `A > 0 ^ A > 3` groups as
+`(A > 0) ^ (A > 3)`. GCC still suggests parentheses there, so add them — the
+grouping is already right, but a quiet build is worth two characters.
+
+Both spellings exist on purpose: `&& || ^ !` for people arriving from C, and
+`.land() .lor() .lxor() .lnot()` for people arriving from Python or MATLAB. Same
+call either way.
+
+Overloading `&&`/`||` costs short-circuit evaluation, which an element-wise *or*
+never had — it must look at every element of both operands regardless. And since
+the result is a `Matrix<bool>`, which has no conversion to `bool`, `if (m1 || m2)`
+**doesn't compile**: you have to say `.any()` or `.all()`. Scalar conditions like
+`if (A.any() || B.any())` are plain bools and short-circuit normally. Both
+behaviours are pinned by tests.
+
+**Count with `nnz()`, not `sum()`** — `sum()` returns `datatype`, and on a
+`Matrix<bool>` that saturates at `true` rather than counting.
+
+## Tensors
+
+`Tensor.hpp` adds N-dimensional arrays. Include it *instead of* `Matrix1.0.hpp` —
+it pulls the matrix header in.
+
+```cpp
+#include "Tensor.hpp"
+
+Tensor<double> A(2, 3, 4);           // variadic shape, zero-filled
+A(1, 2, 3) = 5.0;                    // variadic indexing
+
+auto R = A.reshape(6, 4);            // O(1) — metadata only
+auto P = A.permute({2, 0, 1});       // O(1) — strides only
+auto S = A.slice(1, 2);              // O(1) — drops axis 1
+
+A + B      A.mul(B)  A.div(B)        // element-wise, same spelling as Matrix
+A * B                                // contracts A's last axis with B's first —
+                                     // for rank 2 that IS the matrix product
+contract(A, B, 2)                    // tensordot over two axes
+contract(A, B, {2}, {0})             // over explicitly named axes
+contractInto(A, B, 1, out)           // into storage you already own
+```
+
+One flat buffer plus shape and strides, the layout NumPy, PyTorch and TensorFlow
+all use. The alternatives were measured before this was written, on a
+(32, 32, 64, 64) tensor — 4.19M doubles, 33.6 MB:
+
+| | `Matrix<Matrix<double>>` | `vector<Matrix<double>>` | flat (what's built) |
+|---|---|---|---|
+| element-wise add | 14.22 ms | 13.29 ms | **3.74 ms** |
+| sum all | 0.83 ms | 0.79 ms | **0.37 ms** |
+| allocations | 1024 | 1024 | **1** |
+| usable as a GEMM | no | no | **122 GFLOP/s** |
+
+Nesting `Matrix` inside `Matrix` compiles, and addition even works — but
+multiplication *throws*, because the accumulator starts as `datatype(0)`, which
+for a nested element is a 0×0 matrix. That's structural, not a bug to fix: a
+generic algorithm needs a zero of the right *shape*.
+
+`reshape`, `permute` and `contiguous` measure **30–50 nanoseconds** — they only
+rewrite metadata. That matters because every fast tensor contraction is
+`reshape → permute → GEMM → permute back`, and the GEMM is `mstore::gemm`,
+the same kernel `Matrix::operator*` uses, unmodified.
+
+**Copy semantics differ from `Matrix` in one way worth knowing.** Ordinary copies
+deep-copy, as `Matrix` does. But `reshape`/`permute`/`swapAxes`/`T`/`slice` return
+**views** that share storage, so writing through one writes through to the
+original. Copying a view materialises it, so the aliasing never outlives a
+variable you explicitly made with a view method. `clone()` forces a deep copy.
+
+Validated by 95 assertions plus 14 operations cross-checked against NumPy
+(`validate_tensor.cpp`, `tensor_numpy_validate.{cpp,py}`).
+
+## Constants and literals
+
+Math constants use the `std::numbers` names, but work from **C++17**:
+
+```cpp
+mconst::pi, mconst::e, mconst::sqrt2, mconst::phi, ...   // double
+mconst::pi_v<float>, mconst::pi_v<long double>           // any floating type
+```
+
+`<numbers>` is C++20 — at `-std=c++17` it includes but `std::numbers::pi` is
+"not declared" — so depending on it would silently force every user of this
+header to C++20. `M_PI` was the other option and is worse: a POSIX/MSVC
+extension rather than ISO C++, a macro (so it can't be scoped or templated), and
+needs `_USE_MATH_DEFINES` on MSVC. So the constants are defined here with the
+standard's own names and simply **alias to `std::numbers` when it exists**.
+Nothing in user code changes on a move to C++20. All 13 constants are verified
+bit-identical to `std::numbers` in `float`, `double` and `long double`.
+
+The imaginary unit comes from the standard:
+
+```cpp
+using namespace matrix_literals;         // re-exports std::complex_literals
+
+auto z = 3.0 + 4.0i;
+Matrix<std::complex<double>> A(2, 2);
+A = {{1.0 + 2.0i, 3.0 + 0.0i}, {0.0 + 0.0i, 1.0i}};
+```
+
+A literal suffix was chosen over a global `inline constexpr complex<double> i`
+because nearly every loop in matrix code uses `i` as a counter, and a local
+declaration shadows a global one — quietly making the imaginary unit unusable
+inside the very functions you'd want it in. A suffix can't be shadowed.
 
 ## The naming convention
 
@@ -154,6 +444,22 @@ once sorted.
 
 `test.cpp` is the older demonstration program — it prints results for a human to
 read rather than checking them.
+
+**`validate_tensor.cpp`** — 95 assertions over `Tensor.hpp`: shapes, indexing,
+view aliasing, element-wise arithmetic through strided views, reductions,
+contraction against hand-rolled loops, `Matrix` interop, complex tensors, and a
+5-qubit gate-application round trip.
+
+**`tensor_numpy_validate.{cpp,py}`** — the same idea as `numpy_validate` but for
+tensors. NumPy is the reference implementation of this layout, so agreeing with
+it on `permute`/`reshape`/`tensordot` is the strongest available statement that
+the stride arithmetic is right.
+
+```bash
+g++ -std=c++17 -O2 -fopenmp -o validate_tensor validate_tensor.cpp && ./validate_tensor
+g++ -std=c++17 -O2 -fopenmp -o tensor_numpy_validate tensor_numpy_validate.cpp
+./tensor_numpy_validate > tensor_cases.txt && python3 tensor_numpy_validate.py
+```
 
 ## Benchmarks
 

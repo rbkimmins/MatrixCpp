@@ -104,6 +104,30 @@ def close(a, b):
 
 # ─────────────────────────────────── operators with a unique NumPy answer ──
 # key -> f(case) returning the NumPy expectation for case["R"]
+
+def _rref(A, tol=None):
+    """Reduced row echelon form — NumPy has no rref, so here is the reference."""
+    R = A.astype(float).copy()
+    rows, cols = R.shape
+    if tol is None:
+        tol = np.finfo(float).eps * max(rows, cols) * max(1.0, np.abs(R).sum(axis=1).max())
+    row = 0
+    for col in range(cols):
+        if row >= rows:
+            break
+        piv = row + int(np.argmax(np.abs(R[row:, col])))
+        if abs(R[piv, col]) <= tol:
+            R[row:, col] = 0.0
+            continue
+        if piv != row:
+            R[[row, piv]] = R[[piv, row]]
+        R[row] = R[row] / R[row, col]
+        for i in range(rows):
+            if i != row and R[i, col] != 0.0:
+                R[i] = R[i] - R[i, col] * R[row]
+        row += 1
+    return R
+
 DIRECT = {
     "add":            lambda c: c["A"] + c["B"],
     "subtract":       lambda c: c["A"] - c["B"],
@@ -145,7 +169,7 @@ DIRECT = {
     "reshape":        lambda c: c["A"].reshape(1, -1),
     "concat_h":       lambda c: np.hstack((c["A"], c["B"])),
     "concat_v":       lambda c: np.vstack((c["A"], c["B"])),
-    "tensor":         lambda c: np.kron(c["A"], c["B"]),
+    "kron":         lambda c: np.kron(c["A"], c["B"]),
 
     "norm_fro":       lambda c: np.array([[np.linalg.norm(c["A"], "fro")]]),
     "norm_one":       lambda c: np.array([[np.linalg.norm(c["A"], 1)]]),
@@ -171,6 +195,133 @@ DIRECT = {
     "rank":           lambda c: np.array([[float(np.linalg.matrix_rank(c["A"]))]]),
     "cholesky":       lambda c: np.linalg.cholesky(c["A"]),
     "solve":          lambda c: np.linalg.solve(c["A"], c["B"]),
+    # --- tier 6: the FFT ---
+    # NumPy puts the whole 1/n on ifft and none on fft, same as MATLAB, which is
+    # why these references are one-liners rather than rescalings.
+    "fft_re":         lambda c: np.fft.fft(c["A"].ravel()).real.reshape(1, -1),
+    "fft_im":         lambda c: np.fft.fft(c["A"].ravel()).imag.reshape(1, -1),
+    "fft_prime_re":   lambda c: np.fft.fft(c["A"].ravel()).real.reshape(1, -1),
+    "fft_prime_im":   lambda c: np.fft.fft(c["A"].ravel()).imag.reshape(1, -1),
+    "fft_pad_re":     lambda c: np.fft.fft(c["A"].ravel(), 100).real.reshape(1, -1),
+    "fft_trunc_re":   lambda c: np.fft.fft(c["A"].ravel(), 20).real.reshape(1, -1),
+    # NumPy's axis=0 walks down columns, which is MATLAB's default for fft.
+    "fft_cols_re":    lambda c: np.fft.fft(c["A"], axis=0).real,
+    "fft_cols_im":    lambda c: np.fft.fft(c["A"], axis=0).imag,
+    "fft_rows_re":    lambda c: np.fft.fft(c["A"], axis=1).real,
+    "ifft_re":        lambda c: np.fft.ifft(c["A"].ravel()).real.reshape(1, -1),
+    "ifft_im":        lambda c: np.fft.ifft(c["A"].ravel()).imag.reshape(1, -1),
+    "fftshift":       lambda c: np.fft.fftshift(c["A"].ravel()).reshape(1, -1),
+
+    # --- sequences, shape and constructors (tier 5) ---
+    # These take no meaningful input, so "A" is a placeholder the dumper needs.
+    "linspace":       lambda c: np.linspace(-2.0, 3.0, 11).reshape(1, -1),
+    "logspace":       lambda c: np.logspace(-1.0, 2.0, 7).reshape(1, -1),
+    "range":          lambda c: np.arange(0.0, 9.0 + 1e-12, 2.0).reshape(1, -1),
+    "hilb5":          lambda c: sla.hilbert(5),
+    "pascal4":        lambda c: sla.pascal(4).astype(float),
+    "fliplr":         lambda c: np.fliplr(c["A"]),
+    "flipud":         lambda c: np.flipud(c["A"]),
+    # NumPy's rot90 is counterclockwise, which is what MATLAB's is too.
+    "rot90_1":        lambda c: np.rot90(c["A"], 1),
+    "rot90_m1":       lambda c: np.rot90(c["A"], -1),
+    "repmat":         lambda c: np.tile(c["A"], (2, 3)),
+    "circ_row":       lambda c: np.roll(c["A"], 1, axis=0),
+    "circ_col":       lambda c: np.roll(c["A"], -2, axis=1),
+    "blkdiag":        lambda c: sla.block_diag(c["A"], c["B"]),
+    "toeplitz":       lambda c: sla.toeplitz(c["A"].ravel()),
+    # NumPy's vander is ascending by default; ours is descending, like polyval.
+    "vander":         lambda c: np.vander(c["A"].ravel(), increasing=False),
+
+    # --- funm and generalized eigenvalues (tier 4) ---
+    "funm_exp":       lambda c: sla.expm(c["A"]),
+    # SciPy's eigh solves exactly this symmetric-definite problem and returns the
+    # eigenvalues ascending, same as ours.
+    "geneig_sym":     lambda c: sla.eigh(c["A"], c["B"])[0].reshape(-1, 1),
+    "geneig_orth":    lambda c: np.eye(c["A"].shape[0]),
+
+    # --- decomposition and condition estimates (tier 4) ---
+    # A factorisation is only useful if it solves the same system, so the
+    # reference is NumPy's own solve, not a re-implementation of ours.
+    "decomp_solve":   lambda c: np.linalg.solve(c["A"], c["B"]),
+    "decomp_det":     lambda c: np.array([[np.linalg.det(c["A"])]]),
+    # The Hager-Higham estimate is a lower bound in general; on a 5x5 Hilbert
+    # matrix it lands exactly on the true 1-norm condition number.
+    "condest_hilbert": lambda c: np.array([[np.linalg.cond(c["A"], 1)]]),
+    # NumPy's lstsq returns the minimum-norm solution for an under-determined
+    # system, which is exactly what lsqminnorm promises.
+    "lsqminnorm":     lambda c: np.linalg.lstsq(c["A"], c["B"], rcond=None)[0],
+
+    # --- element-wise maths (tier 3) ---
+    "sign":           lambda c: np.sign(c["A"]),
+    "floor":          lambda c: np.floor(c["A"]),
+    "ceil":           lambda c: np.ceil(c["A"]),
+    # NumPy's round is banker's rounding; MATLAB's and C's send halves away from
+    # zero. The test data avoids exact halves so the two agree.
+    "round":          lambda c: np.round(c["A"]),
+    "fix":            lambda c: np.fix(c["A"]),
+    "mod3":           lambda c: np.mod(c["A"], 3.0),
+    "rem3":           lambda c: np.fmod(c["A"], 3.0),
+    "expm1":          lambda c: np.expm1(c["A"]),
+    "asinh":          lambda c: np.arcsinh(c["A"]),
+    "atanh":          lambda c: np.arctanh(c["A"]),
+    "angle_real":     lambda c: np.angle(c["A"]),
+    "atan2":          lambda c: np.arctan2(c["A"], c["B"]),
+    "hypot":          lambda c: np.hypot(c["A"], c["B"]),
+
+    # --- structure, subspaces and polynomials (tier 4) ---
+    "normest":        lambda c: np.array([[np.linalg.norm(c["A"], 2)]]),
+    "bandwidth_lo":   lambda c: np.array([[float(max(
+                          (i - j for i in range(c["A"].shape[0])
+                                 for j in range(c["A"].shape[1])
+                                 if i > j and abs(c["A"][i, j]) > 0), default=0))]]),
+    "rref":           lambda c: _rref(c["A"]),
+    "null_dim":       lambda c: np.array([[float(
+                          c["A"].shape[1] - np.linalg.matrix_rank(c["A"]))]]),
+    "orth_dim":       lambda c: np.array([[float(np.linalg.matrix_rank(c["A"]))]]),
+    # Bases are not unique; the projectors onto those subspaces are.
+    "orth_proj":      lambda c: (lambda o: o @ o.T)(sla.orth(c["A"])),
+    "null_proj":      lambda c: (lambda n: n @ n.T)(sla.null_space(c["A"])),
+    "cross":          lambda c: np.cross(c["A"].ravel(), c["B"].ravel()).reshape(-1, 1),
+    "dot":            lambda c: np.array([[float(np.vdot(c["A"], c["B"]))]]),
+    "polyval":        lambda c: np.polyval(c["A"].ravel(), c["B"].ravel()).reshape(
+                          c["B"].shape),
+    "roots_moduli":   lambda c: np.sort(np.abs(np.roots(c["A"].ravel()))).reshape(-1, 1),
+    "polyfit":        lambda c: np.polyfit(c["A"].ravel(), c["B"].ravel(), 3).reshape(-1, 1),
+
+    # --- scans, orderings and multiset reductions (tier 2) ---
+    # NumPy's axis=0 walks DOWN columns, which is this library's addcol=false.
+    "prod_all":       lambda c: np.array([[c["A"].prod()]]),
+    "prod_col":       lambda c: c["A"].prod(axis=0).reshape(1, -1),
+    "prod_row":       lambda c: c["A"].prod(axis=1).reshape(-1, 1),
+    "cumsum_col":     lambda c: np.cumsum(c["A"], axis=0),
+    "cumsum_row":     lambda c: np.cumsum(c["A"], axis=1),
+    "cumprod_col":    lambda c: np.cumprod(c["A"], axis=0),
+    "diff_col":       lambda c: np.diff(c["A"], axis=0),
+    "diff_row":       lambda c: np.diff(c["A"], axis=1),
+    "sort_col":       lambda c: np.sort(c["A"], axis=0),
+    "sort_row":       lambda c: np.sort(c["A"], axis=1),
+    "sort_desc":      lambda c: -np.sort(-c["A"], axis=0),
+    "median_all":     lambda c: np.array([[np.median(c["A"])]]),
+    "median_col":     lambda c: np.median(c["A"], axis=0).reshape(1, -1),
+    "median_row":     lambda c: np.median(c["A"], axis=1).reshape(-1, 1),
+    "sortrows_k0":    lambda c: c["A"][np.argsort(c["A"][:, 0], kind="stable")],
+    "unique":         lambda c: np.unique(c["A"]).reshape(-1, 1),
+    # NumPy has no mode; ties go to the smallest, which is what this library does.
+    "mode":           lambda c: np.array([[float(
+                          min(np.unique(c["A"]),
+                              key=lambda v: (-np.count_nonzero(c["A"] == v), v)))]]),
+
+    # --- logical masks, dumped as 0/1 so they compare directly ---
+    "mask_gt":        lambda c: (c["A"] > 0.0).astype(float),
+    "mask_le":        lambda c: (c["A"] <= 0.0).astype(float),
+    "mask_band":      lambda c: ((c["A"] > -0.5) & (c["A"] < 0.5)).astype(float),
+    "mask_bor":       lambda c: ((c["A"] > 0.5) | (c["A"] < -0.5)).astype(float),
+    "mask_bxor":      lambda c: ((c["A"] > 0.0) ^ (c["A"] > 0.5)).astype(float),
+    "mask_not":       lambda c: (~(c["A"] > 0.0)).astype(float),
+    # NumPy selects in row-major (C) order too, so this lines up directly.
+    "mask_select":    lambda c: c["A"][c["A"] > 0.0].reshape(-1, 1),
+    "mask_assign":    lambda c: np.where(c["A"] < 0.0, 0.0, c["A"]),
+    "mask_nnz":       lambda c: np.array([[float(np.count_nonzero(c["A"] > 0.0))]]),
     # MATLAB's mrdivide: X = A / B solves X*B = A, i.e. A @ inv(B).
     "mrdivide":       lambda c: (c["A"] + c["A"]) @ np.linalg.inv(c["B"]),
     "lstsq":          lambda c: np.linalg.lstsq(c["A"], c["B"], rcond=None)[0],

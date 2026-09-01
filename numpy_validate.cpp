@@ -135,6 +135,9 @@ static Matrix<double> spd(long n = 5) {
     return A;
 }
 
+// Wraps a scalar result as a 1x1 matrix so it travels through the same channel.
+static Matrix<double> oneByOne(double v) { Matrix<double> m(1, 1); m(0, 0) = v; return m; }
+
 // ══════════════════════════════════════════════════ shared: real + complex ──
 template<typename T>
 static void dumpShared(const std::string& dt) {
@@ -144,7 +147,7 @@ static void dumpShared(const std::string& dt) {
     Case("subtract",   dt).mat("A", A).mat("B", B).mat("R", A - B);
     Case("multiply",   dt).mat("A", A).mat("B", B).mat("R", A * B);
     Case("hadamard",   dt).mat("A", A).mat("B", B).mat("R", A % B);
-    Case("elem_div",   dt).mat("A", A).mat("B", B).mat("R", A.ediv(B));
+    Case("elem_div",   dt).mat("A", A).mat("B", B).mat("R", A.div(B));
     Case("negate",     dt).mat("A", A).mat("R", -A);
     Case("scalar_mul", dt, 2.75).mat("A", A).mat("R", A * 2.75);
     Case("scalar_div", dt, 2.75).mat("A", A).mat("R", A / 2.75);
@@ -181,7 +184,7 @@ static void dumpShared(const std::string& dt) {
     Case("reshape",    dt).mat("A", A).mat("R", A.reshape(1, A.rows() * A.cols()));
     Case("concat_h",   dt).mat("A", A).mat("B", B).mat("R", A.concat(B, 1));
     Case("concat_v",   dt).mat("A", A).mat("B", B).mat("R", A.concat(B, 0));
-    Case("tensor",     dt).mat("A", A).mat("B", B).mat("R", A.tensor(B));
+    Case("kron",     dt).mat("A", A).mat("B", B).mat("R", A.kron(B));
 
     Case("norm_fro",   dt).mat("A", A).scalar("R", A.norm(NormType::Fro));
     Case("norm_one",   dt).mat("A", A).scalar("R", A.norm(NormType::One));
@@ -225,6 +228,197 @@ static void dumpRealOnly() {
       // Matrix RIGHT division, MATLAB's mrdivide: X / W is the X solving X*W = A.
       // NumPy has no operator for it; the reference is A @ inv(W).
       Case("mrdivide", dt).mat("A", W).mat("B", W).mat("R", (W + W) / W); }
+    // ── Tier 6: the FFT ────────────────────────────────────────────────────
+    // Complex results are dumped as separate real and imaginary matrices — the
+    // .dat format tags element kind per matrix, so this needs no format change.
+    { Matrix<double> sig(1, 64);
+      sig.set_Ran_values(-1.0, 1.0, -606);
+      Case("fft_re",   dt).mat("A", sig).mat("R", fft(sig).real());
+      Case("fft_im",   dt).mat("A", sig).mat("R", fft(sig).imag());
+      // A prime length, so this one goes through Bluestein rather than radix-2.
+      Matrix<double> pr(1, 61);
+      pr.set_Ran_values(-1.0, 1.0, -707);
+      Case("fft_prime_re", dt).mat("A", pr).mat("R", fft(pr).real());
+      Case("fft_prime_im", dt).mat("A", pr).mat("R", fft(pr).imag());
+      // Zero-padded, and truncated.
+      Case("fft_pad_re",  dt).mat("A", sig).mat("R", fft(sig, 100).real());
+      Case("fft_trunc_re", dt).mat("A", sig).mat("R", fft(sig, 20).real());
+      // A matrix, transformed column by column.
+      Matrix<double> M(8, 5);
+      M.set_Ran_values(-1.0, 1.0, -808);
+      Case("fft_cols_re", dt).mat("A", M).mat("R", fft(M).real());
+      Case("fft_cols_im", dt).mat("A", M).mat("R", fft(M).imag());
+      Case("fft_rows_re", dt).mat("A", M).mat("R", fft(M, -1, true).real());
+      // The inverse, where the 1/n convention lives.
+      Case("ifft_re", dt).mat("A", sig).mat("R", ifft(sig).real());
+      Case("ifft_im", dt).mat("A", sig).mat("R", ifft(sig).imag());
+      Case("fftshift", dt).mat("A", sig).mat("R", fftshift(sig));
+    }
+
+    // ── Sequences, shape and constructors (tier 5) ─────────────────────────
+    { Case("linspace", dt).mat("A", Matrix<double>(1, 1)).mat("R", linspace(-2.0, 3.0, 11));
+      Case("logspace", dt).mat("A", Matrix<double>(1, 1)).mat("R", logspace(-1.0, 2.0, 7));
+      Case("range",    dt).mat("A", Matrix<double>(1, 1)).mat("R", range(0.0, 9.0, 2.0));
+      Case("hilb5",    dt).mat("A", Matrix<double>(1, 1)).mat("R", hilb(5));
+      Case("pascal4",  dt).mat("A", Matrix<double>(1, 1)).mat("R", pascal(4));
+      Matrix<double> Sh(3, 4); Sh.set_Ran_values(-2.0, 2.0, -717);
+      Case("fliplr",    dt).mat("A", Sh).mat("R", Sh.fliplr());
+      Case("flipud",    dt).mat("A", Sh).mat("R", Sh.flipud());
+      Case("rot90_1",   dt).mat("A", Sh).mat("R", Sh.rot90(1));
+      Case("rot90_m1",  dt).mat("A", Sh).mat("R", Sh.rot90(-1));
+      Case("repmat",    dt).mat("A", Sh).mat("R", Sh.repmat(2, 3));
+      Case("circ_row",  dt).mat("A", Sh).mat("R", Sh.circshift(1, 0));
+      Case("circ_col",  dt).mat("A", Sh).mat("R", Sh.circshift(-2, 1));
+      Matrix<double> Bk(2, 2); Bk.set_Ran_values(-1.0, 1.0, -818);
+      Case("blkdiag",   dt).mat("A", Sh).mat("B", Bk).mat("R", Sh.blkdiag(Bk));
+      Matrix<double> tv(1, 4); tv = {{1, 2, 3, 4}};
+      Case("toeplitz",  dt).mat("A", tv).mat("R", toeplitz(tv));
+      Case("vander",    dt).mat("A", tv).mat("R", vander(tv));
+    }
+
+    // ── funm and generalized eigenvalues (tier 4) ──────────────────────────
+    { Matrix<double> Af(4, 4);
+      Af.set_Ran_values(-1.0, 1.0, -919);
+      // funm against a function SciPy also has, so the reference is genuine.
+      Case("funm_exp", dt).mat("A", Af)
+          .mat("R", funm(Af, [](std::complex<double> z) { return std::exp(z); }).real());
+      // Symmetric-definite generalized eigenvalues.
+      Matrix<double> Rg(5, 5);
+      Rg.set_Ran_values(-1.0, 1.0, -929);
+      Matrix<double> Ag = Rg + Rg.T();
+      Matrix<double> Bg = Rg.T() * Rg;
+      for (int i = 0; i < 5; i++) Bg(i, i) += 5.0;
+      Case("geneig_sym", dt).mat("A", Ag).mat("B", Bg).mat("R", eig(Ag, Bg).first);
+      // Eigenvectors are not unique, so compare what is: X^T B X must be I.
+      Case("geneig_orth", dt).mat("A", Ag).mat("B", Bg)
+          .mat("R", eig(Ag, Bg).second.T() * Bg * eig(Ag, Bg).second);
+    }
+
+    // ── Decomposition and condition estimates (tier 4) ─────────────────────
+    { Matrix<double> Hil(5, 5);
+      for (int i = 0; i < 5; i++) for (int j = 0; j < 5; j++) Hil(i, j) = 1.0 / (i + j + 1);
+      Case("condest_hilbert", dt).mat("A", Hil).mat("R", oneByOne(condest(Hil)));
+      Matrix<double> Gd(5, 5); Gd.set_Ran_values(-1.0, 1.0, -515);
+      Matrix<double> bd(5, 2); bd.set_Ran_values(-1.0, 1.0, -616);
+      Case("decomp_solve", dt).mat("A", Gd).mat("B", bd)
+                              .mat("R", Gd.factorize().solve(bd));
+      Case("decomp_det",   dt).mat("A", Gd).mat("R", oneByOne(Gd.factorize().det()));
+      Matrix<double> Wide(2, 4);
+      Wide = {{1, 0, 1, 0}, {0, 1, 0, 1}};
+      Matrix<double> wr(2, 1); wr = {{2}, {4}};
+      Case("lsqminnorm", dt).mat("A", Wide).mat("B", wr).mat("R", lsqminnorm(Wide, wr));
+    }
+
+    // ── Element-wise maths (tier 3) ────────────────────────────────────────
+    { Matrix<double> E(3, 4);
+      E.set_Ran_values(-3.0, 3.0, -909);
+      Case("sign",  dt).mat("A", E).mat("R", E.sign());
+      Case("floor", dt).mat("A", E).mat("R", E.floor());
+      Case("ceil",  dt).mat("A", E).mat("R", E.ceil());
+      Case("round", dt).mat("A", E).mat("R", E.round());
+      Case("fix",   dt).mat("A", E).mat("R", E.fix());
+      Case("mod3",  dt).mat("A", E).mat("R", E.mod(3.0));
+      Case("rem3",  dt).mat("A", E).mat("R", E.rem(3.0));
+      Case("expm1", dt).mat("A", E).mat("R", E.expm1());
+      Case("asinh", dt).mat("A", E).mat("R", E.asinh());
+      Case("atanh", dt).mat("A", E.mod(1.0)).mat("R", E.mod(1.0).atanh());
+      Case("angle_real", dt).mat("A", E).mat("R", E.angle());
+      Matrix<double> Y(3, 4), X(3, 4);
+      Y.set_Ran_values(-2.0, 2.0, -111);
+      X.set_Ran_values(-2.0, 2.0, -222);
+      Case("atan2", dt).mat("A", Y).mat("B", X).mat("R", Y.atan2(X));
+      Case("hypot", dt).mat("A", Y).mat("B", X).mat("R", Y.hypot(X));
+    }
+
+    // ── Structure, subspaces and polynomials (tier 4) ──────────────────────
+    { Matrix<double> P(4, 4);
+      P.set_Ran_values(-1.0, 1.0, -313);
+      Case("normest", dt).mat("A", P).mat("R", oneByOne(P.normest(1e-12)));
+      Case("bandwidth_lo", dt).mat("A", P).mat("R", oneByOne(double(P.bandwidth().first)));
+      // A rank-deficient matrix, so null() and orth() have something to find.
+      Matrix<double> Rk(3, 3);
+      Rk = {{1, 2, 3}, {2, 4, 6}, {1, 1, 1}};
+      Case("rref", dt).mat("A", Rk).mat("R", Rk.rref());
+      Case("null_dim", dt).mat("A", Rk).mat("R", oneByOne(double(Rk.null().cols())));
+      Case("orth_dim", dt).mat("A", Rk).mat("R", oneByOne(double(Rk.orth().cols())));
+      // null() and orth() bases are not unique, so compare the PROJECTORS they
+      // define, which are.
+      Case("orth_proj", dt).mat("A", Rk).mat("R", Rk.orth() * Rk.orth().T());
+      Case("null_proj", dt).mat("A", Rk).mat("R", Rk.null() * Rk.null().T());
+      Matrix<double> a3(3, 1), b3(3, 1);
+      a3 = {{1}, {2}, {3}};  b3 = {{4}, {5}, {6}};
+      Case("cross", dt).mat("A", a3).mat("B", b3).mat("R", a3.cross(b3));
+      Case("dot",   dt).mat("A", a3).mat("B", b3).mat("R", oneByOne(a3.dot(b3)));
+      Matrix<double> poly(1, 4);
+      poly = {{2, -3, 0, 5}};
+      Matrix<double> pts(1, 5);
+      pts = {{-2, -1, 0, 1, 2}};
+      Case("polyval", dt).mat("A", poly).mat("B", pts).mat("R", polyval(poly, pts));
+      // Roots are returned in no guaranteed order, so compare the polynomial
+      // rebuilt from them via its elementary symmetric functions — the sorted
+      // real parts and moduli are enough to pin them down here.
+      { Matrix<std::complex<double>> rt = roots(poly);
+        Matrix<double> mods(rt.rows(), 1);
+        for (long i = 0; i < rt.rows(); i++) mods(int(i), 0) = std::abs(rt[int(i)]);
+        Case("roots_moduli", dt).mat("A", poly).mat("R", mods.sort(false)); }
+      Matrix<double> fy = polyval(poly, pts);
+      Case("polyfit", dt).mat("A", pts).mat("B", fy).mat("R", polyfit(pts, fy, 3));
+    }
+
+    // ── Scans, orderings and multiset reductions (tier 2) ──────────────────
+    // Real only: everything here except prod/cumsum/cumprod needs an ordering.
+    { Matrix<double> S(4, 5);
+      S.set_Ran_values(-2.0, 2.0, -808);
+      Case("prod_all",  dt).mat("A", S).mat("R", oneByOne(S.prod()));
+      Case("prod_col",  dt).mat("A", S).mat("R", S.prod(false));
+      Case("prod_row",  dt).mat("A", S).mat("R", S.prod(true));
+      Case("cumsum_col",  dt).mat("A", S).mat("R", S.cumsum(false));
+      Case("cumsum_row",  dt).mat("A", S).mat("R", S.cumsum(true));
+      Case("cumprod_col", dt).mat("A", S).mat("R", S.cumprod(false));
+      Case("diff_col",  dt).mat("A", S).mat("R", S.diff(false));
+      Case("diff_row",  dt).mat("A", S).mat("R", S.diff(true));
+      Case("sort_col",  dt).mat("A", S).mat("R", S.sort(false));
+      Case("sort_row",  dt).mat("A", S).mat("R", S.sort(true));
+      Case("sort_desc", dt).mat("A", S).mat("R", S.sort(false, true));
+      Case("median_all", dt).mat("A", S).mat("R", oneByOne(S.median()));
+      Case("median_col", dt).mat("A", S).mat("R", S.median(false));
+      Case("median_row", dt).mat("A", S).mat("R", S.median(true));
+      // sortrows and unique want repeats to be interesting, so use integers.
+      Matrix<double> D(5, 3);
+      D = {{3, 30, 1}, {1, 10, 2}, {2, 20, 3}, {1, 11, 4}, {3, 31, 5}};
+      Case("sortrows_k0", dt).mat("A", D).mat("R", D.sortrows(0));
+      Matrix<double> U(3, 4);
+      U = {{3, 1, 3, 2}, {1, 2, 2, 3}, {5, 3, 1, 1}};
+      Case("unique",    dt).mat("A", U).mat("R", U.unique());
+      Case("mode",      dt).mat("A", U).mat("R", oneByOne(U.mode()));
+    }
+
+    // ── Logical masks ──────────────────────────────────────────────────────
+    // Dumped as 0/1 matrices so NumPy can compare them directly against its own
+    // boolean arrays. Real only: ordering needs <, which complex has not got.
+    { Matrix<double> Md(4, 4);
+      Md.set_Ran_values(-1.0, 1.0, -404);
+      auto asNum = [](const Matrix<bool>& m) {
+          Matrix<double> out(m.rows(), m.cols());
+          for (long i = 0; i < m.rows() * m.cols(); i++) out[int(i)] = m[int(i)] ? 1.0 : 0.0;
+          return out;
+      };
+      Case("mask_gt",   dt).mat("A", Md).mat("R", asNum(Md > 0.0));
+      Case("mask_le",   dt).mat("A", Md).mat("R", asNum(Md <= 0.0));
+      Case("mask_band", dt).mat("A", Md).mat("R", asNum((Md > -0.5).land(Md < 0.5)));
+      Case("mask_bor",  dt).mat("A", Md).mat("R", asNum((Md > 0.5).lor(Md < -0.5)));
+      Case("mask_bxor", dt).mat("A", Md).mat("R", asNum((Md > 0.0).lxor(Md > 0.5)));
+      Case("mask_not",  dt).mat("A", Md).mat("R", asNum(!(Md > 0.0)));
+      // Logical indexing: the selected elements, as a column vector.
+      Case("mask_select", dt).mat("A", Md).mat("R", Matrix<double>(Md(Md > 0.0)));
+      // Write-through: zero everything negative.
+      { Matrix<double> W = Md; W(W < 0.0) = 0.0;
+        Case("mask_assign", dt).mat("A", Md).mat("R", W); }
+      // Counts, as 1x1 matrices so they travel through the same channel.
+      { Matrix<double> c(1, 1); c(0, 0) = double((Md > 0.0).nnz());
+        Case("mask_nnz", dt).mat("A", Md).mat("R", c); }
+    }
+
 
     // Least squares on an over-determined system.
     { Matrix<double> M(6, 3), y(6, 1);
