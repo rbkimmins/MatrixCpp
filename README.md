@@ -18,6 +18,64 @@ auto x = A.solve(b);        // prefer this over A.inverse() * b
 std::cout << x << '\n';
 ```
 
+## Layout
+
+```
+basic/                     the Basic Matrix Package — one include for all of it
+  MatrixCpp.hpp            <-- include this
+  mstore.hpp               raw storage, huge pages, the GEMM kernel
+  constants.hpp            mconst::pi and the _i / _deg literals
+  traits.hpp               is_complex / work_t, ROW and COL, the enums
+  io.hpp                   output formats and file writing
+  matrix.hpp               the Matrix class and its factorisations
+  matrixfunctions.hpp      exp(A), log(A), sqrt(A) — matrix, not element-wise
+  decomposition.hpp        factorize(): factor once, solve many times
+  builders.hpp             linspace, magic, vander, polynomials
+  eigen.hpp                funm, eig(A,B), QZ
+  signal.hpp               fft, conv, filter, interp1, gradient
+  identity.hpp             the global `I`
+  tensor.hpp               the Tensor class
+  random.hpp               the ran2 generator both classes use
+docs/
+  DESIGN_NOTES.md          why the code is the way it is
+```
+
+```cpp
+#include "basic/MatrixCpp.hpp"
+
+Matrix<double> A(3, 3);
+Tensor<double> T({2, 3, 4});
+```
+
+Each header stands on its own and chains its own dependencies, so including
+just `basic/matrix.hpp` pulls exactly what it needs. `Matrix1.0.hpp` and
+`Tensor.hpp` remain at the top level as one-line shims, so existing code
+compiles unchanged.
+
+The ~1250-line comment block that used to live inside the header — every design
+decision, measurement and negative result — is now `docs/DESIGN_NOTES.md`. That
+was most of what made the header unreadable.
+
+**Build with `-O3 -march=native`.**
+
+## Choosing an axis
+
+Reductions, scans and orderings that work along one axis take `ROW` or `COL`,
+naming the axis you get one result *per*:
+
+```cpp
+A.sum(ROW)      // one sum per row     -> m x 1
+A.sum(COL)      // one sum per column  -> 1 x n
+A.cumsum(COL)   // accumulate down each column
+A.sort(ROW)     // sort each row
+```
+
+They're plain `constexpr bool`, so the older `sum(true)` / `sum(false)` spelling
+still compiles — but `sort(ROW)` says what `sort(true)` never did.
+
+A `Tensor` has as many axes as dimensions, so it takes the axis *index*
+instead — `t.sum(0)`, `t.cumsum(2)`.
+
 ## Building
 
 The library is a single header — just `#include "Matrix1.0.hpp"`. It requires
@@ -84,6 +142,33 @@ For the operator spellings, `A /dot/ B` parses as `(A / dot) / B` — `*` and `/
 share a precedence level and associate left to right — so it composes correctly
 with surrounding `+` and `-`.
 
+## Signal, calculus and interpolation
+
+```cpp
+conv(a, b)      deconv(y, a)     poly(r)      poly(A)     // polynomials
+y.trapz()       trapz(x, y)      y.cumtrapz(true)         // integrate
+y.gradient(true)                 y.gradient(true, h)      // differentiate
+interp1(x, y, xq)                filter(b, a, x)
+```
+
+**Axis operations are members, signal operations are free.** `trapz`, `cumtrapz`
+and `gradient` take the same `addcol` flag as `sum` and `cumsum`, because that's
+what they are; `conv`, `filter` and `interp1` treat a whole vector as one signal.
+
+`conv` switches to the FFT above 16384 multiply-adds — a *measured* threshold; my
+first guess was 10× too high and skipped the FFT across a range where it's twice
+as fast. This is also the one place where zero-padding an FFT is correct, since
+the longer signal *is* the answer wanted.
+
+`gradient` keeps the length where `diff` shortens it (centred inside, one-sided
+at the ends) — that's why both exist.
+
+`interp1` returns its fill value outside the range, defaulting to NaN as MATLAB
+does (NumPy clamps instead). ⚠ **That NaN default doesn't survive `-ffast-math`**
+— the flag implies `-ffinite-math-only`, so `isnan()` folds to `false` and the
+sentinel becomes undetectable. Pass an explicit fill (`interp1(x, y, xq, 0.0)`)
+when that matters; it's MATLAB's own escape hatch and works in every build.
+
 ## FFT
 
 ```cpp
@@ -134,6 +219,60 @@ Seeds stay negative, matching `set_Ran_values`. `randn` is Box–Muller, `randpe
 is Fisher–Yates. ⚠ `ran2` keeps static state, so these are deliberately **serial**
 — the one place the OpenMP treatment the rest of the header gets would be wrong.
 
+## Complex support
+
+Routines that used to refuse complex now follow the input type through
+`work_t<T>` — `double` for real, `complex<double>` for complex:
+
+```cpp
+Matrix<std::complex<double>> A(4, 4);
+auto [U, S, V] = A.svd();      // U, V UNITARY; S stays real
+A.cholesky();                  // A = L*L^H, input must be Hermitian
+A.solve(b);  A.inverse();  A.det();  A.QR();  A.LU();  A.pinv();
+exp(A);  sin(A);  cos(A);  tan(A);  sinh(A);  cosh(A);  tanh(A);
+A.norm(NormType::Two);  A.cond();  A.rank();
+```
+
+Three details worth knowing:
+
+- **`cholesky` needs Hermitian, not symmetric.** `A == A^H` is what forces the
+  diagonal real and the pivots positive; a complex *symmetric* matrix is refused.
+  That distinction doesn't exist in the real case and is the whole game here.
+- **`var` stays real** — it's `E|x−μ|²`, a sum of squared magnitudes. `mean`
+  follows the input and is complex. NumPy does the same.
+- **`S` from the SVD stays real** — singular values are magnitudes.
+
+**Still real-only, and it's one missing algorithm:** `eig`, `eigvals`, `hess`,
+`schur`, `funm`, `log(A)`, `sqrt(A)` and `pow(A, real)` all route through the
+**real** Schur form, which a complex matrix doesn't have. That needs a complex
+Hessenberg reduction plus a complex QR iteration — a project of its own.
+
+## Scalars, singular matrices, and what still refuses
+
+A **1×1 matrix is a scalar** — it converts implicitly, in both `Matrix` and
+`Tensor`:
+
+```cpp
+double energy = v.T() * A * v;      // a quadratic form is 1x1
+double e      = contract(x, x, 1);  // so is a full contraction
+```
+
+Any other shape throws — the size is a runtime property, so it can't be a
+compile-time check; NumPy makes the same trade with `float(arr)`. **Masks are
+deliberately excluded**: an implicit `operator bool` on a `Matrix<bool>` would
+turn `if (mask)` from a compile error into a runtime throw, so a `static_assert`
+keeps it an error and tells you to use `.any()` / `.all()` / `.nnz()`.
+
+`A + 3` adds 3 to every element, as in MATLAB (`3 - A` negates first). This had
+to land with the conversion: without it, `A + 1.0` on a 5×5 would have fallen
+through to the scalar conversion and thrown at runtime.
+
+**`det()` of a singular matrix returns 0**, and `LU()` still factors it — `U`
+just carries a zero on its diagonal and `P*A == L*U` holds. Both match MATLAB and
+NumPy. What still refuses is `solve()`, `inverse()` and `factorize()`, because a
+singular system has no unique solution to return — a different question from
+whether the determinant or the factorisation exist.
+
 ## General matrix functions and generalized eigenvalues
 
 ```cpp
@@ -159,6 +298,41 @@ and what LAPACK's `dsygv` gives.
 refuses a near-singular `B` outright rather than returning plausible numbers, and
 names QZ as what would be needed. QZ itself isn't implemented; that's the one
 remaining gap in this tier.
+
+## Least squares, with Q left implicit
+
+LAPACK doesn't have *a* QR routine — it has three, and the split is the point:
+`dgeqrf` factors and leaves Q implicit, `dormqr` applies Q without forming it,
+`dorgqr` forms it only if you want the matrix. This header had only the third,
+so everything went through a full m×m Q.
+
+| least squares | before | after | NumPy `lstsq` |
+|---|---|---|---|
+| 2000×100 | 80.3 ms | **3.08 ms** | 10.58 ms |
+| 4000×200 | 725.9 ms | **12.29 ms** | 87.55 ms |
+| 8000×100 | 2399.2 ms | **11.35 ms** | 40.78 ms |
+
+```cpp
+auto [Q, R, P] = A.QR();                    // Complete: Q is m x m  (MATLAB's qr(A))
+auto [Q, R, P] = A.QR(QRMode::Reduced);     // economy:  Q is m x k  (MATLAB's qr(A,0))
+```
+
+| `QR()` on a tall matrix | Complete | Reduced |
+|---|---|---|
+| 2000×100 | 82.1 ms, Q = 32 MB | **4.28 ms**, Q = 1.6 MB |
+| 4000×200 | 677.1 ms, Q = 128 MB | **19.6 ms**, Q = 6.4 MB |
+| 8000×100 | 2396.6 ms, Q = 512 MB | **15.8 ms**, Q = 6.4 MB |
+
+The reduced Q is *exactly* the first k columns of the complete one — bit for bit.
+Complete stays the default, because that's what MATLAB's `qr(A)` gives. (NumPy
+defaults to reduced; its own `mode='complete'` costs 387.8 ms where `mode='r'` is
+8.4 ms on the same 2000×100.)
+
+An 8000×100 solve was building a **512 MB** `Q` to produce a 100-element answer.
+Forming Q is O(m²·r); applying the reflectors to one right-hand side is O(m·r) —
+6.4×10⁹ operations against 8×10⁵. `rank()` got the same treatment, since it only
+ever read R's diagonal. `QR()` itself still returns an explicit Q, because that's
+what a caller asking for the matrix wants.
 
 ## Factor once, solve many times
 
@@ -542,3 +716,231 @@ nothing left to win. `Matrix1.0.hpp` documents each one and what it would take.
 * Timing is best-of-k with an adaptive repeat count, matched on both sides. The
   minimum is used rather than the mean: the true cost is a floor, and noise only
   ever pushes a sample above it.
+
+## Complex support
+
+Everything in the header works on `std::complex` except the operations that
+genuinely have no complex meaning — `min`/`max`/`sort`/`median`/`mode`, the
+ordering comparisons, and `floor`/`ceil`/`round`/`mod`/`atan2`, which need an
+ordering `std::complex` does not have.
+
+The last group to land was the Schur family. `eig`, `eigvals`, `hess`, `schur`,
+`funm`, `sqrt(A)`, `log(A)`, `pow(A, p)` and `eig(A, B)` all used to go through
+the **real** Schur form, which a complex matrix does not have: it parks a
+conjugate pair in a 2×2 block, and that only works because a real matrix's
+complex eigenvalues come in pairs. Complex matrices get the genuine complex
+Schur decomposition, where `T` is fully triangular — so the complex paths are
+*simpler* than the real ones, with no blocks to special-case.
+
+```cpp
+Matrix<std::complex<double>> A(n, n);
+auto [T, Q] = A.schur();          // T upper triangular, Q unitary
+auto [val, vec] = A.eig();        // A*v == lambda*v, no real-eigenvalue restriction
+auto R = sqrt(A);                 // R*R == A
+auto E = funm(A, [](std::complex<double> z){ return std::exp(z); });
+```
+
+Cross-checked against `scipy.linalg`'s `schur`, `hessenberg`, `sqrtm`, `logm`
+and `expm`, and `funm(exp)` against an independent Taylor series as well.
+
+`factorize()` is complex too — all three paths (LU, Cholesky, QR least squares),
+plus `det()` and the `rcond` estimator. Cholesky dispatches on **Hermitian**,
+not symmetric: a complex symmetric matrix is not Cholesky-able.
+
+### Two real-matrix bugs this uncovered
+
+Both were the same mistake — trusting a real Schur form to say something it
+cannot — and both were silent:
+
+- `eig()` returned the **Schur vectors** as eigenvectors. Only the first column
+  of `Q` is ever an eigenvector. Eigenvalues right, vectors wrong, no error. It
+  was invisible for symmetric input, where the Schur form is diagonal and the
+  two coincide — which is why the existing tests all passed.
+- `sqrt(A)`, `log(A)` and `pow(A, real)` read a 2×2 block as its real part
+  twice. That part is usually positive, so the positive-eigenvalue check passed
+  and the answer came back wrong: `||R*R - A|| = 6.7e-01` on a 4×4 with
+  eigenvalues 6.084 ± 0.403i. They now route through `funm`.
+
+Both are pinned in `validate.cpp` with the matrices that exposed them.
+
+## QZ — the generalized Schur decomposition
+
+```cpp
+auto r = qz(A, B);              // Q^H A Z = S,  Q^H B Z = T,  both triangular
+r.alpha(); r.beta();            // eigenvalue i is alpha[i]/beta[i]
+r.infinite();                   // where beta == 0: B is singular there
+```
+
+`A == Q S Z^H` and `B == Q T Z^H`, with `Q` and `Z` unitary. **Nothing ever
+forms `B⁻¹A`** — which is the entire point. `eigvals(A, B)` used to refuse
+outright below `rcond(B) = 1e-10`, because forming that product spends the
+available precision before the eigensolver starts. It now routes through QZ and
+agrees with `scipy.linalg.eig(A,B)` to 2.3e-13 at exactly that conditioning.
+
+Eigenvalues come back as the **pair** `(alpha, beta)`, the way LAPACK reports
+them, because `beta == 0` is a legitimate *infinite* eigenvalue of a singular
+pencil and a ratio cannot express it.
+
+A real pencil works too. The Hessenberg–triangular reduction stays in real
+arithmetic (that's the O(n³) stage), and only the single-shift sweep is complex
+— which it has to be, since a real pencil can have complex eigenvalues.
+
+### Eigenvectors, and the degenerate cases
+
+```cpp
+auto X = r.eigenvectors();      // one column per eigenvalue
+r.undefined();                  // where alpha AND beta are 0: no eigenvalue exists
+```
+
+Eigenvectors come from back-substitution on the triangular pair in the
+**homogeneous** form `(βA − αB)x = 0`. Dividing to get λ first would give NaN
+for exactly the eigenvalues QZ exists to handle; the homogeneous form stays
+finite, and an infinite eigenvalue comes back with a genuine vector satisfying
+`Bx = 0` (measured at 6.6e-16).
+
+A **singular pencil** — A and B sharing a null space, so `det(A − λB)` vanishes
+identically and *no* eigenvalue is determined — is reported by `undefined()`
+rather than passed off as an answer. Those pairs are 0/0, and the values that
+come back are rounding noise that looks like ordinary numbers. On a 20×20 with a
+shared 12-dimensional null space: 12 undefined pairs here and 12 from SciPy,
+with the remaining 8 agreeing to 1.1e-15.
+
+Interior zeros on `T`'s diagonal need no special handling — the ordinary sweep
+drives them to an end. An earlier version chased them explicitly and was wrong: a
+rotation zeroing `T(k+1,k+1)` leaves `T(k,k)` zero too, so the zero *spreads*
+along the diagonal instead of moving, reporting n−1 infinite eigenvalues for a
+pencil with one. Deleting that code fixed it.
+
+Ill-scaled pencils are normalized first. With `‖A‖ ~ 1e9` against `‖B‖ ~ 1e-9`
+the shift walks through eighteen orders of magnitude and the tolerances stop
+meaning anything — 70 of 400 stress pencils failed to converge before this. The
+scaling is undone on the factors, so `A == Q S Z^H` still holds to the bit.
+After the fix: **400/400, worst relative residual 2.9e-15**.
+
+## The matrix-multiply kernel
+
+`mstore::gemm` tiled its output over **M only**, so any product with `M < 64` had
+one tile and ran single-threaded — 6.5 GFLOP/s on 32 cores against 8.0 on one.
+That's the shape every panel algorithm produces, and it was the real reason
+blocked QR lost.
+
+It now tiles over both dimensions, sizes the dynamic chunk from the work in a
+tile, and shrinks the M block when N is narrower than one. Measured interleaved
+against the old kernel, min of 7:
+
+| shape | before | after | |
+|---|---|---|---|
+| square 1024 | 46.3 | 60.8 GFLOP/s | 1.31× |
+| square 2048 | 68.7 | 67.4 | 0.98× |
+| `C -= V W` (K=48) | 20.1 | 25.2 | 1.26× |
+| `V^H C` (M=48) | 4.2 | 31.6 | **7.56×** |
+| `V^H C` (M=48) large | 5.0 | 50.6 | **10.10×** |
+| `W = Cᵀ V` (N=48) | 39.8 | 74.9 | 1.88× |
+| very skinny (M=16) | 4.9 | 48.2 | **9.90×** |
+
+Bit-identical output on a 137×137 — deliberately not a multiple of 64. This
+lifts every level-3 path, not just QR: Tensor contractions, the Taylor matrix
+functions, plain multiplication.
+
+**Build with `-O3 -march=native`.** On a Zen 4 box, n=1024 square double:
+
+| flags | 1 thread | 32 threads |
+|---|---|---|
+| `-O2` | 5.2 | 71 GFLOP/s |
+| `-O3 -march=native` | 13.5 | **194** |
+
+That's 2.7× for free. Any GFLOP/s figure quoted without its flags is meaningless.
+A packed register-blocked AVX-512 microkernel prototype reaches 75 (1 thread) and
+438 (32 threads) — 5.6× and 2.2× respectively — which is the ceiling for a
+rewrite, and not enough to make blocked QR win.
+
+## The real Schur decomposition
+
+Two bugs, one hiding the other.
+
+**The shift could not converge on a complex pair.** With a complex trailing 2×2
+it fell back to `sigma = d`, a *real* shift — and no real shift converges to a
+conjugate pair. So `schurDecomp` threw on ordinary matrices, in no pattern a size
+threshold would catch: a random 16×16 failed while a 64×64 succeeded. `eig`,
+`schur`, `funm`, `sqrt(A)`, `log(A)` and `pow(A, real)` all went down with it.
+Replaced with the **Francis double shift**.
+
+**Then `split2x2` turned out to be wrong too** — visible only once the Francis
+step began reaching 2×2 blocks the old iteration never did. Its discriminant was
+`((a+d)/2)² − (ad − bc)`, which cancels catastrophically when a ≈ d: for
+`a = d = 1e3, b = c = 1e-3` the true `1e-6` is the difference of two numbers near
+`1e6`. The rotation built from it didn't zero the subdiagonal, and the routine
+then **forced it to zero anyway**, silently breaking the similarity. Replaced
+with LAPACK's `dlanv2` formulation.
+
+500 real matrices (random, near-identity, symmetric, triangular, 1e6-scaled):
+
+| | clean | bad | threw | worst rel. residual |
+|---|---|---|---|---|
+| before | 460 | 2 | **38** | 7.9e-04 |
+| after | **500** | 0 | 0 | **4.3e-15** |
+
+The check that found the second bug: symmetric input must stay symmetric under an
+orthogonal similarity, and symmetric plus zero subdiagonal means *diagonal*. H was
+coming back triangular with a nonzero upper triangle.
+
+## Tensor parity with Matrix
+
+`Tensor` now carries the same element-wise family as `Matrix` — `abs`, `sqrt`,
+`exp`, `ln`, `lg`, `log10`, `sin`/`cos`/`tan`, the hyperbolics and their
+inverses, `pow`, `log(base)`, `sign`, `conj`, and `floor`/`ceil`/`round`/`fix`/
+`expm1`/`log1p` (which refuse complex, as Matrix's do) — plus `prod`, `norm`,
+`var`, `stddev`, axis reductions `prod`/`min`/`max`/`mean`, and the axis scans
+`cumsum`, `cumprod` and `diff`.
+
+The scans keep the axis; `diff` shortens it by one, as MATLAB's does. Reductions
+drop it.
+
+These are checked against `Matrix` on a 2-D tensor and agree **exactly**
+(`0.0e+00` for sum, cumsum, diff, abs and sin) — the two reached them by
+different routes, so an exact match is evidence rather than a shared assumption.
+
+## Printing
+
+`print()` goes to the terminal; every other overload takes a `std::ostream`,
+which is how the rest of C++ spells this. A file, a `std::ostringstream` and a
+socket are all the same thing to it.
+
+```cpp
+A.print();                          // aligned, to the terminal
+A.print(4);                         // ... to 4 decimal places
+A.print(matio::Fmt::CSV);           // comma separated, to the terminal
+A.print(file, matio::Fmt::CSV);     // ... to a file
+A.save("data.csv");                 // format taken from the extension
+std::string s = A.str(matio::Fmt::Markdown);
+std::cout << A;                     // operator<< still works
+```
+
+Eight formats, the same for `Matrix` and `Tensor`:
+
+| | |
+|---|---|
+| `Pretty` | aligned and bracketed — the default, for a terminal |
+| `Plain` | whitespace separated, nothing else |
+| `CSV` / `TSV` | comma / tab separated, optional header row |
+| `Markdown` | pastes straight into a document |
+| `MATLAB` | `[1, 2; 3, 4]`, assignable with `Opts::name` |
+| `NumPy` | `np.array([[1, 2], [3, 4]])` |
+| `JSON` | `[[1, 2], [3, 4]]` |
+
+`Opts` carries `precision`, `scientific`, `header` and `name`. `save()` picks
+the format from the extension (`.csv`, `.tsv`, `.md`, `.json`, `.m`, `.py`,
+`.txt`) and **throws** if the file can't be opened — a save that quietly did
+nothing is the worst outcome.
+
+**Complex formats as `3+4i`, not `(3,4)`.** The default `std::complex` spelling
+contains a comma, which would silently add a column to every CSV row it appeared
+in.
+
+A rank > 2 `Tensor` has no 2-D layout, so `CSV`/`TSV`/`Plain` flatten it to
+(leading axes) × (last axis) and write a `# shape (2, 2, 3)` line first —
+without it the flattening couldn't be undone. `JSON` and `NumPy` nest to match
+the rank instead, so the structure survives on its own.
+
+Reading these back in is deliberately not here yet; the formats were chosen so
+that `Plain`, `CSV` and `TSV` are trivially parseable when it lands.

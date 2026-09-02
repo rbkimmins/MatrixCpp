@@ -6,6 +6,7 @@
 //
 // Build: g++ -std=c++17 -O2 -fopenmp -o validate validate.cpp && ./validate
 #include "Matrix1.0.hpp"
+#include <fstream>
 #include <iostream>
 #include <iomanip>
 #include <string>
@@ -815,6 +816,125 @@ int main() {
     //   * threwMask([]{ ... }) is the helper for the deliberate error paths.
     section("Signal, calculus and interpolation (tier 6)");
     {
+        // ── conv / deconv / poly ──────────────────────────────────────────
+        Matrix<double> ca(1, 3); ca = {{1, 2, 3}};
+        Matrix<double> cb(1, 2); cb = {{1, 5}};
+        Matrix<double> cw(1, 4); cw = {{1, 7, 13, 15}};
+        ok(same(conv(ca, cb), cw),           "conv() multiplies polynomials");
+        ok(conv(ca, cb).numel() == 4,        "conv() length is na + nb - 1");
+        ok(same(conv(cb, ca), conv(ca, cb)), "conv() is commutative");
+        // The FFT path must agree with the direct one. Both are exercised: the
+        // threshold is 16384 multiply-adds, so 200x200 takes the FFT route.
+        Matrix<double> big1(1, 200), big2(1, 200);
+        big1.set_Ran_values(-1, 1, -11); big2.set_Ran_values(-1, 1, -22);
+        Matrix<double> byfft = conv(big1, big2);
+        Matrix<double> bydirect(1, 399);
+        for (long i = 0; i < 200; i++)
+            for (long j = 0; j < 200; j++)
+                bydirect(0, int(i + j)) += big1(0, int(i)) * big2(0, int(j));
+        ok(same(byfft, bydirect, 1e-9),      "the FFT path agrees with the direct loop");
+
+        // deconv is defined by the identity, so that is what gets tested.
+        auto [dq, dr] = deconv(conv(ca, cb), ca);
+        ok(same(dq, cb, 1e-12),              "deconv() recovers the quotient");
+        ok(same(conv(ca, dq) + dr, conv(ca, cb), 1e-12),
+                                             "y == conv(a,q) + r exactly");
+        auto [q2, r2] = deconv(cw, ca);
+        ok(same(conv(ca, q2) + r2, cw, 1e-12), "the identity holds with a remainder too");
+        ok(threwMask([&]{ Matrix<double> z(1, 2); deconv(cw, z); }),
+                                             "deconv() rejects a zero leading coefficient");
+
+        // poly and roots must invert each other — the tie back to tier 4.
+        Matrix<double> rts(1, 3); rts = {{1, 2, 3}};
+        Matrix<double> pw(1, 4); pw = {{1, -6, 11, -6}};
+        ok(same(poly(rts), pw, 1e-10),       "poly() builds the monic polynomial");
+        Matrix<std::complex<double>> back = roots(poly(rts));
+        Matrix<double> backr(1, 3);
+        for (int i = 0; i < 3; i++) backr(0, i) = back[i].real();
+        ok(same(backr.sort(true), rts, 1e-8), "roots(poly(r)) returns r");
+        // A square matrix gives its CHARACTERISTIC polynomial instead.
+        Matrix<double> Ap(2, 2); Ap = {{4, 1}, {2, 3}};      // eigenvalues 2 and 5
+        Matrix<double> cp(1, 3); cp = {{1, -7, 10}};
+        ok(same(poly(Ap), cp, 1e-10),        "poly(A) is the characteristic polynomial");
+        // and the Cayley-Hamilton statement: p(A) == 0.
+        Matrix<double> ch = Ap * Ap - Ap * 7.0 + Id(2) * 10.0;
+        ok(ch.norm() < 1e-10,                "Cayley-Hamilton: p(A) == 0");
+        ok(threwMask([&]{ Matrix<double> ns(2, 3); poly(ns); }),
+                                             "poly() rejects a non-square non-vector");
+
+        // ── trapz / cumtrapz / gradient ───────────────────────────────────
+        Matrix<double> ys(1, 5); ys = {{0, 1, 2, 3, 4}};
+        Matrix<double> xs(1, 5); xs = {{0, 1, 2, 3, 4}};
+        // A straight line integrates exactly, which is the point of trapezoids.
+        ok(near(ys.trapz(), 8.0),            "trapz() is exact for a straight line");
+        ok(near(trapz(xs, ys), 8.0),         "trapz(x,y) agrees with unit spacing");
+        Matrix<double> x2(1, 5); x2 = {{0, 2, 4, 6, 8}};
+        ok(near(trapz(x2, ys), 16.0),        "trapz(x,y) honours the spacing");
+        ok(ys.trapz(true)(0, 0) == ys.trapz(), "the axis form agrees on one row");
+        // cumtrapz must end where trapz does.
+        Matrix<double> ct = ys.cumtrapz(true);
+        ok(ct.numel() == ys.numel(),         "cumtrapz() keeps the shape");
+        ok(near(ct(0, 0), 0.0),              "cumtrapz() starts at 0");
+        ok(near(ct(0, 4), ys.trapz()),       "cumtrapz() ends at trapz()");
+        // gradient of a straight line is constant — INCLUDING at the ends, which
+        // is the whole difference between gradient and diff.
+        Matrix<double> gr = ys.gradient(true);
+        ok(gr.numel() == ys.numel(),         "gradient() keeps the length, unlike diff()");
+        ok(near(gr(0, 0), 1.0) && near(gr(0, 4), 1.0),
+                                             "gradient() is right at the one-sided ends");
+        ok(near(gr(0, 2), 1.0),              "and in the centred interior");
+        ok(ys.diff(true).numel() == ys.numel() - 1, "diff() does shorten, for contrast");
+        Matrix<double> gh = ys.gradient(true, 2.0);
+        ok(near(gh(0, 2), 0.5),              "gradient() scales by the spacing h");
+        ok(threwMask([&]{ ys.gradient(true, 0.0); }), "a zero spacing throws");
+
+        // ── interp1 ───────────────────────────────────────────────────────
+        Matrix<double> xq(1, 3); xq = {{0.5, 2.5, 4.0}};
+        Matrix<double> iw(1, 3); iw = {{0.5, 2.5, 4.0}};
+        ok(same(interp1(xs, ys, xq), iw, 1e-12), "interp1() on a line is exact");
+        // Out of range gives the fill value, MATLAB's choice — NumPy clamps.
+        Matrix<double> xo(1, 2); xo = {{-1.0, 9.0}};
+        // An explicit fill works in EVERY build, which is why it exists: the NaN
+        // default is undetectable under -ffast-math, since -ffinite-math-only
+        // lets the compiler assume no NaN can occur and folds isnan() to false.
+        Matrix<double> iof = interp1(xs, ys, xo, -999.0);
+        ok(near(iof(0, 0), -999.0) && near(iof(0, 1), -999.0),
+                                             "interp1() uses the fill value outside the range");
+        ok(near(interp1(xs, ys, xo, 0.0)(0, 0), 0.0), "and any fill value works");
+#ifndef __FAST_MATH__
+        Matrix<double> io = interp1(xs, ys, xo);
+        ok(std::isnan(io(0, 0)) && std::isnan(io(0, 1)),
+                                             "the default fill is NaN");
+#else
+        ok(true, "the default NaN fill is not checkable under -ffast-math");
+#endif
+        ok(near(interp1(xs, ys, xs)(0, 2), ys(0, 2)),
+                                             "interp1() reproduces the sample points");
+        Matrix<double> unsorted(1, 3); unsorted = {{0, 2, 1}};
+        Matrix<double> yv(1, 3); yv = {{0, 1, 2}};
+        ok(threwMask([&]{ interp1(unsorted, yv, xq); }),
+                                             "interp1() rejects unsorted x");
+
+        // ── filter ────────────────────────────────────────────────────────
+        // y[n] = x[n] + 0.5 y[n-1]: the impulse response is 0.5^n.
+        Matrix<double> fb(1, 1); fb = {{1}};
+        Matrix<double> fa(1, 2); fa = {{1, -0.5}};
+        Matrix<double> delta(1, 5); delta = {{1, 0, 0, 0, 0}};
+        Matrix<double> fr = filter(fb, fa, delta);
+        ok(near(fr(0, 0), 1.0) && near(fr(0, 1), 0.5) && near(fr(0, 3), 0.125),
+                                             "filter() gives the geometric impulse response");
+        // With a==1 a filter IS a truncated convolution, which ties it to conv().
+        Matrix<double> one(1, 1); one = {{1}};
+        Matrix<double> sig(1, 6); sig.set_Ran_values(-1, 1, -33);
+        Matrix<double> kern(1, 3); kern = {{1, 2, 3}};
+        Matrix<double> fconv = filter(kern, one, sig);
+        Matrix<double> full = conv(kern, sig);
+        bool trunc = true;
+        for (int i = 0; i < 6; i++) if (std::abs(fconv(0, i) - full(0, i)) > 1e-12) trunc = false;
+        ok(trunc,                            "filter(b,1,x) is conv(b,x) truncated to length(x)");
+        ok(threwMask([&]{ Matrix<double> z(1, 2); filter(fb, z, delta); }),
+                                             "filter() rejects a zero a(0)");
+
         using cplx = std::complex<double>;
         auto maxdiff = [](const Matrix<cplx>& X, const Matrix<cplx>& Y) {
             double m = 0.0;
@@ -1057,6 +1177,904 @@ int main() {
         ok(pm.numel() == 50,                 "randperm() returns n entries");
         ok(pm.unique().numel() == 50,        "randperm() is a permutation — no repeats");
         ok(pm.min() == 0 && pm.max() == 49,  "randperm() covers 0..n-1");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    section("QR with Q left implicit (LAPACK's split)");
+    {
+        // solve() and rank() no longer form Q. These pin down that the answers
+        // are unchanged — the whole point is that nothing OBSERVABLE moved.
+        Matrix<double> A(40, 6);
+        A.set_Ran_values(-1, 1, -11);
+        Matrix<double> b(40, 1);
+        b.set_Ran_values(-1, 1, -22);
+
+        Matrix<double> x = A.solve(b);
+        ok(x.rows() == 6 && x.cols() == 1, "least squares returns one value per unknown");
+        // The defining property: the residual is orthogonal to every column of
+        // A. That is what "least squares" MEANS, and it needs no reference.
+        Matrix<double> resid = A * x - b;
+        ok((A.T() * resid).norm() < 1e-9, "A^T (Ax - b) == 0, the normal equations");
+        // And it must still agree with forming Q explicitly.
+        auto [Q, R, P] = A.QR();
+        Matrix<double> QtB = Q.T() * b;
+        ok(same(Q * R, A * P, 1e-10),      "QR() still returns a consistent explicit Q");
+        ok(same(Q.T() * Q, Id(40), 1e-10), "and an orthogonal one");
+
+        // An exactly-determined system must give the exact answer.
+        Matrix<double> Sq(6, 6);
+        Sq.set_Ran_values(-1, 1, -33);
+        for (int i = 0; i < 6; i++) Sq(i, i) += 6.0;
+        Matrix<double> bs(6, 1);
+        bs.set_Ran_values(-1, 1, -44);
+        ok(same(Sq * Sq.solve(bs), bs, 1e-10), "a square system is still exact");
+
+        // rank() reads only R's diagonal now.
+        Matrix<double> Rk(30, 5);
+        Rk.set_Ran_values(-1, 1, -55);
+        ok(Rk.rank() == 5,                 "rank() of a full-rank tall matrix");
+        for (int i = 0; i < 30; i++) Rk(i, 4) = Rk(i, 0) * 3.0;   // make column 4 dependent
+        ok(Rk.rank() == 4,                 "rank() sees the dependent column");
+
+        // Rank-deficient least squares: the free variables stay at zero and the
+        // residual is still orthogonal to the column space.
+        Matrix<double> Def(20, 4);
+        Def.set_Ran_values(-1, 1, -66);
+        for (int i = 0; i < 20; i++) Def(i, 3) = Def(i, 1) * 2.0;
+        Matrix<double> bd(20, 1);
+        bd.set_Ran_values(-1, 1, -77);
+        Matrix<double> xd = Def.solve(bd);
+        ok((Def.T() * (Def * xd - bd)).norm() < 1e-8,
+                                           "rank-deficient least squares still solves");
+
+        // The column permutation is applied from the pivot list rather than by
+        // multiplying an n×n permutation matrix. Same answer, O(n) not O(n²).
+        Matrix<double> Perm(12, 4);
+        Perm.set_Ran_values(-1, 1, -88);
+        Matrix<double> bp(12, 1);
+        bp.set_Ran_values(-1, 1, -99);
+        auto [Qp, Rp, Pp] = Perm.QR();
+        Matrix<double> viaQ(4, 1);
+        {   // the old route: back-substitute then multiply by P
+            Matrix<double> Yv = Qp.T() * bp;
+            Matrix<double> Y(4, 1);
+            for (int i = 3; i >= 0; i--) {
+                double acc = Yv(i, 0);
+                for (int j = i + 1; j < 4; j++) acc -= Rp(i, j) * Y(j, 0);
+                Y(i, 0) = acc / Rp(i, i);
+            }
+            viaQ = Pp * Y;
+        }
+        ok(same(Perm.solve(bp), viaQ, 1e-9),
+                                           "the pivot-list permutation matches P*y");
+
+        // ── the reduced / economy mode ────────────────────────────────────
+        // MATLAB's qr(A,0), NumPy's default mode='reduced'. Q becomes m x k and
+        // R k x n with k = min(m,n); the rows of R below k are zero anyway.
+        Matrix<double> T(40, 6);
+        T.set_Ran_values(-1, 1, -111);
+        auto [Qc, Rc, Pc] = T.QR();
+        auto [Qe, Re, Pe] = T.QR(QRMode::Reduced);
+        ok(Qc.rows() == 40 && Qc.cols() == 40, "Complete Q is m x m");
+        ok(Rc.rows() == 40 && Rc.cols() == 6,  "Complete R is m x n");
+        ok(Qe.rows() == 40 && Qe.cols() == 6,  "Reduced Q is m x k");
+        ok(Re.rows() == 6 && Re.cols() == 6,   "Reduced R is k x n");
+        // The reduced Q IS the first k columns of the complete one — not merely
+        // equivalent, identical to the bit.
+        bool sameCols = true;
+        for (int i = 0; i < 40; i++)
+            for (int j = 0; j < 6; j++)
+                if (Qc(i, j) != Qe(i, j)) sameCols = false;
+        ok(sameCols,                       "reduced Q is exactly the first k columns of complete Q");
+        // Both must still reconstruct.
+        Matrix<double> Pd(6, 6);
+        for (int i = 0; i < 6; i++)
+            for (int j = 0; j < 6; j++) Pd(i, j) = double(Pc(i, j));
+        ok(same(Qc * Rc, T * Pd, 1e-10),   "A*P == Q*R for Complete");
+        ok(same(Qe * Re, T * Pd, 1e-10),   "A*P == Q*R for Reduced");
+        // A reduced Q has orthonormal COLUMNS but is not square, so Q^T Q == I
+        // holds and Q Q^T does not — worth pinning, since assuming otherwise is
+        // the classic economy-QR mistake.
+        ok(same(Qe.T() * Qe, Id(6), 1e-10), "reduced Q has orthonormal columns");
+        ok(!same(Qe * Qe.T(), Id(40), 1e-6),
+                                           "but Q*Q^T is NOT the identity — it is a projector");
+        // For a WIDE matrix the two modes coincide, because k == m already.
+        Matrix<double> Wd(5, 12);
+        Wd.set_Ran_values(-1, 1, -222);
+        ok(std::get<0>(Wd.QR(QRMode::Reduced)).cols() == std::get<0>(Wd.QR()).cols(),
+                                           "for a wide matrix Reduced and Complete agree");
+
+        // ── unpivoted mode ────────────────────────────────────────────────
+        // MATLAB's two-output [Q,R] = qr(A). P is the identity, so A == Q*R
+        // exactly, with no permutation to undo.
+        auto [Qu, Ru, Pu] = T.QR(QRMode::Reduced, QRPivot::Off);
+        bool pIsId = true;
+        for (int i = 0; i < 6; i++)
+            for (int j = 0; j < 6; j++)
+                if (Pu(i, j) != (i == j ? 1 : 0)) pIsId = false;
+        ok(pIsId,                          "unpivoted QR returns P == I");
+        ok(same(Qu * Ru, T, 1e-10),        "unpivoted: A == Q*R with no permutation");
+        ok(same(Qu.T() * Qu, Id(6), 1e-10),"unpivoted Q still has orthonormal columns");
+        bool upper = true;
+        for (int i = 1; i < 6; i++)
+            for (int j = 0; j < i; j++)
+                if (std::abs(Ru(i, j)) > 1e-12) upper = false;
+        ok(upper,                          "unpivoted R is upper triangular");
+        // The rank-revealing property is exactly what is given up: pivoted R has
+        // |R(i,i)| non-increasing, unpivoted has no such guarantee.
+        auto [Qp2, Rp2, Pp2] = T.QR(QRMode::Reduced);
+        bool nonIncreasing = true;
+        for (int i = 1; i < 6; i++)
+            if (std::abs(Rp2(i, i)) > std::abs(Rp2(i - 1, i - 1)) + 1e-12) nonIncreasing = false;
+        ok(nonIncreasing,                  "pivoted R has |R(i,i)| non-increasing (rank-revealing)");
+
+        // Complex must go through the same path.
+        using cplx = std::complex<double>;
+        Matrix<cplx> Ac(20, 4);
+        for (int i = 0; i < 20; i++)
+            for (int j = 0; j < 4; j++)
+                Ac(i, j) = cplx(std::sin(0.7 * i + j), std::cos(i - 0.4 * j));
+        Matrix<cplx> bc(20, 1);
+        for (int i = 0; i < 20; i++) bc(i, 0) = cplx(std::sin(i), std::cos(2.0 * i));
+        Matrix<cplx> xc = Ac.solve(bc);
+        // A^H (Ax - b) == 0 — the CONJUGATE transpose, which is the complex
+        // statement of the normal equations.
+        ok((Ac.H() * (Ac * xc - bc)).norm() < 1e-9,
+                                           "complex least squares: A^H(Ax-b) == 0");
+        auto [Qz, Rz, Pz] = Ac.QR(QRMode::Reduced);
+        ok(Qz.rows() == 20 && Qz.cols() == 4, "reduced QR works for complex");
+        Matrix<cplx> Ic4(4, 4);
+        for (int i = 0; i < 4; i++) Ic4(i, i) = 1.0;
+        ok(same(Qz.H() * Qz, Ic4, 1e-10),  "and its columns are orthonormal under Q^H Q");
+        auto [Qw, Rw, Pw] = Ac.QR(QRMode::Reduced, QRPivot::Off);
+        ok(same(Qw * Rw, Ac, 1e-10),       "complex unpivoted: A == Q*R");
+        ok(same(Qw.H() * Qw, Ic4, 1e-10),  "complex unpivoted Q is unitary in its columns");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    section("Complex linear algebra (work_t)");
+    {
+        using cplx = std::complex<double>;
+        auto Ic = [](int k) {
+            Matrix<cplx> E(k, k);
+            for (int i = 0; i < k; i++) E(i, i) = 1.0;
+            return E;
+        };
+        Matrix<cplx> A(4, 4);
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++)
+                A(i, j) = cplx(std::sin(2.0 * i + j), std::cos(i - 1.5 * j));
+        Matrix<cplx> Adiag = A;
+        for (int i = 0; i < 4; i++) Adiag(i, i) += 4.0;   // well conditioned
+
+        // --- the return type follows the input, which is the whole point ---
+        ok((std::is_same<decltype(A.inverse()), Matrix<cplx>>::value),
+                                             "inverse() of a complex matrix is complex");
+        ok((std::is_same<decltype(Matrix<double>(2, 2).inverse()), Matrix<double>>::value),
+                                             "and stays double for a real one");
+
+        // --- mean is complex, var is NOT ---
+        Matrix<cplx> M2(2, 2);
+        M2(0, 0) = cplx(1, 2); M2(0, 1) = cplx(3, -1);
+        M2(1, 0) = cplx(-2, 0.5); M2(1, 1) = cplx(4, 1.5);
+        ok((std::is_same<decltype(M2.mean()), cplx>::value),
+                                             "mean() of a complex matrix is complex");
+        ok(std::abs(M2.mean() - cplx(1.5, 0.75)) < 1e-12, "and is the right value");
+        ok((std::is_same<decltype(M2.var()), double>::value),
+                                             "var() stays REAL — it is E|x-mu|^2");
+        ok(M2.var() > 0.0,                   "and is positive");
+
+        // --- Cholesky is the HERMITIAN factorisation for complex ---
+        Matrix<cplx> B(4, 4);
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++)
+                B(i, j) = cplx(std::sin(i * 3.1 + j), std::cos(i + 2.7 * j));
+        Matrix<cplx> Hpd = B.H() * B;
+        for (int i = 0; i < 4; i++) Hpd(i, i) += 4.0;
+        ok(Hpd.IsHermitian(),                "the test matrix is Hermitian");
+        Matrix<cplx> L = Hpd.cholesky();
+        ok(same(L * L.H(), Hpd, 1e-10),      "cholesky(): A == L*L^H, not L*L^T");
+        bool realDiag = true, lower = true;
+        for (int i = 0; i < 4; i++) {
+            if (std::abs(L(i, i).imag()) > 1e-12) realDiag = false;
+            for (int j = i + 1; j < 4; j++) if (std::abs(L(i, j)) > 1e-12) lower = false;
+        }
+        ok(realDiag && lower,                "L is lower triangular with a real diagonal");
+        // Complex SYMMETRIC but not Hermitian must be refused — the distinction
+        // does not exist for real matrices and is the whole game for complex.
+        Matrix<cplx> Sy(2, 2);
+        Sy(0, 0) = cplx(1, 1); Sy(0, 1) = 2.0; Sy(1, 0) = 2.0; Sy(1, 1) = 3.0;
+        ok(threwMask([&]{ Sy.cholesky(); }), "symmetric-but-not-Hermitian is refused");
+
+        // --- SVD: U and V unitary, singular values REAL ---
+        for (auto d : std::vector<std::pair<int,int>>{{4,4},{6,3},{3,6}}) {
+            Matrix<cplx> C(d.first, d.second);
+            for (int i = 0; i < d.first; i++)
+                for (int j = 0; j < d.second; j++)
+                    C(i, j) = cplx(std::sin(1.7*i + 0.3*j), std::cos(0.9*i - 1.1*j));
+            auto [U, S, V] = C.svd();
+            ok((std::is_same<decltype(S), Matrix<double>>::value),
+               "svd(): S is real at " + std::to_string(d.first) + "x" + std::to_string(d.second));
+            Matrix<cplx> Sc(S.rows(), S.cols());
+            for (long i = 0; i < S.rows(); i++)
+                for (long j = 0; j < S.cols(); j++) Sc(int(i), int(j)) = cplx(S(int(i), int(j)), 0);
+            ok(same(U * Sc * V.H(), C, 1e-10),
+               "svd(): A == U*S*V^H at " + std::to_string(d.first) + "x" + std::to_string(d.second));
+            ok(same(U.H() * U, Ic(d.first), 1e-10) && same(V.H() * V, Ic(d.second), 1e-10),
+               "svd(): U and V are UNITARY at " + std::to_string(d.first) + "x" +
+                   std::to_string(d.second));
+        }
+        // What the SVD unblocks.
+        ok(Adiag.norm(NormType::Two) > 0.0,  "norm(Two) works for complex");
+        ok(Adiag.cond(NormType::Two) >= 1.0, "cond(Two) works for complex");
+        ok(Adiag.rank() == 4,                "rank() works for complex");
+        ok(same(Adiag * Adiag.pinv() * Adiag, Adiag, 1e-9),
+                                             "pinv() satisfies A*A+*A == A for complex");
+
+        // --- LU, QR, solve, inverse, det ---
+        Matrix<cplx> b(4, 1);
+        for (int i = 0; i < 4; i++) b(i, 0) = cplx(i + 1, -i);
+        ok(same(Adiag * Adiag.solve(b), b, 1e-10), "solve() works for complex");
+        ok(same(Adiag * Adiag.inverse(), Ic(4), 1e-10), "inverse() works for complex");
+        cplx dt = Adiag.det();
+        ok(std::abs(dt * Adiag.inverse().det() - cplx(1, 0)) < 1e-9,
+                                             "det(A)*det(A^-1) == 1 for complex");
+        auto [Lu, Uu, Pu] = Adiag.LU();
+        Matrix<cplx> Pc(4, 4);
+        for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) Pc(i, j) = Pu(i, j);
+        ok(same(Pc * Adiag, Lu * Uu, 1e-10), "LU(): P*A == L*U for complex");
+        auto [Q, R, Pq] = Adiag.QR();
+        Matrix<cplx> Pqc(4, 4);
+        for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) Pqc(i, j) = Pq(i, j);
+        ok(same(Adiag * Pqc, Q * R, 1e-9),   "QR(): A*P == Q*R for complex");
+        ok(same(Q.H() * Q, Ic(4), 1e-10),    "QR(): Q is UNITARY, not merely orthogonal");
+
+        // --- the Taylor matrix functions ---
+        Matrix<cplx> Sm = A * 0.125;         // small, so the series converges fast
+        ok(same(exp(Sm) * exp(Sm * -1.0), Ic(4), 1e-10), "exp(A)*exp(-A) == I for complex");
+        ok(same(sin(Sm) * sin(Sm) + cos(Sm) * cos(Sm), Ic(4), 1e-10), "sin^2 + cos^2 == I");
+        ok(same(cosh(Sm) * cosh(Sm) - sinh(Sm) * sinh(Sm), Ic(4), 1e-10),
+                                             "cosh^2 - sinh^2 == I");
+        ok(same(cos(Sm) * tan(Sm), sin(Sm), 1e-9), "cos(A)*tan(A) == sin(A) — needs complex solve");
+        // Euler's identity on a matrix, which only means anything for complex.
+        ok(same(exp(Sm * cplx(0, 1)), cos(Sm) + sin(Sm) * cplx(0, 1), 1e-10),
+                                             "exp(iA) == cos(A) + i sin(A)");
+        // Real results must be unchanged.
+        ok((std::is_same<decltype(exp(Matrix<double>(2, 2))), Matrix<double>>::value),
+                                             "exp() of a real matrix is still real");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    section("Complex Schur, and everything that was blocked behind it");
+    {
+        using cplx = std::complex<double>;
+        const int n = 6;
+        Matrix<cplx> A(n, n);
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++)
+                A(i, j) = cplx(std::sin(i * 1.3 + j * 0.7), std::cos(i * 0.9 - j));
+        Matrix<cplx> Ic(n, n);
+        for (int i = 0; i < n; i++) Ic(i, i) = 1.0;
+
+        // ── the Schur form itself ──
+        // A complex matrix has NO real Schur form: the 2x2-block trick works
+        // only because a real matrix's complex eigenvalues come in conjugate
+        // pairs. The complex form is fully TRIANGULAR, which is what makes
+        // everything downstream simpler rather than harder.
+        auto [T, Q] = A.schur();
+        ok(same(Q * T * Q.H(), A, 1e-10),  "complex schur: A == Q T Q^H");
+        ok(same(Q.H() * Q, Ic, 1e-10),     "complex schur: Q is unitary");
+        bool tri = true;
+        for (int i = 1; i < n; i++)
+            for (int j = 0; j < i; j++)
+                if (T(i, j) != cplx(0.0, 0.0)) tri = false;
+        ok(tri,                            "complex schur: T is EXACTLY triangular, no 2x2 blocks");
+
+        auto [H, Qh] = A.hess();
+        ok(same(Qh * H * Qh.H(), A, 1e-10),"complex hess: A == Q H Q^H");
+        ok(same(Qh.H() * Qh, Ic, 1e-10),   "complex hess: Q is unitary");
+        bool hess_ok = true;
+        for (int i = 2; i < n; i++)
+            for (int j = 0; j <= i - 2; j++)
+                if (H(i, j) != cplx(0.0, 0.0)) hess_ok = false;
+        ok(hess_ok,                        "complex hess: exactly Hessenberg below the subdiagonal");
+
+        // ── eigenvalues and eigenvectors ──
+        auto [val, vec] = A.eig();
+        double worst = 0.0;
+        for (int k = 0; k < n; k++) {
+            Matrix<cplx> x(n, 1);
+            for (int i = 0; i < n; i++) x(i, 0) = vec(i, k);
+            worst = std::max(worst, (A * x - x * val(k, 0)).norm());
+        }
+        ok(worst < 1e-10,                  "complex eig: A v == lambda v for every column");
+        auto ev = A.eigvals();
+        double detWorst = 0.0;
+        for (int k = 0; k < n; k++) {
+            Matrix<cplx> M = A;
+            for (int i = 0; i < n; i++) M(i, i) -= ev(k, 0);
+            detWorst = std::max(detWorst, std::abs(M.det()));
+        }
+        ok(detWorst < 1e-8,                "complex eigvals: each is a root of det(A - lambda I)");
+        Matrix<cplx> one(1, 1);
+        one(0, 0) = cplx(3.0, -4.0);
+        ok(one.eigvals()(0, 0) == cplx(3.0, -4.0),
+                                           "1x1 complex eigvals keeps the imaginary part");
+
+        // ── THE REAL BUG THIS UNCOVERED ──
+        // eig() used to return the SCHUR VECTORS as eigenvectors. Only the first
+        // column of Q is ever an eigenvector; the rest span invariant subspaces
+        // without being eigenvectors of anything. It was silent — right
+        // eigenvalues, wrong vectors — and invisible for symmetric input,
+        // because there the Schur form is diagonal and the two coincide.
+        Matrix<double> NS(3, 3);
+        NS(0, 0) = 1; NS(0, 1) = 2; NS(0, 2) = 3;
+        NS(1, 0) = 0; NS(1, 1) = 2; NS(1, 2) = 4;
+        NS(2, 0) = 0; NS(2, 1) = 0; NS(2, 2) = 3;
+        auto [nv, nx] = NS.eig();
+        double nsWorst = 0.0;
+        for (int k = 0; k < 3; k++) {
+            Matrix<double> x(3, 1);
+            for (int i = 0; i < 3; i++) x(i, 0) = nx(i, k);
+            nsWorst = std::max(nsWorst, (NS * x - x * nv(k, 0)).norm());
+        }
+        ok(nsWorst < 1e-10,                "real eig on a NON-symmetric matrix returns true eigenvectors");
+
+        // ── matrix functions ──
+        Matrix<cplx> Am(5, 5);
+        for (int i = 0; i < 5; i++)
+            for (int j = 0; j < 5; j++)
+                Am(i, j) = cplx(std::sin(i * 1.1 + j * 0.4), std::cos(i - j * 0.5)) * 0.5;
+        for (int i = 0; i < 5; i++) Am(i, i) += 3.0;
+        auto R = sqrt(Am);
+        ok(same(R * R, Am, 1e-10),         "complex sqrt(A): R*R == A");
+        auto L = log(Am, M_E);
+        auto EL = funm(L, [](cplx z) { return std::exp(z); });
+        ok(same(EL, Am, 1e-10),            "complex log(A): exp(log A) == A");
+        ok(same(pow(Am, 3), Am * Am * Am, 1e-9),
+                                           "complex pow(A,3) == A*A*A");
+        ok(same(pow(Am, -1), Am.inverse(), 1e-10),
+                                           "complex pow(A,-1) == inverse");
+        auto P25 = pow(Am, 2.5);
+        ok(same(P25 * P25, Am * Am * Am * Am * Am, 1e-8),
+                                           "complex pow(A,2.5) squared == A^5");
+        auto Ex = funm(Am, [](cplx z) { return std::exp(z); });
+        Matrix<cplx> Sm(5, 5), Pm(5, 5);
+        for (int i = 0; i < 5; i++) { Sm(i, i) = 1.0; Pm(i, i) = 1.0; }
+        for (int k = 1; k <= 60; k++) {
+            Pm = Pm * Am;
+            Matrix<cplx> t = Pm;
+            for (int i = 0; i < 25; i++) t[i] /= std::tgamma(k + 1.0);
+            Sm = Sm + t;
+        }
+        ok(same(Ex, Sm, 1e-9),             "complex funm(exp) matches an independent Taylor series");
+
+        // ── AND THE OTHER REAL BUG ──
+        // A real matrix with a conjugate pair has its 2x2 block read as the real
+        // part TWICE by the diagonal. That part is usually positive, so the
+        // positivity check passed and sqrt/log returned garbage silently:
+        // measured ||R*R - A|| = 6.7e-01 before the fix.
+        Matrix<double> Br(4, 4);
+        Br.set_Ran_values(1, 2, -9);
+        for (int i = 0; i < 4; i++) Br(i, i) += 6;
+        auto evB = Br.eigvals();
+        bool hasPair = false;
+        for (int i = 0; i < 4; i++)
+            if (std::abs(evB(i, 0).imag()) > 1e-8) hasPair = true;
+        ok(hasPair,                        "the guard matrix really does have a conjugate pair");
+        auto Rb = sqrt(Br);
+        ok(same(Rb * Rb, Br, 1e-9),        "real sqrt with COMPLEX eigenvalues is right, not silently wrong");
+        auto Lb = log(Br, M_E);
+        auto ELb = funm(Lb, [](cplx z) { return std::exp(z); });
+        Matrix<double> ELr(4, 4);
+        for (int i = 0; i < 16; i++) ELr[i] = ELb[i].real();
+        ok(same(ELr, Br, 1e-9),            "real log with COMPLEX eigenvalues round-trips");
+
+        // ── the Hermitian-definite generalized problem ──
+        Matrix<cplx> Ga(5, 5), Gb(5, 5);
+        for (int i = 0; i < 5; i++)
+            for (int j = 0; j < 5; j++) {
+                Ga(i, j) = cplx(std::sin(i + j * 1.3), std::cos(i * 0.7 - j));
+                Gb(i, j) = cplx(std::cos(i * 0.4 + j), std::sin(i - j * 1.1));
+            }
+        Ga = (Ga + Ga.H()) * 0.5;
+        Gb = Gb.H() * Gb;
+        for (int i = 0; i < 5; i++) Gb(i, i) += 5.0;
+        auto [gval, gx] = eig(Ga, Gb);
+        double gRes = 0.0, gIm = 0.0;
+        for (int k = 0; k < 5; k++) {
+            Matrix<cplx> x(5, 1);
+            for (int i = 0; i < 5; i++) x(i, 0) = gx(i, k);
+            gRes = std::max(gRes, (Ga * x - (Gb * x) * gval(k, 0)).norm());
+            gIm = std::max(gIm, std::abs(gval(k, 0).imag()));
+        }
+        ok(gRes < 1e-10,                   "complex eig(A,B): A x == lambda B x");
+        ok(gIm < 1e-10,                    "complex eig(A,B): a Hermitian pencil has REAL eigenvalues");
+        Matrix<cplx> I5(5, 5);
+        for (int i = 0; i < 5; i++) I5(i, i) = 1.0;
+        ok(same(gx.H() * Gb * gx, I5, 1e-10),
+                                           "complex eig(A,B): vectors are B-orthonormal, X^H B X == I");
+        bool asc = true;
+        for (int k = 1; k < 5; k++)
+            if (gval(k, 0).real() < gval(k - 1, 0).real()) asc = false;
+        ok(asc,                            "complex eig(A,B): eigenvalues ascending, as MATLAB's are");
+    }
+
+    section("Printing and file output");
+    {
+        using F = matio::Fmt;
+        Matrix<double> A(2, 3);
+        A(0, 0) = 1;  A(0, 1) = -2.5; A(0, 2) = 3;
+        A(1, 0) = 40; A(1, 1) = 5;    A(1, 2) = -6.25;
+
+        // print(stream) and str() must agree — one of them being a separate
+        // code path is exactly how formatting drifts.
+        std::ostringstream os;
+        A.print(os, matio::Opts(F::CSV, 2));
+        std::string viaStream = os.str();
+        if (!viaStream.empty() && viaStream.back() == '\n') viaStream.pop_back();
+        ok(viaStream == A.str(matio::Opts(F::CSV, 2)),
+                                           "print(stream) and str() produce the same text");
+
+        ok(A.str(matio::Opts(F::CSV, 1)) == "1.0,-2.5,3.0\n40.0,5.0,-6.2",
+                                           "CSV");
+        ok(A.str(matio::Opts(F::TSV, 1)) == "1.0\t-2.5\t3.0\n40.0\t5.0\t-6.2",
+                                           "TSV");
+        ok(A.str(matio::Opts(F::Plain, 1)) == "1.0 -2.5 3.0\n40.0 5.0 -6.2",
+                                           "Plain");
+        ok(A.str(matio::Opts(F::MATLAB, 1)) == "[1.0, -2.5, 3.0; 40.0, 5.0, -6.2]",
+                                           "MATLAB");
+        ok(A.str(matio::Opts(F::JSON, 1)) == "[[1.0, -2.5, 3.0], [40.0, 5.0, -6.2]]",
+                                           "JSON");
+        ok(A.str(matio::Opts(F::NumPy, 1)) ==
+               "np.array([[1.0, -2.5, 3.0], [40.0, 5.0, -6.2]])", "NumPy");
+        // Pretty right-aligns to the widest cell, which is what makes columns
+        // line up when the entries differ in width.
+        ok(A.str(matio::Opts(F::Pretty, 1)) == "[  1.0  -2.5   3.0 ]\n[ 40.0   5.0  -6.2 ]",
+                                           "Pretty aligns on the widest cell");
+
+        matio::Opts hdr(F::CSV, 0);
+        hdr.header = true;
+        ok(A.str(hdr).substr(0, 14) == "col1,col2,col3", "CSV header row when asked for");
+        // Markdown REQUIRES a header row, so it always emits one.
+        ok(A.str(matio::Opts(F::Markdown, 0)).substr(0, 4) == "| co",
+                                           "Markdown always emits a header row");
+        matio::Opts nm(F::MATLAB, 0);
+        nm.name = "A";
+        ok(A.str(nm).substr(0, 5) == "A = [" && A.str(nm).back() == ';',
+                                           "MATLAB with a name is assignable source");
+        matio::Opts sci(F::CSV, 2);
+        sci.scientific = true;
+        ok(A.str(sci).substr(0, 8) == "1.00e+00", "scientific notation");
+
+        // ── complex must not corrupt a CSV ──
+        // std::complex streams as (3,4). That comma would silently add a column
+        // to every row it appeared in, so this formats as 3+4i instead.
+        Matrix<std::complex<double>> C(1, 2);
+        C(0, 0) = std::complex<double>(1, 2);
+        C(0, 1) = std::complex<double>(3, -4);
+        const std::string cs = C.str(matio::Opts(F::CSV, 1));
+        ok(cs == "1.0+2.0i,3.0-4.0i",       "complex CSV uses a+bi, not (a,b)");
+        long commas = 0;
+        for (char ch : cs) if (ch == ',') commas++;
+        ok(commas == 1,                     "so one column separator, not three");
+
+        // ── files ──
+        A.save("/tmp/mcpp_test.csv");
+        std::ifstream fin("/tmp/mcpp_test.csv");
+        std::string first;
+        std::getline(fin, first);
+        fin.close();
+        ok(first == "1.000000,-2.500000,3.000000",
+                                           "save() picks CSV from the .csv extension");
+        A.save("/tmp/mcpp_test.md");
+        std::ifstream f2("/tmp/mcpp_test.md");
+        std::getline(f2, first);
+        f2.close();
+        ok(first.substr(0, 4) == "| co", "save() picks Markdown from .md");
+        A.save("/tmp/mcpp_test.dat", matio::Opts(F::TSV, 1));
+        std::ifstream f3("/tmp/mcpp_test.dat");
+        std::getline(f3, first);
+        f3.close();
+        ok(first == "1.0\t-2.5\t3.0",     "an explicit format overrides the extension");
+        // A save that quietly did nothing is the worst outcome, so it throws.
+        ok(threwMask([&] { A.save("/nonexistent-dir-xyz/out.csv"); }),
+                                           "save() throws when the file cannot be opened");
+
+        std::ostringstream so;
+        so << A;
+        ok(so.str() == A.str(),             "operator<< matches str()");
+        ok(A.str() == A.str(matio::Opts(F::Pretty, 6)),
+                                           "the default format is Pretty at 6 dp");
+    }
+
+    section("Real Schur: Francis double shift and 2x2 standardisation");
+    {
+        // ── the matrices the single real shift could not do ──
+        // A single real shift cannot converge to a complex-conjugate pair, so
+        // the old code threw on ordinary matrices — and not in any pattern a
+        // size threshold would catch: a plain random 16x16 failed while a 64x64
+        // succeeded. Every consumer went down with it: eig, schur, funm,
+        // sqrt(A), log(A), pow(A,real).
+        auto schurOK = [&](const Matrix<double>& A, double tol) {
+            const int n = (int)A.rows();
+            auto [Hv, Qv] = A.schurDecomp();
+            Matrix<double> H(n, n), Q(n, n), Id2(n, n);
+            for (int i = 0; i < n * n; i++) { H[i] = Hv[(std::size_t)i]; Q[i] = Qv[(std::size_t)i]; }
+            for (int i = 0; i < n; i++) Id2(i, i) = 1.0;
+            if ((Q * H * Q.T() - A).norm() / A.norm() > tol) return false;
+            if ((Q.T() * Q - Id2).norm() > tol) return false;
+            for (int i = 2; i < n; i++)                      // quasi-triangular
+                for (int j = 0; j <= i - 2; j++)
+                    if (std::abs(H(i, j)) > 1e-10 * A.norm()) return false;
+            for (int i = 1; i + 1 < n; i++) {                // no two adjacent sub-diagonals
+                const double s1 = std::abs(H(i, i - 1)), s2 = std::abs(H(i + 1, i));
+                const double c1 = std::abs(H(i - 1, i - 1)) + std::abs(H(i, i));
+                const double c2 = std::abs(H(i, i)) + std::abs(H(i + 1, i + 1));
+                if (s1 > 1e-12 * std::max(c1, 1.0) && s2 > 1e-12 * std::max(c2, 1.0)) return false;
+            }
+            return true;
+        };
+        Matrix<double> R16(16, 16), R128(128, 128), NI64(64, 64);
+        R16.set_Ran_values(-1, 1, -913);
+        R128.set_Ran_values(-1, 1, -1025);
+        NI64.set_Ran_values(-0.1, 0.1, -7);
+        for (int i = 0; i < 64; i++) NI64(i, i) += 1.0;
+        ok(schurOK(R16, 1e-11),            "real Schur converges on a 16x16 the single shift could not");
+        ok(schurOK(R128, 1e-11),           "real Schur converges on a 128x128");
+        ok(schurOK(NI64, 1e-11),           "real Schur converges on a near-identity 64x64");
+
+        // ── a symmetric matrix must come out DIAGONAL ──
+        // The strongest available check: symmetric input under an orthogonal
+        // similarity must stay symmetric, and symmetric plus zero sub-diagonal
+        // means diagonal. It is what caught the 2x2 standardisation bug, where
+        // H came back triangular with a nonzero UPPER triangle.
+        Matrix<double> Sy(19, 19);
+        Sy.set_Ran_values(-1, 1, -997);
+        Sy = (Sy + Sy.T()) * 0.5;
+        auto [SH, SQ] = Sy.schurDecomp();
+        Matrix<double> Hs(19, 19), Qs(19, 19);
+        for (int i = 0; i < 361; i++) { Hs[i] = SH[(std::size_t)i]; Qs[i] = SQ[(std::size_t)i]; }
+        ok((Qs * Hs * Qs.T() - Sy).norm() / Sy.norm() < 1e-12,
+                                           "symmetric: A == Q H Q^T");
+        ok((Hs - Hs.T()).norm() < 1e-12,   "symmetric input gives a SYMMETRIC Schur form");
+        double offd = 0.0;
+        for (int i = 0; i < 19; i++)
+            for (int j = 0; j < 19; j++)
+                if (i != j) offd = std::max(offd, std::abs(Hs(i, j)));
+        ok(offd < 1e-12,                   "symmetric input gives a DIAGONAL Schur form");
+
+        // ── the cancellation that broke the 2x2 standardisation ──
+        // disc computed as ((a+d)/2)^2 - (a*d - b*c) is the difference of two
+        // numbers near 1e6 when the true value is 1e-6. Formed as
+        // ((a-d)/2)^2 + b*c it is exact. The eigenvalues of this block are
+        // 1000 +- 1e-3, and getting disc wrong moves them.
+        Matrix<double> Tiny(2, 2);
+        Tiny(0, 0) = 1e3;  Tiny(0, 1) = 1e-3;
+        Tiny(1, 0) = 1e-3; Tiny(1, 1) = 1e3;
+        auto tev = Tiny.eigvals();
+        double lo2 = std::min(tev(0, 0).real(), tev(1, 0).real());
+        double hi2 = std::max(tev(0, 0).real(), tev(1, 0).real());
+        ok(std::abs(hi2 - 1000.001) < 1e-6 && std::abs(lo2 - 999.999) < 1e-6,
+                                           "a near-degenerate 2x2 keeps both eigenvalues");
+        ok(std::abs(tev(0, 0).imag()) < 1e-12 && std::abs(tev(1, 0).imag()) < 1e-12,
+                                           "and reports them as real, not a spurious pair");
+
+        // ── everything downstream is unblocked by the fix ──
+        Matrix<double> Fm(48, 48);
+        Fm.set_Ran_values(-0.1, 0.1, -31);
+        for (int i = 0; i < 48; i++) Fm(i, i) += 1.0;
+        auto Ex48 = funm(Fm, [](std::complex<double> z) { return std::exp(z); });
+        ok(Ex48.rows() == 48,              "funm runs on a 48x48 that used to fail to converge");
+        auto Rt = sqrt(Fm);
+        ok(same(Rt * Rt, Fm, 1e-8),        "sqrt(A) on the same matrix round-trips");
+    }
+
+    section("QZ — the generalized Schur decomposition");
+    {
+        using cplx = std::complex<double>;
+        const int n = 7;
+        Matrix<cplx> A(n, n), B(n, n);
+        Matrix<double> ar(n, n), ai(n, n), br(n, n), bi(n, n);
+        ar.set_Ran_values(-1, 1, -3);  ai.set_Ran_values(-1, 1, -77);
+        br.set_Ran_values(-1, 1, -31); bi.set_Ran_values(-1, 1, -91);
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++) {
+                A(i, j) = cplx(ar(i, j), ai(i, j));
+                B(i, j) = cplx(br(i, j), bi(i, j));
+            }
+        for (int i = 0; i < n; i++) B(i, i) += double(n);
+        Matrix<cplx> Ic(n, n);
+        for (int i = 0; i < n; i++) Ic(i, i) = 1.0;
+
+        auto r = qz(A, B);
+        ok(same(r.Q * r.S * r.Z.H(), A, 1e-10),  "qz: A == Q S Z^H");
+        ok(same(r.Q * r.T * r.Z.H(), B, 1e-10),  "qz: B == Q T Z^H");
+        ok(same(r.Q.H() * r.Q, Ic, 1e-10),       "qz: Q is unitary");
+        ok(same(r.Z.H() * r.Z, Ic, 1e-10),       "qz: Z is unitary");
+        bool triS = true, triT = true;
+        for (int i = 1; i < n; i++)
+            for (int j = 0; j < i; j++) {
+                if (r.S(i, j) != cplx(0.0, 0.0)) triS = false;
+                if (r.T(i, j) != cplx(0.0, 0.0)) triT = false;
+            }
+        ok(triS,                                 "qz: S is EXACTLY upper triangular");
+        ok(triT,                                 "qz: T is EXACTLY upper triangular");
+        // Each ratio must actually annihilate the pencil.
+        const auto al = r.alpha(), be = r.beta();
+        double worst = 0.0;
+        for (int k = 0; k < n; k++) {
+            Matrix<cplx> M = A;
+            const cplx lam = al[(std::size_t)k] / be[(std::size_t)k];
+            for (int i = 0; i < n; i++)
+                for (int j = 0; j < n; j++) M(i, j) -= lam * B(i, j);
+            worst = std::max(worst, std::abs(M.det()));
+        }
+        ok(worst < 1e-6,                         "qz: every S(i,i)/T(i,i) is a root of det(A - lambda B)");
+
+        // A REAL pencil goes through the same path — the reduction stays in real
+        // arithmetic, but the sweep and the answer are complex, because a real
+        // pencil can perfectly well have complex eigenvalues.
+        Matrix<double> Ra(6, 6), Rb(6, 6);
+        Ra.set_Ran_values(-1, 1, -5);
+        Rb.set_Ran_values(-1, 1, -11);
+        for (int i = 0; i < 6; i++) Rb(i, i) += 6.0;
+        auto rr = qz(Ra, Rb);
+        Matrix<cplx> Rac(6, 6), Rbc(6, 6), I6(6, 6);
+        for (int i = 0; i < 6; i++) {
+            I6(i, i) = 1.0;
+            for (int j = 0; j < 6; j++) { Rac(i, j) = Ra(i, j); Rbc(i, j) = Rb(i, j); }
+        }
+        ok(same(rr.Q * rr.S * rr.Z.H(), Rac, 1e-10), "qz: real pencil, A == Q S Z^H");
+        ok(same(rr.Q * rr.T * rr.Z.H(), Rbc, 1e-10), "qz: real pencil, B == Q T Z^H");
+        ok(same(rr.Q.H() * rr.Q, I6, 1e-10),         "qz: real pencil, Q unitary");
+
+        // ── the reason QZ exists ──
+        // An ILL-CONDITIONED but nonsingular B. The old eigvals(A,B) formed
+        // B^-1*A and refused outright below rcond 1e-10; QZ never forms it.
+        Matrix<cplx> Ia(6, 6), Ib(6, 6);
+        Matrix<double> ia(6, 6), ib(6, 6);
+        ia.set_Ran_values(-1, 1, -5); ib.set_Ran_values(-1, 1, -9);
+        for (int i = 0; i < 6; i++)
+            for (int j = 0; j < 6; j++) {
+                Ia(i, j) = cplx(ia(i, j), ib(i, j));
+                Ib(i, j) = (i == j) ? cplx(std::pow(10.0, -2.0 * i), 0.0) : cplx(0.0, 0.0);
+            }
+        ok(rcond(Ib) < 1e-9,                     "the guard pencil really is ill conditioned");
+        auto ri = qz(Ia, Ib);
+        ok(same(ri.Q * ri.S * ri.Z.H(), Ia, 1e-8),
+                                                 "qz handles a B the B^-1*A path refuses");
+        auto ev = eigvals(Ia, Ib);
+        ok(ev.rows() == 6,                       "eigvals(A,B) now returns for an ill-conditioned B");
+
+        // ── infinite eigenvalues, where they can be deflated ──
+        // B == 0 makes every eigenvalue infinite. beta() is exactly zero, which
+        // is the honest report; a ratio could not express it.
+        Matrix<cplx> Za(5, 5), Zb(5, 5);
+        for (int i = 0; i < 5; i++)
+            for (int j = 0; j < 5; j++) Za(i, j) = cplx(std::sin(i + j), std::cos(i - j));
+        auto rz = qz(Za, Zb);
+        int ninf = 0;
+        for (bool f : rz.infinite()) if (f) ninf++;
+        ok(ninf == 5,                            "qz: B == 0 gives 5 infinite eigenvalues");
+        ok(threwMask([&] { eigvals(Za, Zb); }),  "eigvals(A,B) refuses to express an infinite eigenvalue");
+
+        // ── eigenvectors from the QZ factors ──
+        // Checked in the HOMOGENEOUS form beta*A*x == alpha*B*x, which stays
+        // finite when beta is zero. Dividing first would give NaN for exactly
+        // the eigenvalues that make QZ worth having.
+        auto X = r.eigenvectors();
+        double vworst = 0.0;
+        for (int k = 0; k < n; k++) {
+            Matrix<cplx> x(n, 1);
+            for (int i = 0; i < n; i++) x(i, 0) = X(i, k);
+            vworst = std::max(vworst, (A * x * be[(std::size_t)k] - B * x * al[(std::size_t)k]).norm());
+        }
+        ok(vworst < 1e-10,                       "qz eigenvectors: beta*A*x == alpha*B*x");
+
+        // A SINGULAR B gives infinite eigenvalues, and those still have honest
+        // eigenvectors: an infinite eigenvalue is one with B*x == 0.
+        Matrix<cplx> Sa(7, 7), Sb(7, 7);
+        Matrix<double> sa1(7, 7), sa2(7, 7), sb1(7, 7), sb2(7, 7);
+        sa1.set_Ran_values(-1, 1, -3);  sa2.set_Ran_values(-1, 1, -7);
+        sb1.set_Ran_values(-1, 1, -13); sb2.set_Ran_values(-1, 1, -17);
+        for (int i = 0; i < 7; i++)
+            for (int j = 0; j < 7; j++) {
+                Sa(i, j) = cplx(sa1(i, j), sa2(i, j));
+                Sb(i, j) = cplx(sb1(i, j), sb2(i, j));
+            }
+        for (int d = 0; d < 2; d++)
+            for (int j = 0; j < 7; j++) Sb(2 + d, j) = Sb(1, j);      // rank 5 of 7
+        ok(Sb.rank() == 5,                       "the guard pencil B really has rank 5 of 7");
+        auto rs = qz(Sa, Sb);
+        auto Xs = rs.eigenvectors();
+        const auto sal = rs.alpha(), sbe = rs.beta();
+        const auto sinf = rs.infinite();
+        double sworst = 0.0, binf = 0.0;
+        int nInf = 0;
+        for (int k = 0; k < 7; k++) {
+            Matrix<cplx> x(7, 1);
+            for (int i = 0; i < 7; i++) x(i, 0) = Xs(i, k);
+            sworst = std::max(sworst, (Sa * x * sbe[(std::size_t)k] - Sb * x * sal[(std::size_t)k]).norm());
+            if (sinf[(std::size_t)k]) { nInf++; binf = std::max(binf, (Sb * x).norm()); }
+        }
+        ok(sworst < 1e-10,                       "singular B: beta*A*x == alpha*B*x still holds");
+        ok(nInf == 2,                            "singular B: two infinite eigenvalues, matching the rank");
+        ok(binf < 1e-10,                         "an infinite eigenvalue's vector satisfies B*x == 0");
+
+        // ── a SINGULAR PENCIL, where no eigenvalue is defined at all ──
+        // A and B sharing a null space makes det(A - lambda B) identically zero.
+        // The pairs that come back are rounding noise and look like ordinary
+        // numbers, so undefined() exists to say so rather than let them pass.
+        Matrix<cplx> Pa(6, 6), Pb(6, 6);
+        for (int i = 0; i < 6; i++)
+            for (int j = 0; j < 4; j++) {
+                Pa(i, j) = cplx(std::sin(i * 1.1 + j), std::cos(i - j * 0.7));
+                Pb(i, j) = cplx(std::cos(i * 0.6 + j), std::sin(i * 1.3 - j));
+            }                                     // columns 4,5 left zero in both
+        auto rp = qz(Pa, Pb);
+        int nUndef = 0;
+        for (bool f : rp.undefined()) if (f) nUndef++;
+        ok(nUndef >= 2,                          "undefined() flags a singular pencil's 0/0 pairs");
+        ok(threwMask([&] { eigvals(Pa, Pb); }),  "eigvals(A,B) refuses a singular pencil outright");
+
+        // ── ill-scaled pencils must still converge ──
+        // The shift is a ratio of products of S and T entries, so ||A|| ~ 1e9
+        // against ||B|| ~ 1e-9 walks it through eighteen orders of magnitude.
+        // 70 of 400 stress pencils failed to converge before qz() normalised
+        // the pair; the scaling is undone on the factors afterwards, so
+        // A == Q S Z^H still holds exactly.
+        Matrix<cplx> Ha(5, 5), Hb(5, 5);
+        Matrix<double> h1(5, 5), h2(5, 5);
+        h1.set_Ran_values(-1, 1, -21); h2.set_Ran_values(-1, 1, -23);
+        for (int i = 0; i < 5; i++)
+            for (int j = 0; j < 5; j++) {
+                Ha(i, j) = cplx(h1(i, j), h2(i, j)) * 1e9;
+                Hb(i, j) = cplx(h2(i, j), h1(i, j)) * 1e-9;
+            }
+        for (int i = 0; i < 5; i++) Hb(i, i) += 5e-9;
+        auto rh = qz(Ha, Hb);
+        ok((rh.Q * rh.S * rh.Z.H() - Ha).norm() / Ha.norm() < 1e-12,
+                                                 "ill-scaled pencil: A == Q S Z^H to relative precision");
+        ok((rh.Q * rh.T * rh.Z.H() - Hb).norm() / Hb.norm() < 1e-12,
+                                                 "ill-scaled pencil: B == Q T Z^H to relative precision");
+    }
+
+    section("Decomposition / factorize on complex matrices");
+    {
+        using cplx = std::complex<double>;
+        const int n = 6;
+        Matrix<cplx> A(n, n), B(n, 3);
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++) A(i, j) = cplx(std::sin(i * 1.4 + j), std::cos(i - j * 0.6));
+            for (int j = 0; j < 3; j++) B(i, j) = cplx(std::cos(i + j), std::sin(i * j + 1.0));
+        }
+        for (int i = 0; i < n; i++) A(i, i) += double(n);
+
+        // ── the LU path ──
+        auto dA = A.factorize();
+        ok((A * dA.solve(B) - B).norm() < 1e-10,
+                                           "complex factorize: LU path solves A X == B");
+        ok(std::abs(dA.det() - A.det()) < 1e-8,
+                                           "complex factorize: det() agrees with A.det()");
+        ok(std::abs(dA.rcond(A.norm(NormType::One)) - rcond(A)) < 1e-10,
+                                           "complex factorize: rcond agrees with the free rcond(A)");
+        ok((dA.solve(B) - solve(A, B)).norm() < 1e-12,
+                                           "complex factorize: repeated solve == one-shot solve");
+
+        // ── the Cholesky path, which needs HERMITIAN not symmetric ──
+        Matrix<cplx> H(n, n);
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++) H(i, j) = cplx(std::cos(i * 0.5 + j), std::sin(i - j));
+        H = H.H() * H;
+        for (int i = 0; i < n; i++) H(i, i) += double(n);
+        ok(H.IsHermitian(),                "the guard matrix really is Hermitian");
+        auto dH = H.factorize();
+        ok((H * dH.solve(B) - B).norm() < 1e-10,
+                                           "complex factorize: Cholesky path solves H X == B");
+        ok(std::abs(dH.det() - H.det()) < 1e-6 * std::abs(H.det()),
+                                           "complex factorize: Cholesky det() agrees");
+
+        // ── the QR least-squares path ──
+        Matrix<cplx> T(12, 4), c(12, 1);
+        for (int i = 0; i < 12; i++) {
+            for (int j = 0; j < 4; j++) T(i, j) = cplx(std::sin(i + j * 1.7), std::cos(i * 0.3 - j));
+            c(i, 0) = cplx(std::cos(i * 0.9), std::sin(i * 1.2));
+        }
+        auto x = T.factorize().solve(c);
+        ok((T.H() * (T * x - c)).norm() < 1e-9,
+                                           "complex factorize: QR path satisfies the normal equations");
+    }
+
+    section("det and LU of a singular matrix");
+    {
+        // A singular matrix HAS a determinant — it is zero — and code that asks
+        // "is this singular" by testing det(A) == 0 deserves an answer, not an
+        // exception. MATLAB and NumPy both return 0. This used to throw.
+        Matrix<double> S(3, 3); S = {{1, 2, 3}, {2, 4, 6}, {1, 1, 1}};   // row2 = 2*row1
+        ok(S.rank() == 2,                    "the test matrix really is singular");
+        ok(S.det() == 0.0,                   "det() of a singular matrix is 0, not a throw");
+        ok(!std::signbit(S.det()),           "and is +0, not -0");
+        ok(Matrix<double>(3, 3).det() == 0.0, "det() of the zero matrix is 0");
+        // Non-singular determinants must be unaffected.
+        Matrix<double> A(3, 3); A = {{2, 0, 1}, {1, 3, 0}, {0, 1, 4}};
+        ok(near(A.det(), 25.0),              "a non-singular det is unchanged");
+        ok(near(Id(4).det(), 1.0),           "det(I) is 1");
+        // det is still multiplicative, including through a singular factor.
+        ok(near((A * S).det(), A.det() * S.det(), 1e-9),
+                                             "det(A*S) == det(A)*det(S), both zero here");
+
+        // The factorisation exists too — U just carries a zero on its diagonal.
+        auto [L, U, P] = S.LU();
+        Matrix<double> Pd(3, 3);
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++) Pd(i, j) = double(P(i, j));
+        ok(same(Pd * S, L * U, 1e-12),       "P*A == L*U for a singular matrix");
+        bool zeroPivot = false;
+        for (int i = 0; i < 3; i++) if (std::abs(U(i, i)) < 1e-12) zeroPivot = true;
+        ok(zeroPivot,                        "U has a zero on its diagonal");
+
+        // What must STILL refuse: a singular system has no unique solution, so
+        // returning one would be a lie. That is a different question from
+        // whether the determinant or the factorisation exist.
+        Matrix<double> b(3, 1); b = {{1}, {2}, {3}};
+        ok(threwMask([&]{ S.solve(b); }),    "solve() still refuses a singular matrix");
+        ok(threwMask([&]{ S.inverse(); }),   "inverse() still refuses");
+        ok(threwMask([&]{ S.factorize(); }), "Decomposition still refuses");
+        // cond() of a singular matrix is infinite, which is the right answer.
+        ok(std::isinf(S.cond(NormType::One)) || S.cond(NormType::One) > 1e15,
+                                             "cond() of a singular matrix is infinite");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    section("A 1x1 matrix is a scalar");
+    {
+        Matrix<double> a(1, 1); a(0, 0) = 3.0;
+        double x = a;
+        ok(near(x, 3.0),                     "a 1x1 converts to its element");
+        ok(near(a + 1.0, 4.0),               "and takes part in scalar arithmetic");
+        ok(near(std::sqrt(Matrix<double>(a) * 3.0), 3.0), "and passes to <cmath>");
+
+        // The case this exists for: a quadratic form is a 1x1 matrix.
+        Matrix<double> A(2, 2); A = {{2, 1}, {1, 3}};
+        Matrix<double> v(2, 1); v = {{1}, {1}};
+        double energy = v.T() * A * v;
+        ok(near(energy, 7.0),                "v'Av reads as a number");
+        // So does a logical index that happens to select one element.
+        Matrix<double> one = A(A > 2.5);
+        ok(one.numel() == 1 && near(double(one), 3.0),
+                                             "a one-element selection converts too");
+
+        // Any other shape THROWS — the size is a runtime property, so this
+        // cannot be a compile-time check. NumPy makes the same trade.
+        ok(threwMask([&]{ double bad = A; (void)bad; }),
+                                             "a 2x2 refuses to become a scalar");
+
+        // --- MATLAB's scalar broadcast, which had to land at the same time ---
+        // Without it, A + 1.0 on a 2x2 would fall through to the conversion,
+        // compile, and throw. With it, it means what MATLAB means.
+        Matrix<double> plus(2, 2); plus = {{3, 2}, {2, 4}};
+        ok(same(A + 1.0, plus),              "A + scalar adds to every element");
+        ok(same(1.0 + A, plus),              "and works with the scalar on the left");
+        Matrix<double> minus(2, 2); minus = {{1, 0}, {0, 2}};
+        ok(same(A - 1.0, minus),             "A - scalar subtracts from every element");
+        // 3 - A is NOT A - 3: it negates first, as MATLAB does.
+        Matrix<double> rev(2, 2); rev = {{1, 2}, {2, 0}};
+        ok(same(3.0 - A, rev),               "scalar - A negates then offsets");
+        ok(!same(3.0 - A, A - 3.0),          "which is not the same as A - scalar");
+        Matrix<double> acc = A; acc += 1.0;
+        ok(same(acc, plus),                  "operator+= with a scalar");
+
+        // --- the safety property this design had to preserve ---
+        // Matrix<bool> deliberately has NO conversion: an implicit operator bool
+        // on a mask would turn `if (mask)` from a compile error into a runtime
+        // throw. Adding the unconstrained version compiled all 555 checks and
+        // silently broke exactly this, which is why the static_assert is there.
+        Matrix<bool> m = A >= 2.0;           // A = {{2,1},{1,3}}: the 2 and the 3
+        ok(m.nnz() == 2,                     "a mask still counts with nnz()");
+        ok(m.any() && !m.all(),              "and still answers any()/all()");
+        // `if (m)` and `if (m1 || m2)` do not compile — verified outside the
+        // suite, since a compile error cannot be asserted from inside it.
     }
 
     // ═══════════════════════════════════════════════════════════════════

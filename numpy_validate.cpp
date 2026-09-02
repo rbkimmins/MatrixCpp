@@ -159,6 +159,56 @@ static void dumpShared(const std::string& dt) {
     Case("imag_part",  dt).mat("A", A).mat("R", A.imag());
 
     Case("elem_exp",   dt).mat("A", A).mat("R", A.exp());
+
+    // ── Least squares with Q left implicit ─────────────────────────────────
+    if constexpr (!is_complex<T>::value) {
+        Matrix<double> Ls(40, 6), Lb(40, 1);
+        Ls.set_Ran_values(-1.0, 1.0, -1201);
+        Lb.set_Ran_values(-1.0, 1.0, -1202);
+        Case("lstsq_tall", dt).mat("A", Ls).mat("B", Lb).mat("R", Ls.solve(Lb));
+        Matrix<double> Rk(30, 5);
+        Rk.set_Ran_values(-1.0, 1.0, -1203);
+        Case("rank_tall", dt).mat("A", Rk).mat("R", oneByOne(double(Rk.rank())));
+    }
+
+    // ── Complex linear algebra (work_t) ────────────────────────────────────
+    // These are dumped under the COMPLEX dtype so numpy_validate.py compares
+    // them against numpy's complex routines directly.
+    if constexpr (is_complex<T>::value) {
+        Matrix<T> Cm(4, 4);
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++)
+                Cm(i, j) = T(std::sin(2.0 * i + j)) + T(std::cos(i - 1.5 * j)) * T(0, 1);
+        for (int i = 0; i < 4; i++) Cm(i, i) += T(4.0);
+        Case("cx_inverse", dt).mat("A", Cm).mat("R", Cm.inverse());
+        Case("cx_det", dt).mat("A", Cm).mat("R", [&]{ Matrix<T> d(1,1); d(0,0)=Cm.det(); return d; }());
+        Matrix<T> rhs(4, 2);
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 2; j++) rhs(i, j) = T(double(i + 1)) + T(double(-j)) * T(0, 1);
+        Case("cx_solve", dt).mat("A", Cm).mat("B", rhs).mat("R", Cm.solve(rhs));
+        Case("cx_pinv", dt).mat("A", Cm).mat("R", Cm.pinv());
+        // Singular values are real and unique, so they compare directly where
+        // U and V (which are not unique) could not.
+        Case("cx_svdvals", dt).mat("A", Cm).mat("R", [&]{
+            auto [U, S, V] = Cm.svd(); (void)U; (void)V;
+            Matrix<T> sv(4, 1);
+            for (int i = 0; i < 4; i++) sv(i, 0) = T(S(i, i));
+            return sv; }());
+        Case("cx_norm2", dt).mat("A", Cm).mat("R", [&]{
+            Matrix<T> v(1,1); v(0,0)=T(Cm.norm(NormType::Two)); return v; }());
+        // A Hermitian positive definite matrix, for the Cholesky comparison.
+        Matrix<T> Hp(4, 4);
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++)
+                Hp(i, j) = T(std::sin(i * 3.1 + j)) + T(std::cos(i + 2.7 * j)) * T(0, 1);
+        Matrix<T> Hh = Hp.H() * Hp;
+        for (int i = 0; i < 4; i++) Hh(i, i) += T(4.0);
+        Case("cx_chol", dt).mat("A", Hh).mat("R", Hh.cholesky());
+        Matrix<T> Sm = Cm * 0.125;
+        Case("cx_expm", dt).mat("A", Sm).mat("R", exp(Sm));
+    }
+
+
     Case("elem_ln",    dt).mat("A", P).mat("R", P.ln());
     Case("elem_log10", dt).mat("A", P).mat("R", P.log10());
     Case("elem_pow",   dt, 2.5).mat("A", P).mat("R", P.pow(2.5));
@@ -189,6 +239,46 @@ static void dumpShared(const std::string& dt) {
     Case("norm_fro",   dt).mat("A", A).scalar("R", A.norm(NormType::Fro));
     Case("norm_one",   dt).mat("A", A).scalar("R", A.norm(NormType::One));
     Case("norm_inf",   dt).mat("A", A).scalar("R", A.norm(NormType::Inf));
+    // ── the complex Schur family, cross-checked against SciPy ──
+    // These were real-only until the complex Schur decomposition landed, so an
+    // INDEPENDENT reference matters more here than anywhere else in this file.
+    if constexpr (is_complex<T>::value) {
+        { auto [Ts, Qs] = A.schur();
+          Case("schur_complex", dt).mat("A", A).mat("T", Ts).mat("Q", Qs); }
+        { auto [Hh, Qhh] = A.hess();
+          Case("hess_complex", dt).mat("A", A).mat("H", Hh).mat("Q", Qhh); }
+        { auto [ev, X] = A.eig();
+          Case("eig_complex", dt).mat("A", A).mat("E", ev).mat("X", X); }
+        { Matrix<T> Ap = A;
+          for (long i = 0; i < Ap.rows(); i++) Ap(int(i), int(i)) += T(4.0);
+          Case("sqrtm_complex", dt).mat("A", Ap).mat("R", sqrt(Ap)); }
+        { Matrix<T> Ap = A;
+          for (long i = 0; i < Ap.rows(); i++) Ap(int(i), int(i)) += T(4.0);
+          Case("logm_complex", dt).mat("A", Ap).mat("R", log(Ap, M_E)); }
+        { Matrix<T> Ap = A;
+          for (long i = 0; i < Ap.rows(); i++) Ap(int(i), int(i)) += T(4.0);
+          Case("expm_complex", dt).mat("A", Ap)
+              .mat("R", funm(Ap, [](std::complex<double> z) { return std::exp(z); })); }
+        // QZ on a pencil. B is pushed away from singular so every eigenvalue is
+        // finite and can be compared as a ratio.
+        { Matrix<T> Bp = B;
+          for (long i = 0; i < Bp.rows(); i++) Bp(int(i), int(i)) += T(double(Bp.rows()));
+          auto r = qz(A, Bp);
+          Matrix<T> Bt(Bp.rows(), Bp.cols());
+          for (long i = 0; i < Bp.rows(); i++)
+              for (long j = 0; j < Bp.cols(); j++) Bt(int(i), int(j)) = Bp(int(i), int(j));
+          Matrix<double> re(A.rows(), 1), im(A.rows(), 1);
+          const auto al = r.alpha(), be = r.beta();
+          for (long i = 0; i < A.rows(); i++) {
+              const std::complex<double> lam = al[(std::size_t)i] / be[(std::size_t)i];
+              re(int(i), 0) = lam.real();
+              im(int(i), 0) = lam.imag();
+          }
+          Case("qz_complex", dt).mat("A", A).mat("B", Bt).mat("S", r.S).mat("T", r.T)
+              .mat("Q", r.Q).mat("Z", r.Z).mat("RE", re).mat("IM", im)
+              .mat("X", r.eigenvectors()); }
+    }
+
 }
 
 // ═════════════════════════════════════════════════════════════ real only ──
@@ -228,6 +318,45 @@ static void dumpRealOnly() {
       // Matrix RIGHT division, MATLAB's mrdivide: X / W is the X solving X*W = A.
       // NumPy has no operator for it; the reference is A @ inv(W).
       Case("mrdivide", dt).mat("A", W).mat("B", W).mat("R", (W + W) / W); }
+    // ── Tier 6: convolution, polynomials, calculus, interpolation ──────────
+    { Matrix<double> pa(1, 4), pb(1, 3);
+      pa = {{2, -3, 0, 5}};
+      pb = {{1, 4, -2}};
+      Case("conv",     dt).mat("A", pa).mat("B", pb).mat("R", conv(pa, pb));
+      // A long convolution, so the FFT path is the one being compared.
+      Matrix<double> la(1, 200), lb(1, 200);
+      la.set_Ran_values(-1.0, 1.0, -1001);
+      lb.set_Ran_values(-1.0, 1.0, -1002);
+      Case("conv_fft", dt).mat("A", la).mat("B", lb).mat("R", conv(la, lb));
+      Case("deconv_q", dt).mat("A", conv(pa, pb)).mat("B", pa)
+                          .mat("R", deconv(conv(pa, pb), pa).first);
+      Matrix<double> rt(1, 4); rt = {{1, -2, 3, 0.5}};
+      Case("poly_roots", dt).mat("A", rt).mat("R", poly(rt));
+      Matrix<double> Pm(3, 3);
+      Pm.set_Ran_values(-1.0, 1.0, -1003);
+      Case("poly_charpoly", dt).mat("A", Pm).mat("R", poly(Pm));
+
+      Matrix<double> sy(1, 9), sx(1, 9);
+      sy.set_Ran_values(-2.0, 2.0, -1004);
+      for (int i = 0; i < 9; i++) sx(0, i) = double(i) * 0.5;
+      Case("trapz_unit", dt).mat("A", sy).mat("R", oneByOne(sy.trapz()));
+      Case("trapz_xy",   dt).mat("A", sx).mat("B", sy).mat("R", oneByOne(trapz(sx, sy)));
+      Case("cumtrapz",   dt).mat("A", sy).mat("R", sy.cumtrapz(true));
+      Case("gradient",   dt).mat("A", sy).mat("R", sy.gradient(true));
+      Case("gradient_h", dt).mat("A", sy).mat("R", sy.gradient(true, 0.5));
+
+      Matrix<double> iy(1, 6), ix(1, 6), iq(1, 5);
+      for (int i = 0; i < 6; i++) { ix(0, i) = double(i); iy(0, i) = std::sin(double(i)); }
+      for (int i = 0; i < 5; i++) iq(0, i) = 0.3 + double(i) * 1.1;
+      Case("interp1", dt).mat("A", ix).mat("B", iq).mat("R", interp1(ix, iy, iq));
+
+      Matrix<double> fb(1, 3), fa(1, 3), fx(1, 12);
+      fb = {{0.2, 0.5, 0.3}};
+      fa = {{1.0, -0.4, 0.1}};
+      fx.set_Ran_values(-1.0, 1.0, -1005);
+      Case("filter", dt).mat("A", fx).mat("R", filter(fb, fa, fx));
+    }
+
     // ── Tier 6: the FFT ────────────────────────────────────────────────────
     // Complex results are dumped as separate real and imaginary matrices — the
     // .dat format tags element kind per matrix, so this needs no format change.
@@ -274,6 +403,17 @@ static void dumpRealOnly() {
       Matrix<double> tv(1, 4); tv = {{1, 2, 3, 4}};
       Case("toeplitz",  dt).mat("A", tv).mat("R", toeplitz(tv));
       Case("vander",    dt).mat("A", tv).mat("R", vander(tv));
+    }
+
+    // ── det / LU of a singular matrix ──────────────────────────────────────
+    { Matrix<double> Sg(3, 3);
+      Sg = {{1, 2, 3}, {2, 4, 6}, {1, 1, 1}};            // row 2 = 2 * row 1
+      Case("det_singular", dt).mat("A", Sg).mat("R", oneByOne(Sg.det()));
+      Matrix<double> Zg(3, 3);
+      Case("det_zeros", dt).mat("A", Zg).mat("R", oneByOne(Zg.det()));
+      Matrix<double> Ng(3, 3);
+      Ng = {{2, 0, 1}, {1, 3, 0}, {0, 1, 4}};
+      Case("det_nonsingular", dt).mat("A", Ng).mat("R", oneByOne(Ng.det()));
     }
 
     // ── funm and generalized eigenvalues (tier 4) ──────────────────────────

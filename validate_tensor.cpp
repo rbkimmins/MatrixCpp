@@ -5,6 +5,7 @@
 //
 // Build: g++ -std=c++17 -O2 -fopenmp -o validate_tensor validate_tensor.cpp
 #include "Tensor.hpp"
+#include <fstream>
 #include <iostream>
 #include <iomanip>
 #include <string>
@@ -390,6 +391,148 @@ int main() {
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    section("Printing and file output");
+    {
+        using F = matio::Fmt;
+        Tensor<double> T({2, 2, 3});
+        for (long i = 0; i < T.size(); i++) T[i] = double(i + 1);
+
+        // Rank > 2 has no 2-D layout, so CSV flattens to
+        // (leading axes) x (last axis) and records the shape first — without
+        // that line the flattening could not be undone.
+        const std::string csv = T.str(matio::Opts(F::CSV, 0));
+        ok(csv.substr(0, 17) == "# shape (2, 2, 3)", "rank>2 CSV records the shape");
+        ok(csv.find("1,2,3\n4,5,6\n7,8,9\n10,11,12") != std::string::npos,
+                                           "rank>2 CSV flattens on the last axis");
+
+        // JSON and NumPy NEST instead, so the structure survives without a
+        // separate shape line.
+        ok(T.str(matio::Opts(F::JSON, 0)) ==
+               "[[[1, 2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]]",
+                                           "JSON nests to match the rank");
+        ok(T.str(matio::Opts(F::NumPy, 0)) ==
+               "np.array([[[1, 2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]])",
+                                           "NumPy nests too");
+
+        // A rank-2 tensor is already a table, so no shape line.
+        Tensor<double> M({2, 3});
+        for (long i = 0; i < 6; i++) M[i] = double(i + 1);
+        ok(M.str(matio::Opts(F::CSV, 0)) == "1,2,3\n4,5,6",
+                                           "rank-2 CSV needs no shape line");
+        // ... and it matches what Matrix produces for the same numbers.
+        Matrix<double> Mm(2, 3);
+        for (int i = 0; i < 2; i++)
+            for (int j = 0; j < 3; j++) Mm(i, j) = double(i * 3 + j + 1);
+        ok(M.str(matio::Opts(F::CSV, 0)) == Mm.str(matio::Opts(F::CSV, 0)),
+                                           "tensor and matrix CSV agree exactly");
+
+        std::ostringstream os;
+        T.print(os, matio::Opts(F::JSON, 0));
+        std::string viaStream = os.str();
+        if (!viaStream.empty() && viaStream.back() == '\n') viaStream.pop_back();
+        ok(viaStream == T.str(matio::Opts(F::JSON, 0)),
+                                           "print(stream) and str() agree");
+
+        T.save("/tmp/mcpp_tensor.json");
+        std::ifstream fin("/tmp/mcpp_tensor.json");
+        std::string first;
+        std::getline(fin, first);
+        fin.close();
+        ok(first.substr(0, 3) == "[[[",    "save() picks JSON from the .json extension");
+
+        Tensor<std::complex<double>> C({1, 2});
+        C[0] = std::complex<double>(1, 2);
+        C[1] = std::complex<double>(3, -4);
+        ok(C.str(matio::Opts(F::CSV, 1)) == "1.0+2.0i,3.0-4.0i",
+                                           "complex tensor CSV uses a+bi");
+    }
+
+    section("Element-wise maths, scans and axis reductions (Matrix parity)");
+    {
+        Tensor<double> t({2, 3, 4});
+        for (long i = 0; i < t.size(); i++) t[i] = double(i + 1);
+
+        // ── whole-tensor reductions ──
+        ok(t.prod() == 620448401733239409999872.0, "prod() over every element");
+        ok(std::abs(t.norm() - 70.0) < 1e-12,      "norm() is the Frobenius norm");
+        ok(std::abs(t.var() - 47.9166666666667) < 1e-9,  "var() over every element");
+        ok(std::abs(t.stddev() - std::sqrt(t.var())) < 1e-12,
+                                                   "stddev() is sqrt(var())");
+
+        // ── reductions along one axis, which drops it ──
+        // A tensor has as many axes as dimensions, so the axis is its INDEX —
+        // there is no ROW/COL to name, the way Matrix can.
+        ok(t.prod(1).shape() == std::vector<long>({2, 4}),  "prod(axis) drops that axis");
+        ok(t.min(2).shape()  == std::vector<long>({2, 3}),  "min(axis) drops that axis");
+        ok(t.max(2).shape()  == std::vector<long>({2, 3}),  "max(axis) drops that axis");
+        ok(t.mean(0).shape() == std::vector<long>({3, 4}),  "mean(axis) drops that axis");
+        ok(t.min(2)[0] == 1.0 && t.max(2)[0] == 4.0,        "min/max along the last axis");
+
+        // ── scans, which KEEP the axis ──
+        auto cs = t.cumsum(2);
+        ok(cs.shape() == t.shape(),                "cumsum(axis) keeps the shape");
+        ok(cs[0] == 1 && cs[1] == 3 && cs[2] == 6 && cs[3] == 10,
+                                                   "cumsum runs along the axis, not the buffer");
+        auto cp = t.cumprod(2);
+        ok(cp[0] == 1 && cp[1] == 2 && cp[2] == 6 && cp[3] == 24,
+                                                   "cumprod along the last axis");
+        auto df = t.diff(2);
+        ok(df.shape() == std::vector<long>({2, 3, 3}), "diff(axis) shortens it by one");
+        ok(df[0] == 1 && df[1] == 1 && df[2] == 1, "diff of consecutive integers is 1");
+
+        // A scan on an INTERIOR axis has to permute and permute back; getting
+        // the inverse wrong silently transposes the result.
+        auto cs0 = t.cumsum(0);
+        ok(cs0.shape() == t.shape(),               "cumsum on axis 0 keeps the shape");
+        ok(cs0(0, 0, 0) == t(0, 0, 0) && cs0(1, 0, 0) == t(0, 0, 0) + t(1, 0, 0),
+                                                   "cumsum on axis 0 accumulates down axis 0");
+
+        // ── element-wise maths ──
+        auto sn = t.sin(), ex = t.exp(), ab = t.abs(), sg = t.sign();
+        ok(sn.shape() == t.shape() && std::abs(sn[0] - std::sin(1.0)) < 1e-15,
+                                                   "sin() applies element-wise");
+        ok(std::abs(ex[0] - std::exp(1.0)) < 1e-15, "exp() applies element-wise");
+        ok(ab[0] == 1.0 && sg[0] == 1.0,           "abs() and sign()");
+        ok(std::abs(t.sqrt()[3] - 2.0) < 1e-15,    "sqrt()");
+        ok(std::abs(t.ln().exp()[5] - t[5]) < 1e-12, "exp(ln(x)) round-trips");
+        ok(std::abs(t.pow(2.0)[3] - 16.0) < 1e-12, "pow(2)");
+        ok(std::abs(t.log(10.0)[9] - std::log10(10.0)) < 1e-12, "log(base)");
+        Tensor<double> neg({3});
+        neg[0] = -1.7; neg[1] = 0.0; neg[2] = 2.3;
+        ok(neg.floor()[0] == -2.0 && neg.ceil()[0] == -1.0 && neg.fix()[0] == -1.0,
+                                                   "floor / ceil / fix disagree where they should");
+        ok(neg.sign()[0] == -1.0 && neg.sign()[1] == 0.0 && neg.sign()[2] == 1.0,
+                                                   "sign() of negative, zero and positive");
+
+        // ── the strongest check: agree with Matrix on a 2-D tensor ──
+        // Matrix and Tensor reached these by different routes, so an exact
+        // match is real evidence rather than a shared assumption.
+        Matrix<double> M(3, 4);
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 4; j++) M(i, j) = std::sin(i * 4.0 + j);
+        Tensor<double> T = Tensor<double>::fromMatrix(M);
+        ok((T.sum(1).toMatrix() - M.sum(ROW)).norm() == 0.0,
+                                                   "tensor sum(1) == matrix sum(ROW), exactly");
+        ok((T.cumsum(1).toMatrix() - M.cumsum(ROW)).norm() == 0.0,
+                                                   "tensor cumsum(1) == matrix cumsum(ROW)");
+        ok((T.abs().toMatrix() - M.abs()).norm() == 0.0,
+                                                   "tensor abs() == matrix abs()");
+        ok((T.sin().toMatrix() - M.sin()).norm() == 0.0,
+                                                   "tensor sin() == matrix sin()");
+        ok((T.diff(1).toMatrix() - M.diff(ROW)).norm() == 0.0,
+                                                   "tensor diff(1) == matrix diff(ROW)");
+        ok(std::abs(T.norm() - M.norm()) < 1e-14,  "tensor norm() == matrix norm()");
+
+        // Complex goes through the same paths.
+        Tensor<std::complex<double>> c({2, 3});
+        for (long i = 0; i < c.size(); i++)
+            c[i] = std::complex<double>(double(i + 1), -0.5 * double(i));
+        ok(c.conj()[1] == std::conj(c[1]),         "conj() on a complex tensor");
+        ok(std::abs(c.exp()[2] - std::exp(c[2])) < 1e-13, "exp() on a complex tensor");
+        auto cc = c.cumsum(1);
+        ok(cc[1] == c[0] + c[1],                   "cumsum on a complex tensor");
+    }
+
     section("Quantum gate application — the workload this exists for");
     {
         // A 5-qubit state is a (2,2,2,2,2) tensor. Applying a single-qubit gate

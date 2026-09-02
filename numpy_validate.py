@@ -29,6 +29,8 @@ import numpy as np
 
 try:
     import scipy.linalg as sla
+    import scipy.signal as ssig
+    import scipy.integrate as sint
     HAVE_SCIPY = True
 except ImportError:
     HAVE_SCIPY = False
@@ -128,6 +130,10 @@ def _rref(A, tol=None):
         row += 1
     return R
 
+
+# np.trapz was renamed np.trapezoid in NumPy 2.0. Bind whichever exists.
+_trapz = getattr(np, "trapezoid", None) or np.trapz
+
 DIRECT = {
     "add":            lambda c: c["A"] + c["B"],
     "subtract":       lambda c: c["A"] - c["B"],
@@ -195,6 +201,31 @@ DIRECT = {
     "rank":           lambda c: np.array([[float(np.linalg.matrix_rank(c["A"]))]]),
     "cholesky":       lambda c: np.linalg.cholesky(c["A"]),
     "solve":          lambda c: np.linalg.solve(c["A"], c["B"]),
+    # --- tier 6: convolution, polynomials, calculus, interpolation ---
+    "conv":           lambda c: np.convolve(c["A"].ravel(), c["B"].ravel()).reshape(1, -1),
+    "conv_fft":       lambda c: np.convolve(c["A"].ravel(), c["B"].ravel()).reshape(1, -1),
+    # NumPy's polydiv returns (quotient, remainder) with the same descending
+    # coefficient convention this library uses.
+    "deconv_q":       lambda c: np.polydiv(c["A"].ravel(), c["B"].ravel())[0].reshape(1, -1),
+    "poly_roots":     lambda c: np.poly(c["A"].ravel()).reshape(1, -1),
+    # np.poly of a square matrix is its characteristic polynomial, same rule.
+    "poly_charpoly":  lambda c: np.poly(c["A"]).reshape(1, -1),
+    # np.trapezoid is NumPy 2.0's name for what 1.x calls np.trapz; accept either
+    # so this file does not pin a NumPy version for one reference.
+    "trapz_unit":     lambda c: np.array([[_trapz(c["A"].ravel())]]),
+    "trapz_xy":       lambda c: np.array([[_trapz(c["B"].ravel(), c["A"].ravel())]]),
+    # SciPy's cumulative_trapezoid with initial=0 matches MATLAB's cumtrapz.
+    "cumtrapz":       lambda c: sint.cumulative_trapezoid(
+                          c["A"].ravel(), initial=0).reshape(1, -1),
+    "gradient":       lambda c: np.gradient(c["A"].ravel()).reshape(1, -1),
+    "gradient_h":     lambda c: np.gradient(c["A"].ravel(), 0.5).reshape(1, -1),
+    # np.interp CLAMPS outside the range where ours returns NaN, so the query
+    # points here are all interior and the two agree.
+    "interp1":        lambda c: np.interp(c["B"].ravel(), c["A"].ravel(),
+                          np.sin(c["A"].ravel())).reshape(1, -1),
+    "filter":         lambda c: ssig.lfilter([0.2, 0.5, 0.3], [1.0, -0.4, 0.1],
+                          c["A"].ravel()).reshape(1, -1),
+
     # --- tier 6: the FFT ---
     # NumPy puts the whole 1/n on ifft and none on fft, same as MATLAB, which is
     # why these references are one-liners rather than rescalings.
@@ -231,6 +262,30 @@ DIRECT = {
     "toeplitz":       lambda c: sla.toeplitz(c["A"].ravel()),
     # NumPy's vander is ascending by default; ours is descending, like polyval.
     "vander":         lambda c: np.vander(c["A"].ravel(), increasing=False),
+
+    # --- least squares with Q left implicit ---
+    "lstsq_tall":     lambda c: np.linalg.lstsq(c["A"], c["B"], rcond=None)[0],
+    "rank_tall":      lambda c: np.array([[float(np.linalg.matrix_rank(c["A"]))]]),
+
+    # --- complex linear algebra (work_t) ---
+    "cx_inverse":     lambda c: np.linalg.inv(c["A"]),
+    "cx_det":         lambda c: np.array([[np.linalg.det(c["A"])]]),
+    "cx_solve":       lambda c: np.linalg.solve(c["A"], c["B"]),
+    "cx_pinv":        lambda c: np.linalg.pinv(c["A"]),
+    # Singular values are unique where U and V are not, so they compare directly.
+    "cx_svdvals":     lambda c: np.linalg.svd(c["A"], compute_uv=False).reshape(-1, 1),
+    "cx_norm2":       lambda c: np.array([[np.linalg.norm(c["A"], 2)]]),
+    # NumPy's cholesky returns the LOWER factor with A == L @ L.conj().T, same
+    # convention as ours.
+    "cx_chol":        lambda c: np.linalg.cholesky(c["A"]),
+    "cx_expm":        lambda c: sla.expm(c["A"]),
+
+    # --- det / LU of a singular matrix ---
+    # NumPy returns 0.0 for a singular determinant rather than raising, which is
+    # the behaviour these cases pin down.
+    "det_singular":    lambda c: np.array([[np.linalg.det(c["A"])]]),
+    "det_zeros":       lambda c: np.array([[np.linalg.det(c["A"])]]),
+    "det_nonsingular": lambda c: np.array([[np.linalg.det(c["A"])]]),
 
     # --- funm and generalized eigenvalues (tier 4) ---
     "funm_exp":       lambda c: sla.expm(c["A"]),
@@ -406,9 +461,125 @@ def check_eigvals(c, name):
     report(f"{name}  eigenvalues (complex) match numpy", ok, d)
 
 
+def check_schur_complex(c, name):
+    A, T, Q = c["A"], c["T"], c["Q"]
+    # A complex Schur form is not unique (any eigenvalue ordering is valid), so
+    # the DEFINING properties are what to check, plus agreement with SciPy on
+    # the eigenvalue multiset.
+    ok, d = close(Q @ T @ Q.conj().T, A)
+    report(f"{name}  A == Q T Q^H", ok, d)
+    ok, d = close(Q.conj().T @ Q, np.eye(A.shape[0]))
+    report(f"{name}  Q unitary", ok, d)
+    report(f"{name}  T upper triangular", np.allclose(np.tril(T, -1), 0), "")
+    if HAVE_SCIPY:
+        key = lambda z: (round(z.real, 8), round(z.imag, 8))
+        mine = sorted(np.diag(T), key=key)
+        theirs = sorted(sla.schur(A, output="complex")[0].diagonal(), key=key)
+        ok, d = close(np.array(mine), np.array(theirs))
+        report(f"{name}  eigenvalues match scipy.linalg.schur", ok, d)
+
+
+def check_hess_complex(c, name):
+    A, H, Q = c["A"], c["H"], c["Q"]
+    ok, d = close(Q @ H @ Q.conj().T, A)
+    report(f"{name}  A == Q H Q^H", ok, d)
+    report(f"{name}  H is Hessenberg", np.allclose(np.tril(H, -2), 0), "")
+    if HAVE_SCIPY:
+        # The reduction is unique only up to phase, so compare the invariant:
+        # |subdiagonal|, which any correct Hessenberg reduction reproduces.
+        theirs = sla.hessenberg(A)
+        ok, d = close(np.abs(np.diag(H, -1)), np.abs(np.diag(theirs, -1)))
+        report(f"{name}  |subdiagonal| matches scipy.linalg.hessenberg", ok, d)
+
+
+def check_eig_complex(c, name):
+    A, E, X = c["A"], c["E"].ravel(), c["X"]
+    res = max(np.linalg.norm(A @ X[:, k] - E[k] * X[:, k]) for k in range(len(E)))
+    report(f"{name}  A x == lambda x for every column", res < 1e-8, f"max resid {res:.2e}")
+    key = lambda z: (round(z.real, 8), round(z.imag, 8))
+    ok, d = close(np.array(sorted(E, key=key)),
+                  np.array(sorted(np.linalg.eigvals(A), key=key)))
+    report(f"{name}  eigenvalues match numpy", ok, d)
+
+
+def check_qz(c, name):
+    A, B, S, T, Q, Z = c["A"], c["B"], c["S"], c["T"], c["Q"], c["Z"]
+    mine = c["RE"].ravel() + 1j * c["IM"].ravel()
+    # The generalized Schur form is not unique (any eigenvalue ordering is a
+    # valid one), so the DEFINING properties are what to check, and SciPy is
+    # asked only for the eigenvalue multiset.
+    ok, d = close(Q @ S @ Z.conj().T, A)
+    report(f"{name}  A == Q S Z^H", ok, d)
+    ok, d = close(Q @ T @ Z.conj().T, B)
+    report(f"{name}  B == Q T Z^H", ok, d)
+    n = A.shape[0]
+    ok, d = close(Q.conj().T @ Q, np.eye(n))
+    report(f"{name}  Q unitary", ok, d)
+    ok, d = close(Z.conj().T @ Z, np.eye(n))
+    report(f"{name}  Z unitary", ok, d)
+    report(f"{name}  S upper triangular", np.allclose(np.tril(S, -1), 0), "")
+    report(f"{name}  T upper triangular", np.allclose(np.tril(T, -1), 0), "")
+    # Eigenvectors are checked in the HOMOGENEOUS form beta*A*x == alpha*B*x,
+    # which stays finite when beta is zero. They are not compared to scipy's
+    # directly: an eigenvector is only defined up to a scalar.
+    X = c["X"]
+    al, be = np.diag(S), np.diag(T)
+    res = max(np.linalg.norm(be[k] * (A @ X[:, k]) - al[k] * (B @ X[:, k]))
+              for k in range(n))
+    report(f"{name}  beta*A*x == alpha*B*x for every column", res < 1e-8, f"max resid {res:.2e}")
+    if HAVE_SCIPY:
+        theirs = sla.eig(A, B, right=False)
+        key = lambda z: (round(z.real, 6), round(z.imag, 6))
+        m = np.array(sorted(mine, key=key))
+        t = np.array(sorted(theirs, key=key))
+        d = float(np.max(np.abs(m - t) / np.maximum(np.abs(t), 1.0)))
+        report(f"{name}  eigenvalues match scipy.linalg.eig(A,B)", d < 1e-8, f"relative {d:.2e}")
+        # And as (alpha,beta) pairs on the Riemann sphere — the scale-invariant
+        # comparison, and the only one that can compare an INFINITE eigenvalue.
+        sa, sb = sla.eig(A, B, right=False, homogeneous_eigvals=True)
+        def chord(p, q):
+            return abs(p[0] * q[1] - p[1] * q[0]) / (
+                np.sqrt(abs(p[0]) ** 2 + abs(p[1]) ** 2) *
+                np.sqrt(abs(q[0]) ** 2 + abs(q[1]) ** 2))
+        theirs_p = list(zip(sa, sb))
+        used = [False] * n
+        worst = 0.0
+        for p in zip(al, be):
+            best, bj = 9e9, -1
+            for j, q in enumerate(theirs_p):
+                if used[j]:
+                    continue
+                dd = chord(p, q)
+                if dd < best:
+                    best, bj = dd, j
+            used[bj] = True
+            worst = max(worst, best)
+        report(f"{name}  (alpha,beta) match scipy on the Riemann sphere", worst < 1e-8,
+               f"chordal {worst:.2e}")
+
+
+def _scipy_fn(name_, fn):
+    def check(c, cname):
+        if not HAVE_SCIPY:
+            global skipped
+            skipped += 1
+            print(f"  {YELLOW}SKIP{OFF}  {cname}  (scipy missing)")
+            return
+        ok, d = close(c["R"], fn(c["A"]))
+        report(f"{cname}  matches scipy.linalg.{name_}", ok, d)
+    return check
+
+
 FACTORISATIONS = {
     "lu": check_lu, "qr": check_qr, "svd": check_svd,
     "eig_symmetric": check_eig_sym, "eigvals": check_eigvals,
+    "schur_complex": check_schur_complex,
+    "hess_complex": check_hess_complex,
+    "eig_complex": check_eig_complex,
+    "sqrtm_complex": _scipy_fn("sqrtm", lambda A: sla.sqrtm(A)),
+    "logm_complex": _scipy_fn("logm", lambda A: sla.logm(A)),
+    "expm_complex": _scipy_fn("expm", lambda A: sla.expm(A)),
+    "qz_complex": check_qz,
 }
 
 
