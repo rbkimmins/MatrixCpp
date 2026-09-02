@@ -3132,8 +3132,9 @@ class Matrix {
     // downdating, which is pure overhead when the caller does not need the
     // rank-revealing property. P comes back as the identity.
     //
-    // NOT BLOCKED, and that is a measured decision rather than an omission —
-    // see the QR notes in the roadmap at the foot of this file.
+    // NOT BLOCKED AND NOT RECURSIVE, and that is a measured decision rather
+    // than an omission. Both level-3 variants were implemented and both lost by
+    // about 2x — see the QR section of docs/DESIGN_NOTES.md for the numbers.
     QRFactored qrFactorUnpivoted() const {
         using W = work_t<datatype>;
         auto cj = [](const W& v) {
@@ -3621,46 +3622,112 @@ class Matrix {
                 if constexpr (is_complex<datatype>::value) return std::conj(v);
                 else return v;
             };
-            for (long i = 0; i < n; i++) {
-                W* MATRIXCPP_RESTRICT Li = Lg + i * n;
-                for (long j = 0; j < i; j++) {
-                    const W* MATRIXCPP_RESTRICT Lj = Lg + j * n;
-                    W a0 = W(0), a1 = W(0), a2 = W(0), a3 = W(0);
-                    long k = 0;
-                    for (; k + 3 < j; k += 4) {
-                        a0 += Li[k] * cj(Lj[k]);
-                        a1 += Li[k + 1] * cj(Lj[k + 1]);
-                        a2 += Li[k + 2] * cj(Lj[k + 2]);
-                        a3 += Li[k + 3] * cj(Lj[k + 3]);
+            // ── BLOCKED right-looking Cholesky — LAPACK's dpotrf ────────────
+            //
+            // The unblocked version this replaced built row i from dot products
+            // of two completed rows — well suited to row-major, carefully
+            // written with four accumulator chains, and still only 4% of what
+            // the multiply kernel can do, because a dot product is level 2 and
+            // there is nothing to be done about that.
+            //
+            // Blocking splits it three ways: an unblocked factorisation of a
+            // small diagonal block, a triangular solve for the panel below it,
+            // and the trailing update as ONE GEMM. Like LU and unlike QR, this
+            // costs no extra arithmetic — there is no T matrix to build.
+            //
+            // The trailing update is mathematically a SYRK, A22 -= L21 L21^H,
+            // which only needs the lower triangle and so is half the work. It
+            // is done here as a full GEMM and only the lower half is subtracted:
+            // twice the arithmetic, at more than twenty times the rate.
+            for (long i = 0; i < n; i++)          // seed with the lower triangle of A
+                for (long j = 0; j <= i; j++) Lg[i * n + j] = W(grid[i * n + j]);
+
+            constexpr int NB = 64;
+            std::vector<W> L21H, Tt;
+            for (int j0 = 0; j0 < n; j0 += NB) {
+                const int jb = std::min(NB, (int)n - j0);
+
+                // ── 1. Unblocked Cholesky on the jb x jb diagonal block ──
+                // Every earlier block's contribution has already been
+                // subtracted by step 3, so only this block's own history
+                // matters here.
+                for (int i = j0; i < j0 + jb; i++) {
+                    W* MATRIXCPP_RESTRICT Li = Lg + (std::size_t)i * n;
+                    for (int c = j0; c < i; c++) {
+                        const W* MATRIXCPP_RESTRICT Lc = Lg + (std::size_t)c * n;
+                        W a0 = W(0), a1 = W(0);
+                        int k = j0;
+                        for (; k + 1 < c; k += 2) {
+                            a0 += Li[k] * cj(Lc[k]);
+                            a1 += Li[k + 1] * cj(Lc[k + 1]);
+                        }
+                        for (; k < c; k++) a0 += Li[k] * cj(Lc[k]);
+                        // L(c,c) is real and positive, so conj(L(c,c)) is itself.
+                        Li[c] = (Li[c] - (a0 + a1)) / Lc[c];
                     }
-                    for (; k < j; k++) a0 += Li[k] * cj(Lj[k]);
-                    const W acc = W(grid[i * n + j]) - ((a0 + a1) + (a2 + a3));
-                    // L(j,j) is real and positive, so conj(L(j,j)) == L(j,j) and
-                    // this division needs no special case.
-                    Li[j] = acc / Lj[j];
+                    // The diagonal accumulates |L(i,k)|^2, which is REAL however
+                    // complex the entries are — that is exactly why a Hermitian
+                    // matrix has real pivots and a merely symmetric complex one
+                    // does not.
+                    double d0 = 0.0, d1 = 0.0;
+                    int k = j0;
+                    for (; k + 1 < i; k += 2) {
+                        d0 += magnitudeSq(Li[k]);
+                        d1 += magnitudeSq(Li[k + 1]);
+                    }
+                    for (; k < i; k++) d0 += magnitudeSq(Li[k]);
+                    const double piv = double(std::real(Li[i])) - (d0 + d1);
+                    // A non-positive pivot IS the proof that A is not positive
+                    // definite — this failure is the standard PD test.
+                    if (piv <= 0.0)
+                        throw std::domain_error(
+                            "cholesky: matrix is not positive definite — non-positive pivot " +
+                            std::to_string(piv) + " at index " + std::to_string(i));
+                    Li[i] = W(std::sqrt(piv));
                 }
-                // The diagonal accumulates |L(i,k)|^2, which is REAL however
-                // complex the entries are — that is exactly why a Hermitian
-                // matrix has real pivots and a merely symmetric complex one
-                // does not.
-                double d0 = 0.0, d1 = 0.0, d2 = 0.0, d3 = 0.0;
-                long k = 0;
-                for (; k + 3 < i; k += 4) {
-                    d0 += magnitudeSq(Li[k]);
-                    d1 += magnitudeSq(Li[k + 1]);
-                    d2 += magnitudeSq(Li[k + 2]);
-                    d3 += magnitudeSq(Li[k + 3]);
+
+                const int rows = (int)n - (j0 + jb);
+                if (rows <= 0) continue;
+
+                // ── 2. Panel solve: L21 = A21 * L11^-H ──
+                // Each row is independent and contiguous, so this parallelises
+                // cleanly over rows.
+#ifdef _OPENMP
+                #pragma omp parallel for schedule(static) if ((long)rows * jb * jb >= 32768)
+#endif
+                for (int i = 0; i < rows; i++) {
+                    W* MATRIXCPP_RESTRICT Ri = Lg + (std::size_t)(j0 + jb + i) * n;
+                    for (int c = 0; c < jb; c++) {
+                        const W* MATRIXCPP_RESTRICT Lc = Lg + (std::size_t)(j0 + c) * n;
+                        W acc = Ri[j0 + c];
+                        for (int q = 0; q < c; q++) acc -= Ri[j0 + q] * cj(Lc[j0 + q]);
+                        Ri[j0 + c] = acc / Lc[j0 + c];
+                    }
                 }
-                for (; k < i; k++) d0 += magnitudeSq(Li[k]);
-                const double piv =
-                    double(std::real(grid[i * n + i])) - ((d0 + d1) + (d2 + d3));
-                // A non-positive pivot IS the proof that A is not positive
-                // definite — this failure is the standard PD test.
-                if (piv <= 0.0)
-                    throw std::domain_error(
-                        "cholesky: matrix is not positive definite — non-positive pivot " +
-                        std::to_string(piv) + " at index " + std::to_string(i));
-                Li[i] = W(std::sqrt(piv));
+
+                // ── 3. Trailing update as one GEMM: A22 -= L21 * L21^H ──
+                L21H.assign((std::size_t)jb * rows, W(0));
+                for (int q = 0; q < jb; q++)
+                    for (int c = 0; c < rows; c++)
+                        L21H[(std::size_t)q * rows + c] = cj(Lg[(std::size_t)(j0 + jb + c) * n + j0 + q]);
+                Tt.resize((std::size_t)rows * rows);
+                // L21 is already contiguous in row-major: row i is
+                // Lg[(j0+jb+i)*n + j0 .. j0+jb-1]. Pack it so the GEMM sees a
+                // dense operand.
+                std::vector<W> L21((std::size_t)rows * jb);
+                for (int i = 0; i < rows; i++) {
+                    const W* MATRIXCPP_RESTRICT src = Lg + (std::size_t)(j0 + jb + i) * n + j0;
+                    std::copy(src, src + jb, L21.begin() + (std::size_t)i * jb);
+                }
+                mstore::gemm(L21.data(), L21H.data(), Tt.data(), rows, rows, jb);
+#ifdef _OPENMP
+                #pragma omp parallel for schedule(static) if ((long)rows * rows >= 32768)
+#endif
+                for (int i = 0; i < rows; i++) {
+                    W* MATRIXCPP_RESTRICT dst = Lg + (std::size_t)(j0 + jb + i) * n + j0 + jb;
+                    const W* MATRIXCPP_RESTRICT src = Tt.data() + (std::size_t)i * rows;
+                    for (int c = 0; c <= i; c++) dst[c] -= src[c];   // lower triangle only
+                }
             }
             return L;
         } catch (const std::exception& e) {
@@ -5407,48 +5474,162 @@ class Matrix {
                                         std::to_string(rowSize) + "x" + std::to_string(colSize));
 
         int n = (int)rowSize;
-        std::vector<W> packed((std::size_t)(n * n));
-        for (int k = 0; k < n * n; k++) packed[(std::size_t)k] = W(grid[k]);
 
-        auto pat = [&](int i, int j) -> W& { return packed[(std::size_t)(i * n + j)]; };
+        // ── BLOCKED right-looking LU — LAPACK's dgetrf ──────────────────────
+        //
+        // Two decisions, both measured.
+        //
+        // BLOCKED, because unlike QR it costs nothing extra. QR's compact-WY
+        // form needs a T matrix — a Gram product plus triangular multiplies,
+        // about 40% more arithmetic — which is why blocking lost there twice.
+        // LU's blocked update is the SAME arithmetic regrouped, so the GEMM is
+        // pure profit.
+        //
+        // COLUMN-MAJOR internally, which is the bigger win. Every operation in
+        // the panel runs DOWN a column: the pivot search, the scaling, the
+        // rank-1 update. In row-major storage each of those walks a fresh cache
+        // line per element. Profiling the row-major version put 21% of the
+        // whole factorisation in the column scaling alone and another 29% in
+        // packing. Held column-major, all five inner loops — search, scale,
+        // update, both GEMM packs and the subtract — are contiguous, and only
+        // the row swaps are strided, which is O(n^2) against O(n^3) of work.
+        // The trailing update is formed transposed for the same reason:
+        //     A22^T -= U12^T * L21^T
+        // reads both operands as contiguous runs.
+        //
+        // The PIVOT SEQUENCE IS UNCHANGED from the unblocked version: a pivot
+        // is still chosen after every previous update has landed, so the same
+        // rows are picked in the same order and det() keeps its sign.
+        // Both transposes are TILED. Done naively they stride one cache line
+        // per element in one direction or the other, and at n=2048 the two of
+        // them plus the zero-filling of buffers that are about to be
+        // overwritten were 94 ms of a 152 ms det() — 62% of the call spent
+        // outside the factorisation. A 32x32 tile fits comfortably in L1 and
+        // makes both the read and the write side sequential.
+        constexpr int TT = 32;
+        mstore::RawBuf<W> wbuf((long)n * n);   // no zero-fill: fully overwritten
+        W* MATRIXCPP_RESTRICT w = wbuf.get();
+        for (int i0 = 0; i0 < n; i0 += TT)
+            for (int c0 = 0; c0 < n; c0 += TT) {
+                const int iE = std::min(i0 + TT, n), cE = std::min(c0 + TT, n);
+                for (int i = i0; i < iE; i++)
+                    for (int c = c0; c < cE; c++)
+                        w[(std::size_t)c * n + i] = W(grid[(std::size_t)i * n + c]);
+            }
+        auto at = [&](int i, int c) -> W& { return w[(std::size_t)c * n + i]; };
 
         std::vector<int> pivotVec(n);
-        for (int i = 0; i < n; i++)
-            pivotVec[i] = i;
+        for (int i = 0; i < n; i++) pivotVec[i] = i;
 
-        for (int k = 0; k < n; k++) {
-            // Pivot on MAGNITUDE, which is what partial pivoting means for a
-            // complex matrix too — |z| is real whatever z is.
-            int maxRow = k;
-            double maxVal = magnitude(pat(k, k));
-            for (int i = k + 1; i < n; i++) {
-                double v = magnitude(pat(i, k));
-                if (v > maxVal) {
-                    maxVal = v;
-                    maxRow = i;
+        constexpr int NB = 64;
+        // Allocated ONCE. Re-assigning per block cost 29% of the factorisation
+        // — not the copying, the ZERO-FILL: std::vector::assign
+        // value-initialises and then mstore::gemm zeroes its output again on
+        // entry, two redundant passes over a buffer about to be overwritten.
+        std::vector<W> Lt((std::size_t)NB * n), Ut((std::size_t)n * NB),
+            L11((std::size_t)NB * NB);
+        mstore::RawBuf<W> Tbuf((long)n * n);   // gemm overwrites it; do not pay to zero it
+        W* MATRIXCPP_RESTRICT Tt = Tbuf.get();
+
+        for (int j = 0; j < n; j += NB) {
+            const int jb = std::min(NB, n - j);
+
+            // ── 1. Factor the panel: rows j..n-1, columns j..j+jb-1 ──
+            for (int k = j; k < j + jb; k++) {
+                // Pivot on MAGNITUDE — that is what partial pivoting means for
+                // a complex matrix too, since |z| is real whatever z is. The
+                // scan is now one contiguous run.
+                const W* MATRIXCPP_RESTRICT colk = &at(0, k);
+                int maxRow = k;
+                double maxVal = magnitude(colk[k]);
+                for (int i = k + 1; i < n; i++) {
+                    const double v = magnitude(colk[i]);
+                    if (v > maxVal) { maxVal = v; maxRow = i; }
+                }
+                if (maxVal == 0.0) {
+                    if (throwIfSingular)
+                        throw std::runtime_error("LU: zero pivot in column " +
+                                                 std::to_string(k) + " — matrix is singular");
+                    // Everything at or below (k,k) is already zero: nothing to
+                    // eliminate, nothing to divide by. U(k,k) stays 0, which is
+                    // what makes det() come out 0.
+                    pivotVec[k] = k;
+                    continue;
+                }
+                if (maxRow != k)
+                    for (int c = 0; c < n; c++) std::swap(at(k, c), at(maxRow, c));
+                pivotVec[k] = maxRow;
+
+                // Scale and update the rest of the panel. Both run down
+                // columns, so both are contiguous.
+                W* MATRIXCPP_RESTRICT ck = &at(0, k);
+                const W piv = ck[k];
+                for (int i = k + 1; i < n; i++) ck[i] /= piv;
+                const int pEnd = j + jb;
+                for (int c = k + 1; c < pEnd; c++) {
+                    W* MATRIXCPP_RESTRICT cc = &at(0, c);
+                    const W ukc = cc[k];
+                    if (ukc == W(0)) continue;
+                    for (int i = k + 1; i < n; i++) cc[i] -= ck[i] * ukc;
                 }
             }
-            if (maxVal == 0.0) {
-                if (throwIfSingular)
-                    throw std::runtime_error("LU: zero pivot in column " + std::to_string(k) +
-                                             " — matrix is singular");
-                // Everything at or below (k,k) in this column is already zero,
-                // so there is nothing to eliminate and nothing to divide by:
-                // record no swap and move on. U(k,k) is left at 0, which is
-                // exactly what makes det() come out 0.
-                pivotVec[k] = k;
-                continue;
+
+            const int rest = n - (j + jb);
+            if (rest <= 0) continue;
+            const int rows = rest;
+
+            // ── 2. Triangular solve: U12 = L11^-1 * A12 ──
+            // L11 is jb x jb and unit lower triangular; packed row-major once
+            // so the solve reads it from cache rather than striding.
+            for (int r = 0; r < jb; r++)
+                for (int q = 0; q < jb; q++) L11[(std::size_t)r * jb + q] = at(j + r, j + q);
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) if ((long)jb * jb * rest >= 32768)
+#endif
+            for (int c = 0; c < rest; c++) {
+                W* MATRIXCPP_RESTRICT col = &at(0, j + jb + c);
+                for (int r = 1; r < jb; r++) {
+                    W acc = col[j + r];
+                    const W* MATRIXCPP_RESTRICT lr = L11.data() + (std::size_t)r * jb;
+                    for (int q = 0; q < r; q++) acc -= lr[q] * col[j + q];
+                    col[j + r] = acc;
+                }
             }
-            if (maxRow != k)
-                for (int j = 0; j < n; j++)
-                    std::swap(pat(k, j), pat(maxRow, j));
-            pivotVec[k] = maxRow;
-            for (int i = k + 1; i < n; i++)
-                pat(i, k) /= pat(k, k);
-            for (int i = k + 1; i < n; i++)
-                for (int j = k + 1; j < n; j++)
-                    pat(i, j) -= pat(i, k) * pat(k, j);
+
+            // ── 3. The trailing update as ONE GEMM, formed transposed ──
+            //   A22^T -= U12^T * L21^T
+            // U12^T is (rest x jb): row c is columns j..j+jb-1 of trailing
+            // column c — contiguous. L21^T is (jb x rows): row q is rows
+            // j+jb..n-1 of panel column q — contiguous. Both packs are plain
+            // copies, which is the point of holding the matrix this way.
+            for (int c = 0; c < rest; c++) {
+                const W* MATRIXCPP_RESTRICT src = &at(j, j + jb + c);
+                std::copy(src, src + jb, Ut.begin() + (std::size_t)c * jb);
+            }
+            for (int q = 0; q < jb; q++) {
+                const W* MATRIXCPP_RESTRICT src = &at(j + jb, j + q);
+                std::copy(src, src + rows, Lt.begin() + (std::size_t)q * rows);
+            }
+            mstore::gemm(Ut.data(), Lt.data(), Tt, rest, rows, jb);
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) if ((long)rows * rest >= 32768)
+#endif
+            for (int c = 0; c < rest; c++) {
+                W* MATRIXCPP_RESTRICT dst = &at(j + jb, j + jb + c);
+                const W* MATRIXCPP_RESTRICT src = Tt + (std::size_t)c * rows;
+                for (int i = 0; i < rows; i++) dst[i] -= src[i];
+            }
         }
+
+        // Back to row-major for luSubstitute and the other consumers.
+        std::vector<W> packed((std::size_t)n * n);
+        for (int i0 = 0; i0 < n; i0 += TT)
+            for (int c0 = 0; c0 < n; c0 += TT) {
+                const int iE = std::min(i0 + TT, n), cE = std::min(c0 + TT, n);
+                for (int i = i0; i < iE; i++)
+                    for (int c = c0; c < cE; c++)
+                        packed[(std::size_t)i * n + c] = w[(std::size_t)c * n + i];
+            }
         return {packed, pivotVec};
     }
 

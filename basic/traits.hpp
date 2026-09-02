@@ -12,6 +12,9 @@
 // it, or this header alone if that is genuinely all you need.
 
 #include "constants.hpp"
+#include <array>
+#include <chrono>
+#include <functional>
 
 template <class T>
 struct is_complex : std::false_type {};
@@ -304,6 +307,7 @@ enum class QRMode { Complete, Reduced };
 // LAPACK ships these as two routines and so does Eigen (HouseholderQR is
 // blocked, ColPivHouseholderQR is not), for exactly this reason.
 enum class QRPivot { On, Off };
+
 
 
 // Controls how the Taylor-series matrix functions evaluate their series.

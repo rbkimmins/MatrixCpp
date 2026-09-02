@@ -1,27 +1,35 @@
-// ════════════════════════════════════════════════════════════════════════════
-#include <memory>
+// ══════════════════════════════════════════════════════════════════════════
 //  MatrixCpp benchmark harness — real and complex
 //
 //  Times every operation the library supports, for BOTH Matrix<double> and
-//  Matrix<complex<double>>, and writes one CSV per (dtype, operation) into
-//  bench/.  NumpyRunningtime.py runs the identical operation set through NumPy
-//  and writes matching CSVs; plot_running_time.jl and the plotting half of
-//  NumpyRunningtime.py then draw the comparison.
+//  Matrix<complex<double>>, and DRAWS THE RESULTS ITSELF using the plotting
+//  package. No Julia, no matplotlib, no intermediate file to hand to another
+//  language.
 //
-//  Output contract — keep these in step with the Python and Julia scripts:
+//  It also writes one CSV per (dtype, operation) into bench/. Those exist for
+//  ONE reason: numpy_timings.py reads them to learn which operations and which
+//  sizes to time, and writes its own alongside. A cross-language comparison has
+//  to persist data somewhere; a single-language plot does not, and no longer
+//  does.
+//
 //      bench/cpp_<dtype>_<op>.csv      dtype in {real, complex}
 //      columns: size,time_seconds
 //
-//  Build:
-//      g++ -std=c++17 -O3 -march=native -fopenmp -o Running_time
-//      Running_time.cpp
-//      ./Running_time
+//  Build and run from the REPO ROOT:
+//      g++ -std=c++17 -O3 -march=native -fopenmp -I. \
+//          benchmarks/running_time.cpp -o running_time
+//      ./running_time
+//
+//  Writes benchmarks/plots/speed_<dtype>_<group>.png.
 //
 //  Note on -ffast-math: it is deliberately NOT in the line above. It implies
 //  -fcx-limited-range, which changes how complex multiply and divide are
 //  evaluated, so complex timings taken with it are not comparable to NumPy's.
-// ════════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════
+#include "plotting/MatrixPlot.hpp"
+
 #include <chrono>
+#include <set>
 #include <cmath>
 #include <complex>
 #include <fstream>
@@ -183,6 +191,34 @@ static double timeBest(F&& f) {
 
 static int written = 0;
 
+// Every timed series is kept so the run can plot itself at the end. The CSV is
+// still written, but only because numpy_timings.py needs it to match sizes.
+struct Series {
+  string dtype, op, group;
+  vector<double> n, t;
+};
+static vector<Series> results;
+
+// The group an operation belongs to, from its name. Deriving it here rather
+// than passing it at each of the fifty-odd call sites keeps the benchmark list
+// readable and means a new operation lands in the right figure automatically.
+static string groupOf(const string& op) {
+  auto has = [&](const char* s) { return op.find(s) != string::npos; };
+  if (has("lu") || has("qr") || has("svd") || has("eig") || has("det") ||
+      has("inverse") || has("cholesky") || has("schur") || has("solve") ||
+      has("rank") || has("pinv"))
+    return "factorisations";
+  if (has("mat_pow") || has("expm") || has("logm") || has("sqrtm") || has("funm"))
+    return "matrix_functions";
+  if (has("sum") || has("trace") || has("norm") || has("mean") || has("min") ||
+      has("max") || has("prod"))
+    return "reductions";
+  if (has("transpose") || has("concat") || has("isdiagonal") || has("conj") ||
+      has("diag") || has("reshape"))
+    return "structure";
+  return "elementwise";
+}
+
 // Runs one operation across its size range and writes
 // bench/cpp_<dtype>_<op>.csv. `body` receives the size and returns the callable
 // to be timed.
@@ -192,11 +228,19 @@ static void bench(const string& dtype, const string& op, long nMax,
   ofstream out(path);
   out << "size,time_seconds\n";
   out.precision(12);
+  Series s;
+  s.dtype = dtype;
+  s.op = op;
+  s.group = groupOf(op);
   for (long n : logspace(nMax, POINTS)) {
     auto fn = setup(n);
-    out << n << "," << timeBest(fn) << "\n";
+    const double secs = timeBest(fn);
+    out << n << "," << secs << "\n";
+    s.n.push_back(double(n));
+    s.t.push_back(secs * 1e3);   // milliseconds read better on a plot
   }
   out.flush();
+  results.push_back(std::move(s));
   cout << "  " << path << "\n";
   written++;
 }
@@ -568,8 +612,47 @@ int main() {
   auto t1 = high_resolution_clock::now();
 
   cout << "\n"
-       << written << " file(s) written in " << duration<double>(t1 - t0).count()
-       << " s\n"
-       << "Next: python3 NumpyRunningtime.py   (runs NumPy, then plots)\n";
+       << written << " series timed in " << duration<double>(t1 - t0).count() << " s\n";
+
+  // ── Draw the results ──────────────────────────────────────────────────
+  // One figure per (dtype, group), every operation in that group overlaid on
+  // log-log axes. Fifty-odd separate figures would be a minute of Julia
+  // startup and nothing anyone would look at; grouped, the shape of each
+  // family is visible at a glance and a curve that bends the wrong way stands
+  // out.
+  if (system("mkdir -p benchmarks/plots") != 0) {
+    cerr << "could not create benchmarks/plots/\n";
+    return 1;
+  }
+  cout << "\nplotting -> benchmarks/plots/\n";
+  std::set<string> seen;
+  for (const Series& s : results) seen.insert(s.dtype + "|" + s.group);
+  for (const string& key : seen) {
+    const size_t bar = key.find('|');
+    const string dt = key.substr(0, bar), grp = key.substr(bar + 1);
+    plt::figure();
+    int drawn = 0;
+    for (const Series& s : results) {
+      if (s.dtype != dt || s.group != grp || s.n.empty()) continue;
+      plt::plot(s.n, s.t, s.op);
+      drawn++;
+    }
+    if (drawn == 0) continue;
+    plt::set("xscale", ":log10");
+    plt::set("yscale", ":log10");
+    plt::title(dt + " — " + grp + " (" + std::to_string(drawn) + " operations)");
+    plt::xlabel("n");
+    plt::ylabel("time (ms)");
+    plt::margin(6.0);
+    plt::legend(":outerright");
+    plt::size(1000, 600);
+    const string out = "benchmarks/plots/speed_" + dt + "_" + grp + ".png";
+    plt::save(out);
+    cout << "  " << out << "  (" << drawn << " ops)\n";
+  }
+
+  cout << "\nFor the NumPy comparison:\n"
+       << "  python3 benchmarks/numpy_timings.py    # times NumPy into bench/\n"
+       << "  ./plot_comparison                      # draws C++ vs NumPy\n";
   return 0;
 }

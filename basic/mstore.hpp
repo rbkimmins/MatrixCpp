@@ -109,6 +109,23 @@ namespace mstore {
             delete[] p;
     }
 
+    // RAII around rawAlloc, for a scratch buffer the caller is about to
+    // overwrite completely. std::vector value-initialises, and zeroing a buffer
+    // that is then written in full is pure waste — measured at tens of
+    // milliseconds inside a single LU.
+    template <class T>
+    class RawBuf {
+      public:
+        explicit RawBuf(long n) : p_(rawAlloc<T>(n)) {}
+        ~RawBuf() { rawFree(p_); }
+        RawBuf(const RawBuf&) = delete;
+        RawBuf& operator=(const RawBuf&) = delete;
+        T* get() const { return p_; }
+
+      private:
+        T* p_;
+    };
+
     // Below this much work (multiply-accumulate count) a product runs serially: the
     // parallel region costs more to set up than it saves.
     inline constexpr long PARALLEL_MIN_WORK = 65536;

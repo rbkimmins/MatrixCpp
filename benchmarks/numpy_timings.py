@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 """
-NumPy half of the MatrixCpp benchmark, plus the Python plots.
+NumPy half of the MatrixCpp benchmark.
 
-Runs the same operation set as Running_time.cpp — for both real and complex
-matrices — and writes bench/numpy_<dtype>_<op>.csv alongside the C++ results.
-Then draws the comparison.
+Runs the same operation set as benchmarks/running_time.cpp — for both real and
+complex matrices — and writes bench/numpy_<dtype>_<op>.csv alongside the C++
+results, then prints a comparison table.
+
+IT DOES NOT PLOT. Every figure in this project is drawn by C++, through the
+plotting package: see benchmarks/plot_comparison.cpp, which reads the same CSVs
+this writes. The CSVs exist only because a CROSS-LANGUAGE comparison has to
+persist data somewhere — the C++-only speed plots keep nothing on disk.
 
 The size points are not chosen here: they are read back out of the C++ CSVs, so
 both implementations are measured at exactly the same n. No interpolation, no
 mismatched ranges, and any op the C++ side skipped is skipped here too.
 
-Usage:
-    ./Running_time                  # writes bench/cpp_*.csv     (run this first)
-    python3 NumpyRunningtime.py     # writes bench/numpy_*.csv, then plots
-    python3 NumpyRunningtime.py --plot-only     # re-draw without re-timing
+Usage, from the repo root:
+    ./running_time                            # writes bench/cpp_*.csv  (first)
+    python3 benchmarks/numpy_timings.py       # writes bench/numpy_*.csv + table
+    python3 benchmarks/numpy_timings.py --summary-only   # table, no re-timing
+    ./plot_comparison                         # C++ draws the comparison
 
 Fairness notes, because several NumPy operations are lazy:
   * A.T and A.conj().T return VIEWS in NumPy and cost O(1). The C++ T()/H()
@@ -39,7 +45,6 @@ except ImportError:
     print("scipy not found — lu / sqrtm / logm / expm will be skipped")
 
 BENCH_DIR = "bench"
-PLOT_DIR = "plots"
 
 MIN_SECONDS = 0.05
 MAX_REPS = 100
@@ -208,121 +213,42 @@ def run_benchmarks():
         print(f"  wrote  {out_path}  ({len(rows)} points)")
 
 
-# ──────────────────────────────────────────────────────────── plotting ──
-def make_plots():
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.ticker import LogLocator
-
-    os.makedirs(os.path.join(PLOT_DIR, "ops"), exist_ok=True)
-
-    CPP = "#2a9d5c"      # green  — C++
-    NPY = "#3d7ebd"      # blue   — NumPy
-    WIN = "#2a9d5c"
-    LOSE = "#c0392b"
-
+# ─────────────────────────────────────────────────────────── summary ──
+def summarise():
+    """Console table only. THE PLOTS ARE DRAWN BY C++ — see
+    benchmarks/plot_comparison.cpp, which reads the same CSVs this writes."""
     pairs = {}
-    for (dtype, op), cpath in cpp_files().items():
+    for (dtype, op), path in cpp_files().items():
         npath = os.path.join(BENCH_DIR, f"numpy_{dtype}_{op}.csv")
         if not os.path.exists(npath):
             continue
-        cs, ct = read_csv(cpath)
-        ns, nt = read_csv(npath)
-        common = np.intersect1d(cs, ns)
-        if len(common) < 2:
-            continue
-        ct = np.array([ct[list(cs).index(s)] for s in common])
-        nt = np.array([nt[list(ns).index(s)] for s in common])
-        good = (ct > 0) & (nt > 0)
-        if good.sum() < 2:
-            continue
-        pairs[(dtype, op)] = (common[good], ct[good], nt[good])
-
+        n, ct = read_csv(path)
+        _, nt = read_csv(npath)
+        if len(n) and len(ct) and len(nt):
+            pairs[(dtype, op)] = (n, ct, nt)
     if not pairs:
-        sys.exit("No matched cpp/numpy pairs to plot.")
-
-    # ── per-operation figure: times on the left, speedup on the right ──
-    for (dtype, op), (n, ct, nt) in sorted(pairs.items()):
-        ratio = nt / ct
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
-
-        ax1.loglog(n, ct, "o-", color=CPP, lw=2, ms=4, label="MatrixCpp")
-        ax1.loglog(n, nt, "s-", color=NPY, lw=2, ms=4, label="NumPy")
-        ax1.set_xlabel("Matrix size n  (n × n)")
-        ax1.set_ylabel("Time (s)   — lower is better")
-        ax1.set_title(f"{op}  [{dtype}]")
-        ax1.grid(True, which="both", alpha=0.25)
-        ax1.legend()
-
-        ax2.axhline(1.0, color="#555", lw=1.2, ls="--", zorder=2)
-        ax2.fill_between(n, 1.0, ratio, where=ratio >= 1, color=WIN, alpha=0.22,
-                         interpolate=True, zorder=1)
-        ax2.fill_between(n, 1.0, ratio, where=ratio < 1, color=LOSE, alpha=0.22,
-                         interpolate=True, zorder=1)
-        ax2.plot(n, ratio, "o-", color="#222", lw=2, ms=4, zorder=3)
-        ax2.set_xscale("log")
-        ax2.set_yscale("log")
-        ax2.yaxis.set_major_locator(LogLocator(base=10.0, subs=(1.0,), numticks=12))
-        ax2.set_xlabel("Matrix size n")
-        ax2.set_ylabel("NumPy time ÷ MatrixCpp time")
-        ax2.set_title(f"speedup  —  above 1 = MatrixCpp wins  ({ratio[-1]:.2f}× at n={n[-1]})")
-        ax2.grid(True, which="both", alpha=0.25)
-        ax2.text(0.02, 0.95, "MatrixCpp faster", transform=ax2.transAxes,
-                 color=WIN, fontweight="bold", va="top", fontsize=9)
-        ax2.text(0.02, 0.05, "NumPy faster", transform=ax2.transAxes,
-                 color=LOSE, fontweight="bold", va="bottom", fontsize=9)
-
-        fig.tight_layout()
-        out = os.path.join(PLOT_DIR, "ops", f"{dtype}_{op}.png")
-        fig.savefig(out, dpi=130)
-        plt.close(fig)
-
-    print(f"\n  {len(pairs)} per-op figures -> {PLOT_DIR}/ops/")
-
-    # ── summary: one bar per operation, at the largest common size ──
-    for dtype in ("real", "complex"):
-        items = []
-        for (dt, op), (n, ct, nt) in pairs.items():
-            if dt != dtype:
-                continue
-            items.append((op, nt[-1] / ct[-1], int(n[-1])))
-        if not items:
-            continue
-        items.sort(key=lambda r: r[1])
-        labels = [f"{op}  (n={nn})" for op, _, nn in items]
-        vals = [r[1] for r in items]
-        colors = [WIN if v >= 1 else LOSE for v in vals]
-
-        fig, ax = plt.subplots(figsize=(11, 0.42 * len(items) + 2.2))
-        ax.barh(labels, vals, color=colors, alpha=0.85)
-        ax.axvline(1.0, color="#333", lw=1.4, ls="--")
-        ax.set_xscale("log")
-        ax.set_xlabel("NumPy time ÷ MatrixCpp time   (log scale, >1 = MatrixCpp faster)")
-        ax.set_title(f"MatrixCpp vs NumPy — {dtype}, at the largest measured size")
-        ax.grid(True, axis="x", which="both", alpha=0.25)
-        for i, v in enumerate(vals):
-            ax.text(v * (1.06 if v >= 1 else 0.94), i, f"{v:.2f}×",
-                    va="center", ha="left" if v >= 1 else "right", fontsize=8.5)
-        fig.tight_layout()
-        out = os.path.join(PLOT_DIR, f"summary_{dtype}.png")
-        fig.savefig(out, dpi=140)
-        plt.close(fig)
-        print(f"  summary -> {out}")
-
-    # ── console table, so the numbers are readable without opening a PNG ──
+        print("No matching cpp_/numpy_ pairs in bench/.")
+        return
     print("\n" + "=" * 74)
-    print(f"{'dtype':9s} {'operation':17s} {'n':>6s} {'MatrixCpp':>12s} {'NumPy':>12s} {'speedup':>9s}")
+    print(f"{'dtype':9s} {'operation':17s} {'n':>6s} {'MatrixCpp':>12s} "
+          f"{'NumPy':>12s} {'speedup':>8s}")
     print("=" * 74)
+    wins = 0
     for (dtype, op), (n, ct, nt) in sorted(pairs.items()):
         r = nt[-1] / ct[-1]
+        if r > 1.0:
+            wins += 1
         mark = "" if 0.9 <= r <= 1.1 else ("  <<" if r < 1 else "  >>")
-        print(f"{dtype:9s} {op:17s} {int(n[-1]):6d} {ct[-1]:12.6f} {nt[-1]:12.6f} {r:8.2f}x{mark}")
+        print(f"{dtype:9s} {op:17s} {int(n[-1]):6d} {ct[-1]:12.6f} "
+              f"{nt[-1]:12.6f} {r:8.2f}{mark}")
     print("=" * 74)
-    print(">> MatrixCpp faster    << NumPy faster")
+    print(f">> MatrixCpp faster    << NumPy faster     ({wins}/{len(pairs)} to MatrixCpp)")
+    print("\nPlots:  g++ -std=c++17 -O2 -fopenmp -I. benchmarks/plot_comparison.cpp "
+          "-o plot_comparison && ./plot_comparison")
+
 
 
 if __name__ == "__main__":
-    if "--plot-only" not in sys.argv:
+    if "--summary-only" not in sys.argv:
         run_benchmarks()
-    make_plots()
+    summarise()

@@ -873,16 +873,56 @@ it.
         sub-diagonal means DIAGONAL. That is what exposed the second bug,
         where H came back triangular with a nonzero upper triangle.
 
-    [ ] STILL LEFT:
-        - RECURSIVE QR (Elmroth-Gustavson), now worth revisiting: the fixed
-          block size always produced skinny panels, which is the shape the
-          GEMM was worst at. A recursion splits columns in half, so the top
-          levels generate LARGE, square-ish products — what the GEMM is best
-          at. Its base case is qrFactorUnpivoted(), already in place.
-          Weigh it against the T-building cost first: with block size b that
-          is O(b^2 * rows) per block, negligible at b=48 (~1% of the total)
-          but around a third of the work when b is n/2. That trade is why
-          this is worth measuring rather than assuming.
+    [x] QR IS FINISHED. Both level-3 variants are now implemented, measured
+        and rejected, and the unblocked level-2 path stands.
+
+        RECURSIVE QR (Elmroth-Gustavson) was the last untried option, and the
+        argument for it was real: fixed blocking always produces skinny N=48
+        panels, the shape the GEMM is worst at, while a recursion halves the
+        block width so the TOP level is one large square-ish product. That part
+        held up — measured standalone, the root GEMMs run at 74.5 GFLOP/s,
+        indistinguishable from a full 1024^3 square (77.2). It still lost:
+
+            size        unblocked   recursive   ratio
+            512x512        24.3        30.5      0.80x
+            1024x1024      62.3       116.4      0.54x
+            1500x1500     147.1       324.0      0.45x
+            2048x2048     375.7       730.5      0.51x
+            4000x200       20.1        54.4      0.37x
+            2000x500       61.7       158.0      0.39x
+
+        Leaf sizes 32, 64, 128, 256 and 512 were all tried; 32 is best and
+        larger is monotonically worse, so "too many small GEMMs at depth" is
+        NOT the explanation — raising the leaf only trades them for level-2
+        panel work. Across the L3 cliff it behaves exactly as the blocked
+        version did, 0.52x at 32 MB narrowing to 0.72x at 99 MB, and never
+        crosses.
+
+        WHY IT LOSES: the recursion does roughly 2.3x the arithmetic of the
+        unblocked path, because every level pays for a T — a Gram matrix
+        V1^H V2 plus two triangular multiplies. The root GEMMs are at full
+        speed but the deeper ones are not (33.6 GFLOP/s at level 1, 22.6 at
+        level 3), and 2.3x the work at a mixed rate does not beat 1x at the
+        level-2 kernel's 22 GFLOP/s.
+
+        TWO IMPLEMENTATION TRAPS, both the same mistake, both worth recording
+        because the first version was 27x SLOWER than unblocked and it would
+        have been easy to stop there and call the algorithm bad:
+          1. The T-combine's two triangular multiplies were hand-written triple
+             loops. O(b^3) each, and b is n/2 at the root.
+          2. Worse, `W^T <- W^T conj(T)` inside the block update was also a
+             hand-written triangular loop — O(bs^2 * trailing), serial. At the
+             fixed block size of 48 that is 4.5% of the blocked version and
+             invisible; at bs = n/2 it was 84.6% OF THE ENTIRE FACTORISATION.
+             Profiling found it; three rounds of guessing had not.
+          Fixing both took 2048x2048 from 11.6 s to 0.73 s. The lesson is that
+          a level-3 algorithm has NO room for a level-2 helper hiding inside
+          it, and that the phase profile is the way to find one.
+
+        So: the level-2 unblocked path is the QR, for this library, on this
+        hardware. What would change that is a faster GEMM KERNEL, not another
+        QR algorithm — and that has its own measured ceiling of 2.2x threaded,
+        which is not enough. See the GEMM notes.
         - The fixed-block BLOCKED QR IS REJECTED A SECOND TIME, now that the
           GEMM parallelises properly. This was the obvious follow-up — the
           panel GEMM that ran single-threaded was named as the headline
@@ -1276,3 +1316,84 @@ relevant to the quantum-circuit goal, since the QFT is exactly this.
 ═══════════════════════════════════════════════════════════════════════════
 
 ```
+
+---
+
+## Optimising the factorisations (LU, Cholesky, QZ)
+
+Measured against OUR OWN GEMM rather than against NumPy, because NumPy here
+links the reference BLAS and beating it proves nothing. At n=1024 the multiply
+kernel does ~180-270 GFLOP/s; that is the ceiling everything else is judged by.
+
+    operation      before      after     speedup
+    LU (det)      52.2 ms    24.7 ms      2.1x
+    solve         52.1 ms    25.0 ms      2.1x
+    inverse       81.8 ms    48.4 ms      1.7x
+    cholesky      53.8 ms    17.3 ms      3.1x
+    qz (n=1024)   91.9 s     21.9 s       4.2x
+
+### LU — blocked AND column-major
+
+Two changes, and the second was the larger.
+
+BLOCKED (LAPACK's dgetrf): factor a narrow panel, one small triangular solve,
+then take the whole trailing update as a single GEMM. Unlike QR this costs
+NOTHING EXTRA — QR's compact-WY form needs a T matrix, about 40% more
+arithmetic, which is why blocking lost there twice; LU's blocked update is the
+same arithmetic regrouped.
+
+COLUMN-MAJOR internally. Every operation in an LU panel runs DOWN a column —
+the pivot search, the scaling, the rank-1 update — and in row-major storage each
+one walks a fresh cache line per element. Profiling the row-major blocked
+version put 21% of the factorisation in the column scaling alone and 29% in
+packing. Held column-major, all five inner loops are contiguous and only the row
+swaps stride, which is O(n^2) against O(n^3) of work. The trailing update is
+formed TRANSPOSED, A22^T -= U12^T L21^T, so both GEMM operands pack as plain
+copies. Interleaved A/B: column-major wins 1.26-1.51x over row-major blocked.
+
+THE PIVOT SEQUENCE IS UNCHANGED, so det() keeps its sign and every existing
+test passes untouched.
+
+Two smaller traps, both worth naming because neither is arithmetic:
+  - std::vector::assign VALUE-INITIALISES, and mstore::gemm then zeroes its
+    output again on entry. Re-assigning the scratch buffers per block was two
+    redundant passes over ~32 MB, and 29% of the factorisation. They are now
+    allocated once, and the GEMM output uses mstore::RawBuf, which skips the
+    zero-fill entirely.
+  - The two transposes at the boundaries were naive and strided. Tiled at 32x32
+    they went from 94 ms to ~41 ms of a 152 ms det() at n=2048.
+
+### Cholesky — blocked
+
+Same shape (LAPACK's dpotrf), and it was the worst offender at 4% of peak. The
+trailing update is mathematically a SYRK, A22 -= L21 L21^H, which needs only the
+lower triangle. It is done here as a full GEMM with only the lower half
+subtracted: twice the arithmetic at more than twenty times the rate.
+
+### QZ — 4.2x, and none of it was arithmetic
+
+The QZ was 12-14x slower than schurDecomp for an algorithm that should be about
+2x. Two causes, both about MEMORY rather than flops:
+
+  1. THE ROTATION RANGES WERE NOT RESTRICTED. An earlier version applied every
+     rotation to the full row and column, reasoning that rotating a pair of
+     zeros is harmless. It is harmless and it was expensive: a column rotation
+     touched all n rows where only the first p+2 can be nonzero. schurDecomp had
+     always restricted its equivalent. Fixing it made the sweeps 3.3-4.8x faster.
+  2. Q AND Z WERE STORED THE WRONG WAY ROUND. Every update to them rotates a
+     COLUMN pair, which strides a cache line per element; held transposed the
+     same update is two contiguous runs. schurDecomp already did this for its Q.
+     Applied to both the sweeps and the Hessenberg-triangular reduction, which
+     had become 63% of the total once the sweeps were fixed, and which halved.
+
+qz/schur is now 2.4-4.4x, which is about what the structure predicts: QZ carries
+four matrices where Schur carries two.
+
+### Still slow, and why
+
+    schur   0.9 GFLOP/s      svd   1.4 GFLOP/s
+These are iterative eigenvalue algorithms built on Givens rotations and small
+reflectors — inherently level 1 and 2. The real fix is LAPACK's multishift,
+blocked bulge-chasing (dlaqr0) and a blocked Hessenberg reduction (dgehrd),
+which accumulate many rotations and apply them through GEMM. That is a project
+of its own, not a tuning pass.

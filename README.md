@@ -36,6 +36,11 @@ basic/                     the Basic Matrix Package — one include for all of i
   identity.hpp             the global `I`
   tensor.hpp               the Tensor class
   random.hpp               the ran2 generator both classes use
+plotting/                  Plots.jl from C++ — no julia syntax, no build flags
+  MatrixPlot.hpp           <-- include this
+  julia_script.hpp         script generation and the julia subprocess
+  demo.cpp                 eight figures, doubles as a smoke test
+gpu/                       placeholder; see gpu/README.md for the measurements
 docs/
   DESIGN_NOTES.md          why the code is the way it is
 ```
@@ -82,7 +87,7 @@ The library is a single header — just `#include "Matrix1.0.hpp"`. It requires
 **C++17** (it uses `if constexpr`, structured bindings and inline variables).
 
 ```
-g++ -std=c++17 -O3 -march=native -ffast-math -fopenmp -o Running_time Running_time.cpp
+g++ -std=c++17 -O3 -march=native -fopenmp -I. benchmarks/running_time.cpp -o running_time
 ```
 
 `-fopenmp` is optional; the header guards its OpenMP use with `#ifdef _OPENMP`
@@ -637,34 +642,36 @@ g++ -std=c++17 -O2 -fopenmp -o tensor_numpy_validate tensor_numpy_validate.cpp
 
 ## Benchmarks
 
-Three pieces, sharing one data contract in `bench/`:
-
 ```
-g++ -std=c++17 -O3 -march=native -fopenmp -o Running_time Running_time.cpp
-./Running_time                       # -> bench/cpp_<dtype>_<op>.csv
-python3 NumpyRunningtime.py          # -> bench/numpy_<dtype>_<op>.csv, then plots/
-julia --project=. plot_running_time.jl   # -> plots/julia/
+g++ -std=c++17 -O3 -march=native -fopenmp -I. benchmarks/running_time.cpp -o running_time
+./running_time
 ```
 
-Every operation is timed for **both** `Matrix<double>` and
-`Matrix<complex<double>>`. The Python script does not choose its own sizes — it
-reads them back out of the C++ CSVs, so both implementations are measured at
-exactly the same `n`, with no interpolation and no mismatched ranges.
+Times 57 operations across both `Matrix<double>` and `Matrix<complex<double>>`
+and **draws the results itself** into `benchmarks/plots/` — one figure per
+family, on log-log axes. About 45 s. No Julia, no matplotlib, no intermediate
+file: the plots come out of the C++ program that took the measurements.
 
-Output:
+Comparing against NumPy is the one place data is written to disk, because the
+two sides are measured by two different languages and have to meet somewhere:
 
-| file | what it shows |
-|---|---|
-| `plots/summary_<dtype>.png` | every operation on one bar chart, sorted by speedup |
-| `plots/ops/<dtype>_<op>.png` | times (log-log) beside the speedup ratio |
-| `plots/julia/scaling_<dtype>.png` | measured exponent *k* in time ∝ n^k, against the textbook value |
+```
+python3 benchmarks/numpy_timings.py     # -> bench/numpy_*.csv + a table
+g++ -std=c++17 -O2 -fopenmp -I. benchmarks/plot_comparison.cpp -o plot_comparison
+./plot_comparison                       # -> benchmarks/plots/speedup_*.png
+```
 
-Speedup is always **NumPy time ÷ MatrixCpp time**: above 1 means MatrixCpp is
-faster (green), below means NumPy is (red).
+The Python side does not choose its own sizes — it reads them back out of the
+C++ CSVs, so both implementations are measured at exactly the same `n`. Speedup
+is always **NumPy time ÷ MatrixCpp time**, plotted against a parity line at 1.
+
+**Read those speedups with care.** NumPy here links the *reference* BLAS
+(`libblas.so.3`), not OpenBLAS or MKL: its matmul runs at ~4.8 GFLOP/s
+single-threaded against ~200 for ours. See "QR: why it is level 2" below for
+what a fair comparison would look like.
 
 Individual benchmarks are toggled by the `#define BENCH_*` lines at the top of
-`Running_time.cpp`. Complex covers the container layer only — `det`, `inverse`,
-`LU`, `QR`, `eig`, `pow` and `log` are still real-only.
+`benchmarks/running_time.cpp`. See `benchmarks/README.md`.
 
 ### Where it stands
 
@@ -944,3 +951,98 @@ the rank instead, so the structure survives on its own.
 
 Reading these back in is deliberately not here yet; the formats were chosen so
 that `Plain`, `CSV` and `TSV` are trivially parseable when it lands.
+
+## QR: why it is level 2
+
+`QR` uses an unblocked Householder factorisation. That is a measured decision,
+not an omission — **both** level-3 variants were implemented and both lost:
+
+| | 1024² | 1500² | 2048² |
+|---|---|---|---|
+| blocked (compact-WY, best of 6 block sizes) | 0.63× | 0.49× | 0.53× |
+| recursive (Elmroth–Gustavson, best of 5 leaf sizes) | 0.54× | 0.45× | 0.51× |
+
+The argument for recursion was sound and it partly held: its root GEMMs run at
+74.5 GFLOP/s, indistinguishable from a full square product. It still loses,
+because the recursion does ~2.3× the arithmetic (every level pays for a `T`),
+the deeper GEMMs run at a third of the root's rate, and the level-2 kernel it
+has to beat is already streaming contiguous columns in parallel.
+
+Two implementation traps are worth knowing, because the first version was **27×
+slower** than unblocked and it would have been easy to stop there and blame the
+algorithm. Both were hand-written triangular loops standing in for a GEMM. The
+costly one — `W^T ← W^T conj(T)` inside the block update — is 4.5% of a blocked
+QR at block size 48 and **84.6% of the whole factorisation** at block size n/2.
+Fixing both took 2048² from 11.6 s to 0.73 s. A level-3 algorithm has no room
+for a level-2 helper hiding inside it, and a phase profile is how you find one.
+
+## Factorisation performance
+
+Measured against **our own GEMM**, not against NumPy — NumPy here links the
+reference BLAS, so beating it proves nothing. At n=1024:
+
+| | before | after | |
+|---|---|---|---|
+| LU (`det`) | 52.2 ms | 24.7 ms | **2.1×** |
+| `solve` | 52.1 ms | 25.0 ms | **2.1×** |
+| `inverse` | 81.8 ms | 48.4 ms | **1.7×** |
+| `cholesky` | 53.8 ms | 17.3 ms | **3.1×** |
+| `qz` | 91.9 s | 21.9 s | **4.2×** |
+
+**LU and Cholesky are blocked** (LAPACK's `dgetrf`/`dpotrf`), so the trailing
+update is a GEMM. Unlike QR this costs nothing extra — QR's compact-WY form
+needs a `T` matrix worth ~40% more arithmetic, which is why blocking lost there
+twice; LU's blocked update is the same arithmetic regrouped.
+
+**LU is also column-major internally.** Every operation in its panel runs *down*
+a column, and row-major storage walks a fresh cache line per element — 21% of
+the factorisation went on column scaling alone. The pivot sequence is unchanged,
+so `det()` keeps its sign.
+
+**QZ's 4.2× was entirely memory, not arithmetic.** Its rotations were applied to
+full rows and columns when only a band can be nonzero, and `Q`/`Z` were stored so
+that every update to them strided. `schurDecomp` had always done both correctly.
+QZ is now 2.4–4.4× Schur rather than 12–14×, which is about what carrying four
+matrices instead of two predicts.
+
+`schur` and `svd` remain at ~1 GFLOP/s. They are iterative eigenvalue algorithms
+built on Givens rotations — inherently level 1/2, and the real fix is LAPACK's
+multishift blocked bulge-chasing, which is a project rather than a tuning pass.
+
+## Plotting
+
+```cpp
+#include "plotting/MatrixPlot.hpp"
+
+Matrix<double> x = linspace(0.0, 10.0, 200);
+plt::plot(x, x.sin(), "sin");
+plt::plot(x, x.cos(), "cos");
+plt::title("trig");  plt::xlabel("x");  plt::legend();
+plt::save("trig.png");
+```
+
+```
+g++ -std=c++17 -O2 -fopenmp -I. demo.cpp -o demo
+```
+
+No Julia syntax, and no build flags beyond `-I.` — it needs `julia` on `PATH`
+with Plots.jl, and nothing else. The model is matplotlib's: a current figure,
+drawing calls add to it, `save()` finishes it.
+
+`plot` `scatter` `bar` `stairs` `semilogx` `semilogy` `loglog` `heatmap`
+`surface` `contour` `spy` `hist`, plus the usual labels, limits and `set()` for
+any other Plots attribute. `plot(A)` on a multi-column matrix draws one series
+per column.
+
+See `plotting/README.md` — including why this shells out to `julia` rather than
+embedding the runtime, which was tried first and crashes inside Julia's package
+loader in a way that depends on the calling binary's size.
+
+## GPU
+
+`gpu/` is a placeholder. CUDA 13.2 and an RTX 5060 Ti are already installed on
+this machine — nothing to install, only `PATH` to set. But measured, cuBLAS
+`DGEMM` is 318–341 GFLOP/s against 180–270 for this CPU: GeForce cards throttle
+FP64 to 1/64 of FP32, so **in double, which is what `basic/` uses everywhere,
+the GPU is only 1.3–1.9× the CPU.** The numbers and what they imply for the
+design are in `gpu/README.md`.

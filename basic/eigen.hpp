@@ -441,8 +441,20 @@ void hessTri(std::vector<W>& A, std::vector<W>& B,
              std::vector<W>& Q, std::vector<W>& Z, int n) {
     auto a = [&](int i, int j) -> W& { return A[(std::size_t)i * n + j]; };
     auto b = [&](int i, int j) -> W& { return B[(std::size_t)i * n + j]; };
-    auto q = [&](int i, int j) -> W& { return Q[(std::size_t)i * n + j]; };
-    auto z = [&](int i, int j) -> W& { return Z[(std::size_t)i * n + j]; };
+    // Q and Z are held TRANSPOSED for the duration. Every update to them is a
+    // rotation of a COLUMN PAIR, which strides a cache line per element in
+    // row-major storage and is two contiguous runs transposed. With the sweeps
+    // fixed this reduction became 56-63% of the whole QZ, and these two loops
+    // were most of it.
+    {
+        std::vector<W> tmp((std::size_t)n * n);
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++) tmp[(std::size_t)j * n + i] = Q[(std::size_t)i * n + j];
+        Q.swap(tmp);
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++) tmp[(std::size_t)j * n + i] = Z[(std::size_t)i * n + j];
+        Z.swap(tmp);
+    }
 
     for (int j = 0; j < n - 2; j++) {
         // Upward, so each rotation acts on rows (i-1, i) and cannot refill the
@@ -460,10 +472,14 @@ void hessTri(std::vector<W>& A, std::vector<W>& B,
                 b(i - 1, k) = c * t1 + s * t2;
                 b(i, k)     = -cj(s) * t1 + c * t2;
             }
-            for (int k = 0; k < n; k++) {                // Q <- Q G^H
-                const W t1 = q(k, i - 1), t2 = q(k, i);
-                q(k, i - 1) = c * t1 + cj(s) * t2;
-                q(k, i)     = -s * t1 + c * t2;
+            {                                            // Q <- Q G^H
+                W* MATRIXCPP_RESTRICT q0 = &Q[(std::size_t)(i - 1) * n];
+                W* MATRIXCPP_RESTRICT q1 = &Q[(std::size_t)i * n];
+                for (int k = 0; k < n; k++) {
+                    const W t1 = q0[k], t2 = q1[k];
+                    q0[k] = c * t1 + cj(s) * t2;
+                    q1[k] = -s * t1 + c * t2;
+                }
             }
             a(i, j) = W(0);
 
@@ -481,10 +497,14 @@ void hessTri(std::vector<W>& A, std::vector<W>& B,
                 a(k, i - 1) = c2 * t1 - cj(s2) * t2;
                 a(k, i)     = s2 * t1 + c2 * t2;
             }
-            for (int k = 0; k < n; k++) {                // Z <- Z W
-                const W t1 = z(k, i - 1), t2 = z(k, i);
-                z(k, i - 1) = c2 * t1 - cj(s2) * t2;
-                z(k, i)     = s2 * t1 + c2 * t2;
+            {                                            // Z <- Z W
+                W* MATRIXCPP_RESTRICT z0 = &Z[(std::size_t)(i - 1) * n];
+                W* MATRIXCPP_RESTRICT z1 = &Z[(std::size_t)i * n];
+                for (int k = 0; k < n; k++) {
+                    const W t1 = z0[k], t2 = z1[k];
+                    z0[k] = c2 * t1 - cj(s2) * t2;
+                    z1[k] = s2 * t1 + c2 * t2;
+                }
             }
             b(i, i - 1) = W(0);
         }
@@ -493,6 +513,15 @@ void hessTri(std::vector<W>& A, std::vector<W>& B,
         for (int j = 0; j <= i - 2; j++) a(i, j) = W(0);
     for (int i = 1; i < n; i++)
         for (int j = 0; j < i; j++) b(i, j) = W(0);
+    {   // back from the transposed layout Q and Z were held in
+        std::vector<W> tmp((std::size_t)n * n);
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++) tmp[(std::size_t)i * n + j] = Q[(std::size_t)j * n + i];
+        Q.swap(tmp);
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++) tmp[(std::size_t)i * n + j] = Z[(std::size_t)j * n + i];
+        Z.swap(tmp);
+    }
 }
 
 // Brings a general pencil to Hessenberg-triangular form: an unpivoted QR of B
@@ -541,39 +570,77 @@ void iterate(std::vector<W>& S, std::vector<W>& T, std::vector<W>& Q,
              std::vector<W>& Z, int n) {
     auto sm = [&](int i, int j) -> W& { return S[(std::size_t)i * n + j]; };
     auto tm = [&](int i, int j) -> W& { return T[(std::size_t)i * n + j]; };
-    auto qm = [&](int i, int j) -> W& { return Q[(std::size_t)i * n + j]; };
-    auto zm = [&](int i, int j) -> W& { return Z[(std::size_t)i * n + j]; };
+    // Q and Z are held TRANSPOSED. Every update to them rotates a pair of
+    // COLUMNS, which in row-major storage strides one cache line per element;
+    // transposed, the same update is two contiguous runs. schurDecomp does the
+    // same thing for its Q, for the same reason.
+    {
+        std::vector<W> tmp(Q.size());
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++) tmp[(std::size_t)j * n + i] = Q[(std::size_t)i * n + j];
+        Q.swap(tmp);
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++) tmp[(std::size_t)j * n + i] = Z[(std::size_t)i * n + j];
+        Z.swap(tmp);
+    }
 
-    // Rotations are applied to the FULL rows and columns, not just the active
-    // block. Restricting them would be an optimisation over known zeros; the
-    // pencil identity A = Q S Z^H is global, so the accumulation is not
-    // optional. Rotating a pair of zeros yields zeros, so nothing is lost.
+    // `hi` is the bottom of the active block; the rotations read it to know how
+    // far down anything can be nonzero.
+    int hi = n - 1;
+
+    // ── The rotation ranges are RESTRICTED, and that is where the time was ──
+    // An earlier version applied every rotation to the full row and column,
+    // reasoning that rotating a pair of zeros costs nothing but correctness is
+    // not at risk. It cost a great deal: a column rotation touched all n rows
+    // where only the first p+2 can be nonzero, and QZ came out 12-14x slower
+    // than schurDecomp for an algorithm that should be about 2x.
+    //   left  on rows (p,p+1): S row p starts at column p-1, so columns below
+    //                          that are zero in both rows. The upper end cannot
+    //                          be trimmed — the off-diagonal block to the right
+    //                          is live.
+    //   right on columns (p,p+1): S is Hessenberg so S(i,p) is zero past
+    //                          i = p+1, and the chase's bulge reaches p+2.
+    //                          Everything past hi is deflated and already zero.
     auto rotL = [&](int p, double c, const W& sv) {          // rows (p, p+1)
-        for (int k = 0; k < n; k++) {
-            const W a1 = sm(p, k), a2 = sm(p + 1, k);
-            sm(p, k) = c * a1 + sv * a2;
-            sm(p + 1, k) = -cj(sv) * a1 + c * a2;
-            const W b1 = tm(p, k), b2 = tm(p + 1, k);
-            tm(p, k) = c * b1 + sv * b2;
-            tm(p + 1, k) = -cj(sv) * b1 + c * b2;
+        const int k0 = (p > 0) ? p - 1 : 0;
+        W* MATRIXCPP_RESTRICT s0 = &S[(std::size_t)p * n];
+        W* MATRIXCPP_RESTRICT s1 = &S[(std::size_t)(p + 1) * n];
+        W* MATRIXCPP_RESTRICT t0 = &T[(std::size_t)p * n];
+        W* MATRIXCPP_RESTRICT t1 = &T[(std::size_t)(p + 1) * n];
+        for (int k = k0; k < n; k++) {
+            const W a1 = s0[k], a2 = s1[k];
+            s0[k] = c * a1 + sv * a2;
+            s1[k] = -cj(sv) * a1 + c * a2;
+            const W b1 = t0[k], b2 = t1[k];
+            t0[k] = c * b1 + sv * b2;
+            t1[k] = -cj(sv) * b1 + c * b2;
         }
+        W* MATRIXCPP_RESTRICT q0 = &Q[(std::size_t)p * n];   // contiguous, transposed
+        W* MATRIXCPP_RESTRICT q1 = &Q[(std::size_t)(p + 1) * n];
         for (int k = 0; k < n; k++) {                        // Q <- Q G^H
-            const W q1 = qm(k, p), q2 = qm(k, p + 1);
-            qm(k, p) = c * q1 + cj(sv) * q2;
-            qm(k, p + 1) = -sv * q1 + c * q2;
+            const W u = q0[k], v = q1[k];
+            q0[k] = c * u + cj(sv) * v;
+            q1[k] = -sv * u + c * v;
         }
     };
     auto rotR = [&](int p, double c, const W& sv) {          // columns (p, p+1)
-        for (int k = 0; k < n; k++) {
-            const W a1 = sm(k, p), a2 = sm(k, p + 1);
-            sm(k, p) = c * a1 - cj(sv) * a2;
-            sm(k, p + 1) = sv * a1 + c * a2;
-            const W b1 = tm(k, p), b2 = tm(k, p + 1);
-            tm(k, p) = c * b1 - cj(sv) * b2;
-            tm(k, p + 1) = sv * b1 + c * b2;
-            const W z1 = zm(k, p), z2 = zm(k, p + 1);        // Z <- Z W
-            zm(k, p) = c * z1 - cj(sv) * z2;
-            zm(k, p + 1) = sv * z1 + c * z2;
+        const int kEnd = std::min(p + 2, hi);
+        for (int k = 0; k <= kEnd; k++) {
+            W* MATRIXCPP_RESTRICT sr = &S[(std::size_t)k * n];
+            const W a1 = sr[p], a2 = sr[p + 1];
+            sr[p] = c * a1 - cj(sv) * a2;
+            sr[p + 1] = sv * a1 + c * a2;
+            W* MATRIXCPP_RESTRICT tr = &T[(std::size_t)k * n];
+            const W b1 = tr[p], b2 = tr[p + 1];
+            tr[p] = c * b1 - cj(sv) * b2;
+            tr[p + 1] = sv * b1 + c * b2;
+        }
+        W* MATRIXCPP_RESTRICT z0 = &Z[(std::size_t)p * n];   // contiguous, transposed
+        W* MATRIXCPP_RESTRICT z1 = &Z[(std::size_t)(p + 1) * n];
+        for (int k = 0; k < n; k++) {                        // Z <- Z W
+            const W u = z0[k], v = z1[k];
+            z0[k] = c * u - cj(sv) * v;
+            z1[k] = sv * u + c * v;
         }
     };
 
@@ -589,7 +656,7 @@ void iterate(std::vector<W>& S, std::vector<W>& T, std::vector<W>& Q,
     const double atol = eps * std::max(anorm, 1.0) * double(n);
     const double btol = eps * std::max(bnorm, 1.0) * double(n);
 
-    int hi = n - 1, iter = 0;
+    int iter = 0;
     while (hi > 0) {
         // ── deflate on S's subdiagonal, relative to its neighbours ──
         int lo = hi;
@@ -700,6 +767,15 @@ void iterate(std::vector<W>& S, std::vector<W>& T, std::vector<W>& Q,
     }
     for (int i = 1; i < n; i++)                  // clear numerical dust
         for (int j = 0; j < i; j++) { sm(i, j) = W(0); tm(i, j) = W(0); }
+    {   // back from the transposed layout Q and Z were held in
+        std::vector<W> tmp(Q.size());
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++) tmp[(std::size_t)i * n + j] = Q[(std::size_t)j * n + i];
+        Q.swap(tmp);
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++) tmp[(std::size_t)i * n + j] = Z[(std::size_t)j * n + i];
+        Z.swap(tmp);
+    }
 }
 
 }  // namespace qz_detail
