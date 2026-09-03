@@ -335,6 +335,21 @@ Matrix<work_t<datatype>> sqrt(const Matrix<datatype>& A) {
 
 // ─── Free-function spellings that mirror mathematical notation ──────────────
 
+// sum(A) — every element. The member A.sum() is the same thing; both exist
+// because capital sigma is written to the LEFT of what it sums, and because
+// MATLAB only has the free spelling while NumPy has both.
+template <typename datatype>
+datatype sum(const Matrix<datatype>& A) {
+    return A.sum();
+}
+
+// sum(A, ROW) / sum(A, COL) — along one axis. The flag names the axis you get
+// ONE RESULT PER: sum(A, ROW) is an m x 1 column, sum(A, COL) a 1 x n row.
+template <typename datatype>
+Matrix<datatype> sum(const Matrix<datatype>& A, bool axis) {
+    return A.sum(axis);
+}
+
 // tr(A) — sum of the main diagonal elements. Mirrors mathematical notation.
 template <typename datatype>
 datatype tr(const Matrix<datatype>& A) {

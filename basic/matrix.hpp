@@ -1045,6 +1045,51 @@ class Matrix {
                 ans[j] = mat(row, j);
             return ans;
         }
+        // ── Arithmetic, so a slice behaves like the matrix it denotes ──
+        // These are MEMBERS on purpose. The free operators cannot help: template
+        // argument deduction runs BEFORE user-defined conversions, so
+        // `proxy - proxy` never reaches operator Matrix. Member lookup happens
+        // first, and then the right-hand side is free to convert.
+        Matrix<datatype> operator+(const Matrix<datatype>& r) const {
+            return static_cast<Matrix<datatype>>(*this) + r;
+        }
+        Matrix<datatype> operator-(const Matrix<datatype>& r) const {
+            return static_cast<Matrix<datatype>>(*this) - r;
+        }
+        Matrix<datatype> operator%(const Matrix<datatype>& r) const {
+            return static_cast<Matrix<datatype>>(*this) % r;
+        }
+        Matrix<datatype> operator*(const Matrix<datatype>& r) const {
+            return static_cast<Matrix<datatype>>(*this) * r;
+        }
+        template <typename Scalar>
+        Matrix<datatype> operator*(const Scalar& k) const {
+            return static_cast<Matrix<datatype>>(*this) * k;
+        }
+        template <typename Scalar>
+        Matrix<datatype> operator/(const Scalar& k) const {
+            return static_cast<Matrix<datatype>>(*this) / k;
+        }
+
+        // ── Mutating fill, writing THROUGH to the matrix ──
+        // The proxy holds a reference, so this is a real in-place fill of the
+        // slice — the same thing Eigen's Block::setRandom does, and what
+        // numpy's `a[:, 0] = ...` achieves.
+        RowProxy& set_Ran_values(double lo, double hi) {
+            Matrix<datatype> tmp(1, mat.cols());
+            tmp.set_Ran_values(lo, hi);
+            return *this = tmp;
+        }
+        RowProxy& set_Ran_values(double lo, double hi, long seed) {
+            Matrix<datatype> tmp(1, mat.cols());
+            tmp.set_Ran_values(lo, hi, seed);
+            return *this = tmp;
+        }
+        RowProxy& fill(const datatype& v) {
+            Matrix<datatype> tmp(1, mat.cols());
+            for (long i = 0; i < tmp.rows() * tmp.cols(); i++) tmp[int(i)] = v;
+            return *this = tmp;
+        }
         friend std::ostream& operator<<(std::ostream& os, const RowProxy& p) {
             return os << static_cast<Matrix<datatype>>(p).toString();
         }
@@ -1072,6 +1117,51 @@ class Matrix {
             for (long i = 0; i < mat.rows(); i++)
                 ans[i] = mat(i, col);
             return ans;
+        }
+        // ── Arithmetic, so a slice behaves like the matrix it denotes ──
+        // These are MEMBERS on purpose. The free operators cannot help: template
+        // argument deduction runs BEFORE user-defined conversions, so
+        // `proxy - proxy` never reaches operator Matrix. Member lookup happens
+        // first, and then the right-hand side is free to convert.
+        Matrix<datatype> operator+(const Matrix<datatype>& r) const {
+            return static_cast<Matrix<datatype>>(*this) + r;
+        }
+        Matrix<datatype> operator-(const Matrix<datatype>& r) const {
+            return static_cast<Matrix<datatype>>(*this) - r;
+        }
+        Matrix<datatype> operator%(const Matrix<datatype>& r) const {
+            return static_cast<Matrix<datatype>>(*this) % r;
+        }
+        Matrix<datatype> operator*(const Matrix<datatype>& r) const {
+            return static_cast<Matrix<datatype>>(*this) * r;
+        }
+        template <typename Scalar>
+        Matrix<datatype> operator*(const Scalar& k) const {
+            return static_cast<Matrix<datatype>>(*this) * k;
+        }
+        template <typename Scalar>
+        Matrix<datatype> operator/(const Scalar& k) const {
+            return static_cast<Matrix<datatype>>(*this) / k;
+        }
+
+        // ── Mutating fill, writing THROUGH to the matrix ──
+        // The proxy holds a reference, so this is a real in-place fill of the
+        // slice — the same thing Eigen's Block::setRandom does, and what
+        // numpy's `a[:, 0] = ...` achieves.
+        ColProxy& set_Ran_values(double lo, double hi) {
+            Matrix<datatype> tmp(mat.rows(), 1);
+            tmp.set_Ran_values(lo, hi);
+            return *this = tmp;
+        }
+        ColProxy& set_Ran_values(double lo, double hi, long seed) {
+            Matrix<datatype> tmp(mat.rows(), 1);
+            tmp.set_Ran_values(lo, hi, seed);
+            return *this = tmp;
+        }
+        ColProxy& fill(const datatype& v) {
+            Matrix<datatype> tmp(mat.rows(), 1);
+            for (long i = 0; i < tmp.rows() * tmp.cols(); i++) tmp[int(i)] = v;
+            return *this = tmp;
         }
         friend std::ostream& operator<<(std::ostream& os, const ColProxy& p) {
             return os << static_cast<Matrix<datatype>>(p).toString();
@@ -1111,6 +1201,51 @@ class Matrix {
                 ans[idx] = mat(r1 + i * rStep, c1 + j * cStep);
             }
             return ans;
+        }
+        // ── Arithmetic, so a slice behaves like the matrix it denotes ──
+        // These are MEMBERS on purpose. The free operators cannot help: template
+        // argument deduction runs BEFORE user-defined conversions, so
+        // `proxy - proxy` never reaches operator Matrix. Member lookup happens
+        // first, and then the right-hand side is free to convert.
+        Matrix<datatype> operator+(const Matrix<datatype>& r) const {
+            return static_cast<Matrix<datatype>>(*this) + r;
+        }
+        Matrix<datatype> operator-(const Matrix<datatype>& r) const {
+            return static_cast<Matrix<datatype>>(*this) - r;
+        }
+        Matrix<datatype> operator%(const Matrix<datatype>& r) const {
+            return static_cast<Matrix<datatype>>(*this) % r;
+        }
+        Matrix<datatype> operator*(const Matrix<datatype>& r) const {
+            return static_cast<Matrix<datatype>>(*this) * r;
+        }
+        template <typename Scalar>
+        Matrix<datatype> operator*(const Scalar& k) const {
+            return static_cast<Matrix<datatype>>(*this) * k;
+        }
+        template <typename Scalar>
+        Matrix<datatype> operator/(const Scalar& k) const {
+            return static_cast<Matrix<datatype>>(*this) / k;
+        }
+
+        // ── Mutating fill, writing THROUGH to the matrix ──
+        // The proxy holds a reference, so this is a real in-place fill of the
+        // slice — the same thing Eigen's Block::setRandom does, and what
+        // numpy's `a[:, 0] = ...` achieves.
+        SubProxy& set_Ran_values(double lo, double hi) {
+            Matrix<datatype> tmp(numRows, numCols);
+            tmp.set_Ran_values(lo, hi);
+            return *this = tmp;
+        }
+        SubProxy& set_Ran_values(double lo, double hi, long seed) {
+            Matrix<datatype> tmp(numRows, numCols);
+            tmp.set_Ran_values(lo, hi, seed);
+            return *this = tmp;
+        }
+        SubProxy& fill(const datatype& v) {
+            Matrix<datatype> tmp(numRows, numCols);
+            for (long i = 0; i < tmp.rows() * tmp.cols(); i++) tmp[int(i)] = v;
+            return *this = tmp;
         }
         friend std::ostream& operator<<(std::ostream& os, const SubProxy& p) {
             return os << static_cast<Matrix<datatype>>(p).toString();
@@ -1471,6 +1606,13 @@ class Matrix {
     }
 
     // element-wise log base 2, using computer science notation.
+    // 2^x, element-wise. MATLAB spells this pow2(); C++ spells it exp2(), and
+    // this follows C++ because pow2() here means "square". std::exp2 has no
+    // complex overload, so it goes through pow(2, x), which does.
+    Matrix exp2() const {
+        return mapElems([](const datatype& x) { return datatype(std::pow(datatype(2), x)); });
+    }
+
     Matrix lg() const {
         return mapElems([=](const datatype& x) { return std::log2(x); });
     }
