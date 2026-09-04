@@ -31,6 +31,8 @@
 #include <string>
 #include <vector>
 
+using namespace mcpu;   // the package lives in mcpu; mgpu is its GPU twin
+
 namespace fs = std::filesystem;
 
 struct Curve {

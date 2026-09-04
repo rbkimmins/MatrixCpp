@@ -5,6 +5,8 @@
 // it never saw.
 #include "plotting/MatrixPlot.hpp"
 #include <cstdio>
+
+using namespace mcpu;   // the package lives in mcpu; mgpu is its GPU twin
 int main() {
     const int N = 1024;
     const double fs = 512.0;                       // samples per second

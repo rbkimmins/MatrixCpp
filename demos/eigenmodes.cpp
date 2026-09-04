@@ -6,6 +6,8 @@
 #include "plotting/MatrixPlot.hpp"
 #include <algorithm>
 #include <cstdio>
+
+using namespace mcpu;   // the package lives in mcpu; mgpu is its GPU twin
 int main() {
     const int n = 200;
     const double h = 1.0 / (n + 1);

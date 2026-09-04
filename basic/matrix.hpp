@@ -14,6 +14,9 @@
 
 #include "io.hpp"
 
+namespace mcpu {
+
+
 template <typename datatype>
 class Decomposition;
 
@@ -1062,13 +1065,72 @@ class Matrix {
         Matrix<datatype> operator*(const Matrix<datatype>& r) const {
             return static_cast<Matrix<datatype>>(*this) * r;
         }
-        template <typename Scalar>
+        // The scalar forms are CONSTRAINED to things actually convertible to
+        // an element. Without that guard they are an exact match for a proxy
+        // argument -- no conversion needed -- so `slice - slice` picks the
+        // scalar template over the Matrix overload that wants a conversion,
+        // and then fails deep inside trying to build a datatype out of a
+        // proxy. Matrix's own mask_scalar_t does not help here: it excludes
+        // Matrix, and a proxy is not one.
+        template <typename Scalar,
+                  typename = std::enable_if_t<std::is_convertible<Scalar, datatype>::value>>
         Matrix<datatype> operator*(const Scalar& k) const {
             return static_cast<Matrix<datatype>>(*this) * k;
         }
-        template <typename Scalar>
+        template <typename Scalar,
+                  typename = std::enable_if_t<std::is_convertible<Scalar, datatype>::value>>
         Matrix<datatype> operator/(const Scalar& k) const {
             return static_cast<Matrix<datatype>>(*this) / k;
+        }
+        // Element-wise division by a matrix, so the guard above does not remove
+        // a spelling that used to work through the unconstrained template.
+        Matrix<datatype> operator/(const Matrix<datatype>& r) const {
+            return static_cast<Matrix<datatype>>(*this) / r;
+        }
+        // Scalar + and -, which the Matrix class has and these did not.
+        template <typename Scalar,
+                  typename = std::enable_if_t<std::is_convertible<Scalar, datatype>::value>>
+        Matrix<datatype> operator+(const Scalar& v) const {
+            return static_cast<Matrix<datatype>>(*this) + v;
+        }
+        template <typename Scalar,
+                  typename = std::enable_if_t<std::is_convertible<Scalar, datatype>::value>>
+        Matrix<datatype> operator-(const Scalar& v) const {
+            return static_cast<Matrix<datatype>>(*this) - v;
+        }
+
+        // ── Compound assignment ────────────────────────────────────────
+        //
+        // `A(all, 0) += b` used to be a compile error: the binary operators
+        // above were made members to get past the deduction problem, but the
+        // compound family was left behind, and there is no conversion path that
+        // rescues it either -- operator+= must be a member, and Matrix's cannot
+        // be found through the proxy.
+        //
+        // Each is defined through the proxy's OWN binary operator above, not
+        // through Matrix's compound one. That matters: Matrix's scalar += is
+        // constrained only against Matrix, so handing it a proxy would pick the
+        // scalar overload and fail. Going through `*this + r` uses the
+        // overload set that already knows what a slice is.
+        template <typename Rhs>
+        RowProxy& operator+=(const Rhs& r) {
+            return *this = *this + r;
+        }
+        template <typename Rhs>
+        RowProxy& operator-=(const Rhs& r) {
+            return *this = *this - r;
+        }
+        template <typename Rhs>
+        RowProxy& operator%=(const Rhs& r) {
+            return *this = *this % r;
+        }
+        template <typename Rhs>
+        RowProxy& operator*=(const Rhs& r) {
+            return *this = *this * r;
+        }
+        template <typename Rhs>
+        RowProxy& operator/=(const Rhs& r) {
+            return *this = *this / r;
         }
 
         // ── Mutating fill, writing THROUGH to the matrix ──
@@ -1135,13 +1197,72 @@ class Matrix {
         Matrix<datatype> operator*(const Matrix<datatype>& r) const {
             return static_cast<Matrix<datatype>>(*this) * r;
         }
-        template <typename Scalar>
+        // The scalar forms are CONSTRAINED to things actually convertible to
+        // an element. Without that guard they are an exact match for a proxy
+        // argument -- no conversion needed -- so `slice - slice` picks the
+        // scalar template over the Matrix overload that wants a conversion,
+        // and then fails deep inside trying to build a datatype out of a
+        // proxy. Matrix's own mask_scalar_t does not help here: it excludes
+        // Matrix, and a proxy is not one.
+        template <typename Scalar,
+                  typename = std::enable_if_t<std::is_convertible<Scalar, datatype>::value>>
         Matrix<datatype> operator*(const Scalar& k) const {
             return static_cast<Matrix<datatype>>(*this) * k;
         }
-        template <typename Scalar>
+        template <typename Scalar,
+                  typename = std::enable_if_t<std::is_convertible<Scalar, datatype>::value>>
         Matrix<datatype> operator/(const Scalar& k) const {
             return static_cast<Matrix<datatype>>(*this) / k;
+        }
+        // Element-wise division by a matrix, so the guard above does not remove
+        // a spelling that used to work through the unconstrained template.
+        Matrix<datatype> operator/(const Matrix<datatype>& r) const {
+            return static_cast<Matrix<datatype>>(*this) / r;
+        }
+        // Scalar + and -, which the Matrix class has and these did not.
+        template <typename Scalar,
+                  typename = std::enable_if_t<std::is_convertible<Scalar, datatype>::value>>
+        Matrix<datatype> operator+(const Scalar& v) const {
+            return static_cast<Matrix<datatype>>(*this) + v;
+        }
+        template <typename Scalar,
+                  typename = std::enable_if_t<std::is_convertible<Scalar, datatype>::value>>
+        Matrix<datatype> operator-(const Scalar& v) const {
+            return static_cast<Matrix<datatype>>(*this) - v;
+        }
+
+        // ── Compound assignment ────────────────────────────────────────
+        //
+        // `A(all, 0) += b` used to be a compile error: the binary operators
+        // above were made members to get past the deduction problem, but the
+        // compound family was left behind, and there is no conversion path that
+        // rescues it either -- operator+= must be a member, and Matrix's cannot
+        // be found through the proxy.
+        //
+        // Each is defined through the proxy's OWN binary operator above, not
+        // through Matrix's compound one. That matters: Matrix's scalar += is
+        // constrained only against Matrix, so handing it a proxy would pick the
+        // scalar overload and fail. Going through `*this + r` uses the
+        // overload set that already knows what a slice is.
+        template <typename Rhs>
+        ColProxy& operator+=(const Rhs& r) {
+            return *this = *this + r;
+        }
+        template <typename Rhs>
+        ColProxy& operator-=(const Rhs& r) {
+            return *this = *this - r;
+        }
+        template <typename Rhs>
+        ColProxy& operator%=(const Rhs& r) {
+            return *this = *this % r;
+        }
+        template <typename Rhs>
+        ColProxy& operator*=(const Rhs& r) {
+            return *this = *this * r;
+        }
+        template <typename Rhs>
+        ColProxy& operator/=(const Rhs& r) {
+            return *this = *this / r;
         }
 
         // ── Mutating fill, writing THROUGH to the matrix ──
@@ -1219,13 +1340,72 @@ class Matrix {
         Matrix<datatype> operator*(const Matrix<datatype>& r) const {
             return static_cast<Matrix<datatype>>(*this) * r;
         }
-        template <typename Scalar>
+        // The scalar forms are CONSTRAINED to things actually convertible to
+        // an element. Without that guard they are an exact match for a proxy
+        // argument -- no conversion needed -- so `slice - slice` picks the
+        // scalar template over the Matrix overload that wants a conversion,
+        // and then fails deep inside trying to build a datatype out of a
+        // proxy. Matrix's own mask_scalar_t does not help here: it excludes
+        // Matrix, and a proxy is not one.
+        template <typename Scalar,
+                  typename = std::enable_if_t<std::is_convertible<Scalar, datatype>::value>>
         Matrix<datatype> operator*(const Scalar& k) const {
             return static_cast<Matrix<datatype>>(*this) * k;
         }
-        template <typename Scalar>
+        template <typename Scalar,
+                  typename = std::enable_if_t<std::is_convertible<Scalar, datatype>::value>>
         Matrix<datatype> operator/(const Scalar& k) const {
             return static_cast<Matrix<datatype>>(*this) / k;
+        }
+        // Element-wise division by a matrix, so the guard above does not remove
+        // a spelling that used to work through the unconstrained template.
+        Matrix<datatype> operator/(const Matrix<datatype>& r) const {
+            return static_cast<Matrix<datatype>>(*this) / r;
+        }
+        // Scalar + and -, which the Matrix class has and these did not.
+        template <typename Scalar,
+                  typename = std::enable_if_t<std::is_convertible<Scalar, datatype>::value>>
+        Matrix<datatype> operator+(const Scalar& v) const {
+            return static_cast<Matrix<datatype>>(*this) + v;
+        }
+        template <typename Scalar,
+                  typename = std::enable_if_t<std::is_convertible<Scalar, datatype>::value>>
+        Matrix<datatype> operator-(const Scalar& v) const {
+            return static_cast<Matrix<datatype>>(*this) - v;
+        }
+
+        // ── Compound assignment ────────────────────────────────────────
+        //
+        // `A(all, 0) += b` used to be a compile error: the binary operators
+        // above were made members to get past the deduction problem, but the
+        // compound family was left behind, and there is no conversion path that
+        // rescues it either -- operator+= must be a member, and Matrix's cannot
+        // be found through the proxy.
+        //
+        // Each is defined through the proxy's OWN binary operator above, not
+        // through Matrix's compound one. That matters: Matrix's scalar += is
+        // constrained only against Matrix, so handing it a proxy would pick the
+        // scalar overload and fail. Going through `*this + r` uses the
+        // overload set that already knows what a slice is.
+        template <typename Rhs>
+        SubProxy& operator+=(const Rhs& r) {
+            return *this = *this + r;
+        }
+        template <typename Rhs>
+        SubProxy& operator-=(const Rhs& r) {
+            return *this = *this - r;
+        }
+        template <typename Rhs>
+        SubProxy& operator%=(const Rhs& r) {
+            return *this = *this % r;
+        }
+        template <typename Rhs>
+        SubProxy& operator*=(const Rhs& r) {
+            return *this = *this * r;
+        }
+        template <typename Rhs>
+        SubProxy& operator/=(const Rhs& r) {
+            return *this = *this / r;
         }
 
         // ── Mutating fill, writing THROUGH to the matrix ──
@@ -6275,3 +6455,5 @@ template <typename datatype>
 std::ostream& operator<<(std::ostream& os, const Matrix<datatype>& M) {
     return os << M.str();
 }
+
+}  // namespace mcpu

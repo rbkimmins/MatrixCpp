@@ -72,71 +72,77 @@ float ran2(long* idum) {
         return temp;
 }
 
-// ── One random value, returned ──────────────────────────────────────────────
-//
-// A(i, j) with two indices hands back a plain double&, and a built-in cannot
-// have members — C++ gives no way to write double::set_Ran_values. So the value
-// form is the one that works, and it is the one that reads correctly anyway:
-//
-//     particles(j, 0) = set_Ran_values(0.0, box_x);
-//
-// It is a FUNCTION RETURNING A NUMBER, not an operator acting on a target, so
-// the name belongs on the right of the assignment. This needs nothing but ran2
-// and so lives here, with no dependency on the matrix library at all.
-//
-// The return type is the common type of the bounds, which is what makes
-//
-//     char c = set_Ran_values('a', 'k');      // a random letter
-//     int  d = set_Ran_values(1, 6);          // a die
-//     double x = set_Ran_values(0.0, 10.0);
-//
-// all behave as written. Bounds are INCLUSIVE for integral results — a d6 must
-// be able to roll a 6 — and half-open for floating-point ones, matching ran2,
-// which deliberately never returns its endpoint.
-template <class A, class B>
-inline std::common_type_t<A, B> set_Ran_values(A lo, B hi, long seed) {
-    using T = std::common_type_t<A, B>;
-    if (seed >= 0)
-        throw std::invalid_argument(
-            "set_Ran_values: seed must be negative - that is how ran2 marks a fresh stream");
-    if (double(lo) > double(hi))
-        throw std::invalid_argument("set_Ran_values: lo must not exceed hi");
-    long s = seed;
-    const double u = double(ran2(&s));
-    if constexpr (std::is_integral<T>::value) {
-        long v = long(double(lo) + u * (double(hi) - double(lo) + 1.0));
-        if (v > long(hi)) v = long(hi);          // guards u rounding to 1.0
-        return T(v);
-    } else {
-        return T(double(lo) + u * (double(hi) - double(lo)));
-    }
-}
+namespace mcpu {
 
-// Unseeded: draws from a shared stream, so consecutive calls differ.
-template <class A, class B>
-inline std::common_type_t<A, B> set_Ran_values(A lo, B hi) {
-    using T = std::common_type_t<A, B>;
-    if (double(lo) > double(hi))
-        throw std::invalid_argument("set_Ran_values: lo must not exceed hi");
-    static long s = -1;
-    const double u = double(ran2(&s));
-    if constexpr (std::is_integral<T>::value) {
-        long v = long(double(lo) + u * (double(hi) - double(lo) + 1.0));
-        if (v > long(hi)) v = long(hi);
-        return T(v);
-    } else {
-        return T(double(lo) + u * (double(hi) - double(lo)));
+    // ── One random value, returned ──────────────────────────────────────────────
+    //
+    // A(i, j) with two indices hands back a plain double&, and a built-in cannot
+    // have members — C++ gives no way to write double::set_Ran_values. So the value
+    // form is the one that works, and it is the one that reads correctly anyway:
+    //
+    //     particles(j, 0) = set_Ran_values(0.0, box_x);
+    //
+    // It is a FUNCTION RETURNING A NUMBER, not an operator acting on a target, so
+    // the name belongs on the right of the assignment. This needs nothing but ran2
+    // and so lives here, with no dependency on the matrix library at all.
+    //
+    // The return type is the common type of the bounds, which is what makes
+    //
+    //     char c = set_Ran_values('a', 'k');      // a random letter
+    //     int  d = set_Ran_values(1, 6);          // a die
+    //     double x = set_Ran_values(0.0, 10.0);
+    //
+    // all behave as written. Bounds are INCLUSIVE for integral results — a d6 must
+    // be able to roll a 6 — and half-open for floating-point ones, matching ran2,
+    // which deliberately never returns its endpoint.
+    template <class A, class B>
+    inline std::common_type_t<A, B> set_Ran_values(A lo, B hi, long seed) {
+        using T = std::common_type_t<A, B>;
+        if (seed >= 0)
+            throw std::invalid_argument(
+                "set_Ran_values: seed must be negative - that is how ran2 marks a fresh stream");
+        if (double(lo) > double(hi))
+            throw std::invalid_argument("set_Ran_values: lo must not exceed hi");
+        long s = seed;
+        const double u = double(ran2(&s));
+        if constexpr (std::is_integral<T>::value) {
+            long v = long(double(lo) + u * (double(hi) - double(lo) + 1.0));
+            if (v > long(hi))
+                v = long(hi);  // guards u rounding to 1.0
+            return T(v);
+        } else {
+            return T(double(lo) + u * (double(hi) - double(lo)));
+        }
     }
-}
 
-void setRan(long& seed) {  // find totals sec since 0:00:00 and makes a seed with it
-    std::stringstream date;
-    auto today = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-    date << ctime(&today);
-    std::string month, day_name;
-    int day, hour, min, sec, total_sec;
-    char ch1, ch2;  //: :
-    date >> day_name >> month >> day >> hour >> ch1 >> min >> ch2 >> sec;
-    total_sec = -(hour * 360 + min * 60 + sec);  // seed must be negative
-    seed = total_sec;
-}
+    // Unseeded: draws from a shared stream, so consecutive calls differ.
+    template <class A, class B>
+    inline std::common_type_t<A, B> set_Ran_values(A lo, B hi) {
+        using T = std::common_type_t<A, B>;
+        if (double(lo) > double(hi))
+            throw std::invalid_argument("set_Ran_values: lo must not exceed hi");
+        static long s = -1;
+        const double u = double(ran2(&s));
+        if constexpr (std::is_integral<T>::value) {
+            long v = long(double(lo) + u * (double(hi) - double(lo) + 1.0));
+            if (v > long(hi))
+                v = long(hi);
+            return T(v);
+        } else {
+            return T(double(lo) + u * (double(hi) - double(lo)));
+        }
+    }
+
+    void setRan(long& seed) {  // find totals sec since 0:00:00 and makes a seed with it
+        std::stringstream date;
+        auto today = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        date << ctime(&today);
+        std::string month, day_name;
+        int day, hour, min, sec, total_sec;
+        char ch1, ch2;  //: :
+        date >> day_name >> month >> day >> hour >> ch1 >> min >> ch2 >> sec;
+        total_sec = -(hour * 360 + min * 60 + sec);  // seed must be negative
+        seed = total_sec;
+    }
+
+}  // namespace mcpu

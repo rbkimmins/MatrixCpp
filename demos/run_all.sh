@@ -2,7 +2,7 @@
 # Builds and runs every demo. From the repo root:  sh demos/run_all.sh
 set -e
 mkdir -p demos/out
-for d in mandelbrot svd_compress eigenmodes heat_expm fft_denoise; do
+for d in mandelbrot svd_compress eigenmodes heat_expm fft_denoise brownian_motion; do
     printf '\n=== %s ===\n' "$d"
     g++ -std=c++17 -O2 -fopenmp -I. "demos/$d.cpp" -o "/tmp/demo_$d"
     "/tmp/demo_$d"

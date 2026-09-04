@@ -39,6 +39,8 @@
 #include <vector>
 
 #include "Matrix1.0.hpp"
+
+using namespace mcpu;   // the package lives in mcpu; mgpu is its GPU twin
 using namespace std;
 using namespace std::chrono;
 

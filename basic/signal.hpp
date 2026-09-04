@@ -12,6 +12,9 @@
 
 #include "eigen.hpp"
 
+namespace mcpu {
+
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Fast Fourier transform  (tier 6)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -762,3 +765,5 @@ void printSideBySide(const Matrix<datatype>& A,
         std::cout << rowA << "   " << sym << "   " << rowB << '\n';
     }
 }
+
+}  // namespace mcpu

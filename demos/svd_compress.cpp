@@ -5,6 +5,8 @@
 // values - which this checks rather than asserts.
 #include "plotting/MatrixPlot.hpp"
 #include <cstdio>
+
+using namespace mcpu;   // the package lives in mcpu; mgpu is its GPU twin
 int main() {
     const int N = 200;
     Matrix<double> img(N, N);

@@ -104,6 +104,9 @@
 #include <memory>
 #include <initializer_list>
 
+namespace mcpu {
+
+
 template <typename datatype>
 class Tensor {
 public:
@@ -1595,3 +1598,5 @@ template <typename datatype>
 Tensor<datatype> operator*(TensorMulLhs<datatype> l, const Tensor<datatype>& B) { return l.a->mul(B); }
 template <typename datatype>
 Tensor<datatype> operator/(TensorDivLhs<datatype> l, const Tensor<datatype>& B) { return l.a->div(B); }
+
+}  // namespace mcpu

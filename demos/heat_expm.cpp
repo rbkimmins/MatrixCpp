@@ -8,6 +8,8 @@
 // past it. The matrix exponential has none, and takes one step of any size.
 #include "plotting/MatrixPlot.hpp"
 #include <cstdio>
+
+using namespace mcpu;   // the package lives in mcpu; mgpu is its GPU twin
 int main() {
     const int n = 120;
     const double h = 1.0 / (n + 1), T = 0.02;

@@ -12,6 +12,9 @@
 
 #include "mstore.hpp"
 
+namespace mcpu {
+
+
 namespace mconst {
 #if defined(__cpp_lib_math_constants) && !defined(MATRIXCPP_NO_STD_NUMBERS)
     using std::numbers::e;
@@ -128,3 +131,5 @@ const static long taylor_limit = 300;
 // otherwise These let one body serve both real and complex datatypes via `if
 // constexpr`, which is what makes conj()/real()/imag()/H() below degrade
 // gracefully instead of failing to compile on Matrix<double>.
+
+}  // namespace mcpu

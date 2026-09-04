@@ -1,5 +1,11 @@
 # MatrixCpp — design notes and roadmap
 
+> **Namespaces.** Everything below is written as bare `Matrix<double>`, which
+> is how it reads under `using namespace mcpu;`. The package lives in `mcpu`
+> and its GPU companion in `mgpu`, so the fully qualified spellings are
+> `mcpu::Matrix` and `mgpu::Matrix`. See the root README.
+
+
 These were a ~1250-line comment block inside `Matrix1.0.hpp`. They are the
 reasoning behind the code, not the code, and they were most of what made the
 header unreadable. Nothing was deleted — this is that block, verbatim.

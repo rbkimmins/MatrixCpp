@@ -6,6 +6,8 @@
 // Writes plot_1_lines.png ... plot_8_family.png into the working directory.
 #include "MatrixPlot.hpp"
 #include <cstdio>
+
+using namespace mcpu;   // the package lives in mcpu; mgpu is its GPU twin
 int main(){
   Matrix<double> x = linspace(0.0, 10.0, 120);
   // 1. multi-series line plot with labels

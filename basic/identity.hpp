@@ -12,6 +12,9 @@
 
 #include "signal.hpp"
 
+namespace mcpu {
+
+
 
 // ============================================================
 // IdentityMatrix — lazy proxy for k*I
@@ -164,3 +167,5 @@ Matrix<datatype> operator*(const IdentityMatrix& Id, Matrix<datatype> A) {
 // is for std=C++17 and beyond
 inline const IdentityMatrix I;
 // const IdentityMatrix I;
+
+}  // namespace mcpu

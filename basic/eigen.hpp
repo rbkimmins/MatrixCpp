@@ -13,6 +13,9 @@
 
 #include "builders.hpp"
 
+namespace mcpu {
+
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Generalized eigenvalue problems  (tier 4)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1062,3 +1065,5 @@ Matrix<std::complex<double>> funm(const Matrix<datatype>& A, F f) {
         }
     return out;
 }
+
+}  // namespace mcpu

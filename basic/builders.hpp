@@ -12,6 +12,9 @@
 
 #include "decomposition.hpp"
 
+namespace mcpu {
+
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Sequences and constructors  (tier 5)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -412,3 +415,5 @@ Matrix<double> polyfit(const Matrix<datatype>& x, const Matrix<datatype>& y, lon
         b(int(i), 0) = double(std::real(y[int(i)]));
     return V.solve(b);
 }
+
+}  // namespace mcpu

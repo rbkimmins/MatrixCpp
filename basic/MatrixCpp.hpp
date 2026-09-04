@@ -7,9 +7,21 @@
 // One include for everything:
 //
 //     #include "basic/MatrixCpp.hpp"
+//     using namespace mcpu;
 //
 //     Matrix<double> A(3, 3);
 //     Tensor<double> T({2, 3, 4});
+//
+// The package lives in NAMESPACE MCPU, and its GPU companion in mgpu, so that
+// mcpu::Matrix and mgpu::Matrix read as the one-to-one pair they are -- the
+// C++ spelling of numpy and cupy:
+//
+//     namespace np = mcpu;
+//     namespace cp = mgpu;
+//
+// Do not `using namespace` both at once; they both export Matrix. Code that
+// includes the Matrix1.0.hpp or Tensor.hpp shims gets mcpu hoisted to global
+// scope automatically and needs no change.
 //
 // The package is split by theme, and each header stands on its own if that is
 // all you need — they chain their own dependencies, so including any one of

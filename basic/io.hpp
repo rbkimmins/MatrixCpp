@@ -32,6 +32,9 @@
 #include <functional>
 #include <ostream>
 
+namespace mcpu {
+
+
 namespace matio {
 
 // Auto means "decide from context": the terminal gets Pretty, a file gets
@@ -234,3 +237,5 @@ void saveWith(const std::string& path, Opts o, Writer w) {
 }
 
 }  // namespace matio
+
+}  // namespace mcpu

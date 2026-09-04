@@ -1,15 +1,19 @@
 # Compiled binaries (these were previously committed — remove them from the
 # index with:  git rm --cached Running_time test test_noomp running_time)
-Running_time
-running_time
-test
-test_noomp
+#
+# LEADING SLASH MATTERS. Unanchored, `test` matches a directory of that name at
+# ANY depth, which silently swallowed the whole of gpu/test/ — source files and
+# all — because git never mentions what it is ignoring.
+/Running_time
+/running_time
+/test
+/test_noomp
 *.o
 *.out
 a.out
 
-validate
-numpy_validate
+/validate
+/numpy_validate
 
 # Benchmark and validation output — regenerate with the commands in README.md
 bench/
@@ -27,3 +31,10 @@ Manifest.toml
 validate_tensor
 tensor_numpy_validate
 tensor_cases.txt
+
+# GPU package build output — regenerate with `make -C gpu`
+gpu/libmatrixcpp_gpu.a
+gpu/test/correctness
+gpu/test/benchmark
+gpu/test/results/
+gpu/demo/wigner

@@ -14,6 +14,9 @@
 
 #include "matrix.hpp"
 
+namespace mcpu {
+
+
 // ─── Matrix functions (free) ────────────────────────────────────────────────
 // Reminder on the convention this header follows:
 //   A.exp()  → element-wise, e^(a_ij) for each element independently
@@ -416,3 +419,5 @@ Matrix<std::complex<double>> eigvals(const Matrix<datatype>& A) {
 // diag(v) — builds a square diagonal matrix FROM a vector, the inverse
 // direction of the member A.diag() which extracts a diagonal into a vector.
 // v must be a row or column vector; an (n x 1) or (1 x n) input gives n x n.
+
+}  // namespace mcpu

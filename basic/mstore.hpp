@@ -50,6 +50,9 @@
     #define MATRIXCPP_RESTRICT
 #endif
 
+namespace mcpu {
+
+
 namespace mstore {
 
     // Ask the kernel to back a large buffer with 2 MB transparent huge pages
@@ -314,3 +317,5 @@ namespace mstore {
 // project moves to C++20 — the names are already the standard ones, they just
 // stop being ours. Define MATRIXCPP_NO_STD_NUMBERS to force the fallback (which
 // is what validate.cpp does, so that the two are checked against each other).
+
+}  // namespace mcpu

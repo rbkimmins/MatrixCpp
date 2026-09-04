@@ -12,6 +12,9 @@
 
 #include "matrixfunctions.hpp"
 
+namespace mcpu {
+
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Decomposition — factor once, solve many times  (tier 4)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -306,3 +309,5 @@ template <typename datatype, typename dtB>
 Matrix<double> lsqminnorm(const Matrix<datatype>& A, const Matrix<dtB>& B, double tol = -1.0) {
     return A.pinv(tol) * B;
 }
+
+}  // namespace mcpu

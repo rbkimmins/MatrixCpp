@@ -8,6 +8,8 @@
 // masks do the work for every pixel at once.
 #include "plotting/MatrixPlot.hpp"
 #include <cstdio>
+
+using namespace mcpu;   // the package lives in mcpu; mgpu is its GPU twin
 int main() {
     using cplx = std::complex<double>;
     const int H = 600, W = 800, MAXIT = 120;

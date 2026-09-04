@@ -16,6 +16,9 @@
 #include <chrono>
 #include <functional>
 
+namespace mcpu {
+
+
 template <class T>
 struct is_complex : std::false_type {};
 template <class T>
@@ -349,3 +352,5 @@ struct TaylorOpts {
 // constexpr all_t all;
 //  Declared here so Matrix::factorize() can name it; defined after the class,
 //  which cannot happen sooner because Decomposition holds Matrix members.
+
+}  // namespace mcpu

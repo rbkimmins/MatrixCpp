@@ -47,6 +47,7 @@ docs/
 
 ```cpp
 #include "basic/MatrixCpp.hpp"
+using namespace mcpu;
 
 Matrix<double> A(3, 3);
 Tensor<double> T({2, 3, 4});
@@ -54,8 +55,31 @@ Tensor<double> T({2, 3, 4});
 
 Each header stands on its own and chains its own dependencies, so including
 just `basic/matrix.hpp` pulls exactly what it needs. `Matrix1.0.hpp` and
-`Tensor.hpp` remain at the top level as one-line shims, so existing code
-compiles unchanged.
+`Tensor.hpp` remain at the top level as shims that also hoist `mcpu` to global
+scope, so existing code compiles unchanged.
+
+## Namespaces
+
+The package lives in `namespace mcpu`, and its GPU companion in `mgpu`, so the
+two spell the same one namespace apart:
+
+```cpp
+namespace np = mcpu;                        // the C++ spelling of
+namespace cp = mgpu;                        //   import numpy as np
+
+np::Matrix<double> A(4096, 4096);
+cp::Matrix<double> dA = cp::upload(A);      // one crossing of the bus
+np::Matrix<double> C  = (dA * dA).cpu();    // and one back
+```
+
+`using namespace mcpu;` gives back the unqualified `Matrix<double>` for
+CPU-only code, and that is what every demo here does. The one combination to
+avoid is `using namespace mcpu;` **and** `using namespace mgpu;` in the same
+file — both export `Matrix`, so the bare name becomes ambiguous. That is the
+point of the split rather than a flaw in it: qualify one of them.
+
+Anything that includes `Matrix1.0.hpp` or `Tensor.hpp` needs no change at all;
+the shims hoist `mcpu` for you.
 
 The ~1250-line comment block that used to live inside the header — every design
 decision, measurement and negative result — is now `docs/DESIGN_NOTES.md`. That
@@ -83,7 +107,8 @@ instead — `t.sum(0)`, `t.cumsum(2)`.
 
 ## Building
 
-The library is a single header — just `#include "Matrix1.0.hpp"`. It requires
+The library is a single header — just `#include "Matrix1.0.hpp"`, which also
+hoists `mcpu` to global scope so the samples above work verbatim. It requires
 **C++17** (it uses `if constexpr`, structured bindings and inline variables).
 
 ```
