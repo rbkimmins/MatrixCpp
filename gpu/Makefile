@@ -26,7 +26,7 @@ NVCCFLAGS := -std=c++17 -O3 -arch=$(ARCH) -Xcompiler -fPIC -Xcompiler -Wall
 LDFLAGS := -L. -lmatrixcpp_gpu -L$(CUDA)/lib64 \
            -lcudart -lcublas -lcusolver -lcurand -lcufft -fopenmp
 
-.PHONY: all test bench demo clean run-test run-bench run-demo
+.PHONY: all test bench demo clean run-test run-bench run-demo bench-cupy run-bench-cupy
 
 all: $(LIB)
 
@@ -38,6 +38,7 @@ $(LIB): src/backend.cu detail/backend.hpp
 test: test/correctness
 bench: test/benchmark
 demo: demo/wigner
+bench-cupy: bench/gpu_timings bench/plot_comparison
 
 test/correctness: test/correctness.cpp $(LIB) gpu_matrix.hpp device.hpp MatrixGpu.hpp
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
@@ -48,6 +49,13 @@ test/benchmark: test/benchmark.cpp $(LIB) gpu_matrix.hpp device.hpp MatrixGpu.hp
 demo/wigner: demo/wigner.cpp $(LIB) gpu_matrix.hpp device.hpp MatrixGpu.hpp
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
 
+bench/gpu_timings: bench/gpu_timings.cpp $(LIB) gpu_matrix.hpp device.hpp MatrixGpu.hpp
+	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
+
+# The plotter needs no CUDA: it reads CSVs and draws with plt::.
+bench/plot_comparison: bench/plot_comparison.cpp
+	$(CXX) -std=c++17 -O2 -fopenmp -Wall -Wextra -I$(ROOT) $< -o $@ -fopenmp
+
 run-test: test/correctness
 	@LD_LIBRARY_PATH=$(CUDA)/lib64:$$LD_LIBRARY_PATH ./test/correctness
 
@@ -55,7 +63,9 @@ run-bench: test/benchmark
 	@LD_LIBRARY_PATH=$(CUDA)/lib64:$$LD_LIBRARY_PATH ./test/benchmark
 
 run-demo: demo/wigner
+bench-cupy: bench/gpu_timings bench/plot_comparison
 	@LD_LIBRARY_PATH=$(CUDA)/lib64:$$LD_LIBRARY_PATH ./demo/wigner
 
 clean:
-	rm -f $(LIB) backend.o test/correctness test/benchmark demo/wigner
+	rm -f $(LIB) backend.o test/correctness test/benchmark demo/wigner \
+	      bench/gpu_timings bench/plot_comparison

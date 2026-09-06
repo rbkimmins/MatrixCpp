@@ -459,6 +459,41 @@ int main() {
         }
     }
 
+    std::printf("\nSorting (Thrust / CUB)\n");
+    for (long n : {1L << 20, 1L << 24}) {
+        Matrix<double> v = randMat(1, n);
+        auto dv = mgpu::upload(v);
+        const double cpu = timeIt(3, [&] { volatile auto r = v.sort(ROW); (void)r; });
+        const double g = timeGpu(5, [&] { auto r = dv.sorted(); mgpu::sync(); });
+        std::printf("  sort %10ld  f64   cpu %9.2f ms   gpu %8.2f ms   %6.2fx\n", n, cpu, g,
+                    cpu / g);
+        g_rows.push_back("sort," + std::to_string(n) + ",f64," + std::to_string(cpu) + "," +
+                         std::to_string(g));
+    }
+    for (long n : {1024L, 4096L}) {
+        Matrix<double> A = randMat(n, n);
+        auto dA = mgpu::upload(A);
+        const double cpu = timeIt(2, [&] { volatile auto r = A.sort(ROW); (void)r; });
+        const double g = timeGpu(5, [&] { auto r = dA.sort(ROW); mgpu::sync(); });
+        std::printf("  sort rows of %4ldx%-4ld  cpu %9.2f ms   gpu %8.2f ms   %6.2fx\n", n, n,
+                    cpu, g, cpu / g);
+        const double cpuc = timeIt(2, [&] { volatile auto r = A.sort(COL); (void)r; });
+        const double gc = timeGpu(5, [&] { auto r = dA.sort(COL); mgpu::sync(); });
+        std::printf("  sort cols of %4ldx%-4ld  cpu %9.2f ms   gpu %8.2f ms   %6.2fx\n", n, n,
+                    cpuc, gc, cpuc / gc);
+        g_rows.push_back("sort_rows," + std::to_string(n) + ",f64," + std::to_string(cpu) + "," +
+                         std::to_string(g));
+    }
+    {
+        const long n = 1L << 22;
+        Matrix<double> v = randMat(1, n);
+        auto dv = mgpu::upload(v);
+        const double cpu = timeIt(2, [&] { volatile auto r = v.median(ROW); (void)r; });
+        const double g = timeGpu(5, [&] { volatile double r = dv.median(); (void)r; mgpu::sync(); });
+        std::printf("  median %8ld f64   cpu %9.2f ms   gpu %8.2f ms   %6.2fx\n", n, cpu, g,
+                    cpu / g);
+    }
+
     {
         std::ofstream f("test/results/cpp.csv");
         f << "op,n,dtype,cpu_ms,gpu_ms\n";

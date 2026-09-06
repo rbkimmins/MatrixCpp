@@ -69,6 +69,13 @@
 
 namespace mgpu {
 
+    namespace detail {
+        // Dependent false, so the static_assert fires only when the function is
+        // actually instantiated rather than the moment the class is parsed.
+        template <typename>
+        inline constexpr bool always_false = false;
+    }  // namespace detail
+
     // ── Device-side storage ────────────────────────────────────────────
     //
     // RAII around cudaMalloc. Move-only on purpose: an accidental copy of a
@@ -109,6 +116,43 @@ namespace mgpu {
         void* p_ = nullptr;
         std::size_t bytes_ = 0;
     };
+
+    // ── Shared vocabulary, re-exported ─────────────────────────────────
+    //
+    // These are RE-EXPORTS, not copies: mgpu::all and mcpu::all name the same
+    // object, so `using namespace mcpu;` and `using namespace mgpu;` in one
+    // file stay unambiguous, and a matrix built on one side can be indexed
+    // with the other's tag.
+    //
+    // WHY THESE AND NOT THE REST. The test is whether the thing has any
+    // dependence on where the data lives:
+    //
+    //   all / all_t   an EMPTY tag struct. No data, no behaviour -- overload
+    //                 resolution reads its type and nothing else. There is
+    //                 literally nothing about it that could differ per device.
+    //   ROW / COL     two bools naming an axis convention.
+    //   NormType      an enum of four names.
+    //
+    // None of those could have a device-specific version even in principle,
+    // so a second definition would only be a way to get them out of step.
+    //
+    // The random-number vocabulary splits, and the split is the interesting
+    // one. ran2, setRan and the value-returning set_Ran_values are HOST
+    // functions -- a sequential generator producing one number at a time --
+    // so they are shared as-is. Filling a MATRIX is not shared: that is
+    // Matrix::set_Ran_values, and the GPU one runs cuRAND across every element
+    // at once and cannot reproduce a sequential stream's order. Same name,
+    // genuinely different implementation, which is why it is a member.
+
+    using mcpu::all;
+    using mcpu::all_t;
+    using mcpu::COL;
+    using mcpu::NormType;
+    using mcpu::ROW;
+
+    using mcpu::ran2;
+    using mcpu::set_Ran_values;
+    using mcpu::setRan;
 
     // ── Complex traits ─────────────────────────────────────────────────
     //
@@ -222,6 +266,139 @@ namespace mgpu {
         datatype* data() { return (datatype*)buf_.get(); }
         const datatype* data() const { return (const datatype*)buf_.get(); }
 
+        // ── Scalar element access ──────────────────────────────────────
+        //
+        // A(i, j) and A[k], read and write, so code written against
+        // mcpu::Matrix compiles unchanged after a namespace swap.
+        //
+        // THESE ARE EXPENSIVE AND THE COST DOES NOT SHRINK. Every one is a
+        // separate 8-byte transfer across PCIe, which costs microseconds
+        // whatever its size -- a latency, not a bandwidth. Filling a 1000x1000
+        // matrix element by element is some seconds of pure round trips
+        // against under a millisecond for set_Ran_values. They exist for the
+        // handful of scalars a program genuinely needs (a boundary value, one
+        // entry of a small vector), not as a way to build data.
+        //
+        // Build on the host and upload, or use fill/set_Ran_values/linspace and
+        // the views, all of which run on the device.
+        //
+        // Indices may be negative and wrap from the end, which is what the CPU
+        // side's documentation promises; anything still out of range throws
+        // rather than reading past the buffer.
+
+        class ElementRef {
+          public:
+            ElementRef(Matrix& m, std::size_t k) : m_(&m), k_(k) {}
+
+            operator datatype() const {
+                datatype v{};
+                detail::copyD2H(&v, m_->data() + k_, sizeof(datatype));
+                return v;
+            }
+            ElementRef& operator=(datatype v) {
+                detail::copyH2D(m_->data() + k_, &v, sizeof(datatype));
+                return *this;
+            }
+            // Element-to-element assignment goes through the host, since there
+            // is no cheaper route for one value.
+            ElementRef& operator=(const ElementRef& o) { return *this = datatype(o); }
+
+            ElementRef& operator+=(datatype v) { return *this = datatype(*this) + v; }
+            ElementRef& operator-=(datatype v) { return *this = datatype(*this) - v; }
+            ElementRef& operator*=(datatype v) { return *this = datatype(*this) * v; }
+            ElementRef& operator/=(datatype v) { return *this = datatype(*this) / v; }
+
+          private:
+            Matrix* m_;
+            std::size_t k_;
+        };
+
+// A floating-point index TRUNCATES rather than rounds -- A[2.9] means
+        // A[2] -- and nothing warns. Refused here for the same reason as on the
+        // CPU side, and with the same message, so ml:: code written against one
+        // backend behaves identically on the other.
+        template <typename U, typename = std::enable_if_t<std::is_floating_point<U>::value>>
+        datatype operator[](U) const {
+            static_assert(!std::is_floating_point<U>::value,
+                          "a floating-point index TRUNCATES: A[2.9] means A[2], not A[3]. "
+                          "Round first and say which you meant, or keep the index integral.");
+            return datatype{};
+        }
+        template <typename U, typename V,
+                  typename = std::enable_if_t<std::is_floating_point<U>::value ||
+                                              std::is_floating_point<V>::value>>
+        datatype operator()(U, V) const {
+            static_assert(!(std::is_floating_point<U>::value || std::is_floating_point<V>::value),
+                          "a floating-point index TRUNCATES: A(1.9, 1.9) means A(1, 1). "
+                          "Round first and say which you meant, or keep the indices integral.");
+            return datatype{};
+        }
+
+                ElementRef operator()(long i, long j) { return ElementRef(*this, flatIndex(i, j)); }
+        datatype operator()(long i, long j) const {
+            datatype v{};
+            detail::copyD2H(&v, data() + flatIndex(i, j), sizeof(datatype));
+            return v;
+        }
+        ElementRef operator[](long k) { return ElementRef(*this, flatIndex(k)); }
+        datatype operator[](long k) const {
+            datatype v{};
+            detail::copyD2H(&v, data() + flatIndex(k), sizeof(datatype));
+            return v;
+        }
+
+        // ── A 1x1 matrix IS a scalar ───────────────────────────────────
+        //
+        //     double r = std::sqrt(sum((a - b).pow(2), ROW));
+        //
+        // sum along a 1 x n row gives a 1 x 1, and this is what lets it be
+        // used as the number it is. Same rule as mcpu::Matrix: exactly one
+        // element or it throws, because there is no other sensible answer.
+        operator datatype() const {
+            if (size() != 1)
+                throw Error("a Matrix converts to a scalar only when it holds exactly one "
+                            "element, but this one is " + std::to_string(rows_) + "x" +
+                            std::to_string(cols_) + " (" + std::to_string(size()) +
+                            " elements). Index it, or reduce it first - sum(), det(), dot() and "
+                            "the other reductions already return scalars.");
+            datatype v{};
+            detail::copyD2H(&v, data(), sizeof(datatype));
+            return v;
+        }
+
+        // ── No iterators, deliberately ─────────────────────────────────
+        //
+        // A range-for over a device matrix would be one PCIe round trip PER
+        // ELEMENT -- about 5 us each, so a 1000x1000 matrix is roughly a
+        // minute of pure latency for what the CPU does in under a millisecond.
+        //
+        // It would also compile silently. Code written against the ml:: layer
+        // is meant to build for either backend, and a loop that works on the
+        // CPU and quietly crawls on the GPU is worse than one that refuses:
+        // the refusal is found at compile time, on the machine writing it.
+        //
+        // Download once and iterate the host copy, or express the loop as a
+        // whole-matrix operation:
+        //
+        //     for (double v : dA.cpu()) ...      // one transfer, then free
+        //     double s = dA.sum();               // better: no transfer at all
+        template <typename U = datatype>
+        U* begin() {
+            static_assert(detail::always_false<U>,
+                          "mgpu::Matrix has no begin()/end(): iterating device memory costs a "
+                          "PCIe round trip per element. Use .cpu() to get an iterable host "
+                          "matrix, or a whole-matrix operation instead.");
+            return nullptr;
+        }
+        template <typename U = datatype>
+        U* end() {
+            static_assert(detail::always_false<U>,
+                          "mgpu::Matrix has no begin()/end(): iterating device memory costs a "
+                          "PCIe round trip per element. Use .cpu() to get an iterable host "
+                          "matrix, or a whole-matrix operation instead.");
+            return nullptr;
+        }
+
         // --- Transfer ---
 
         // Downloads. The only device->host crossing in the class.
@@ -230,6 +407,26 @@ namespace mgpu {
             if (size()) detail::copyD2H(hostData(out), buf_.get(), buf_.bytes());
             return out;
         }
+
+        // --- Output ---
+        //
+        // Formatting is a HOST job: it walks elements one at a time, builds
+        // strings, and produces at most a few kilobytes. There is nothing to
+        // parallelise and nothing to gain from doing it on the device, so all
+        // of these download once and hand the work to the CPU package's
+        // formatter -- which means every format matio knows (Pretty, CSV, TSV,
+        // Markdown, MATLAB, NumPy, JSON) works on a device matrix for free.
+        //
+        // matio lives in mcpu, so it is qualified: the formats are shared, the
+        // namespace split is not.
+
+        void print(std::ostream& os, const mcpu::matio::Opts& o) const { cpu().print(os, o); }
+        void print(std::ostream& os) const { cpu().print(os); }
+        void print(const mcpu::matio::Opts& o) const { cpu().print(o); }
+        void print() const { cpu().print(); }
+        void print(int precision) const { cpu().print(precision); }
+        std::string str(const mcpu::matio::Opts& o = {}) const { return cpu().str(o); }
+        void save(const std::string& path, mcpu::matio::Opts o = {}) const { cpu().save(path, o); }
 
         // --- Fills ---
 
@@ -259,6 +456,31 @@ namespace mgpu {
         }
 
       private:
+        // Negative indices count from the end -- A(-1, -1) is the last
+        // element. The CPU side documents this too but implements it as
+        // `i % rows`, and C++ gives -1 % 3 == -1, so it reads BEFORE the
+        // buffer instead of wrapping. This does the arithmetic that the
+        // documentation describes, and refuses anything still out of range: a
+        // stray index on the device corrupts memory silently rather than
+        // segfaulting where you can see it.
+        std::size_t flatIndex(long i, long j) const {
+            const long r = i < 0 ? i + rows_ : i;
+            const long c = j < 0 ? j + cols_ : j;
+            if (r < 0 || r >= rows_ || c < 0 || c >= cols_)
+                throw Error("index (" + std::to_string(i) + ", " + std::to_string(j) +
+                            ") is outside a " + std::to_string(rows_) + "x" +
+                            std::to_string(cols_) + " matrix");
+            return (std::size_t)r * (std::size_t)cols_ + (std::size_t)c;
+        }
+        std::size_t flatIndex(long k) const {
+            const long n = (long)size();
+            const long q = k < 0 ? k + n : k;
+            if (q < 0 || q >= n)
+                throw Error("flat index " + std::to_string(k) + " is outside a matrix of " +
+                            std::to_string(n) + " elements");
+            return (std::size_t)q;
+        }
+
         static void checkDims(long r, long c) {
             if (r < 0 || c < 0)
                 throw Error("Matrix: negative dimension (" + std::to_string(r) + "x" +
@@ -500,6 +722,56 @@ namespace mgpu {
         }
         Matrix pow2() const { return map(detail::UnOp::Square); }   // square, as in basic/
         Matrix pow(datatype e) const { return scalar(detail::BinOp::Pow, e, false); }
+
+        // The rest of <cmath>, matching mcpu::Matrix. Real only: acosh and its
+        // relatives do have complex branches, but they need a branch-cut
+        // convention to be pinned down and guessing one is worse than not
+        // offering it.
+        Matrix asinh() const { requireReal("asinh"); return map(detail::UnOp::Asinh); }
+        Matrix acosh() const { requireReal("acosh"); return map(detail::UnOp::Acosh); }
+        Matrix atanh() const { requireReal("atanh"); return map(detail::UnOp::Atanh); }
+        Matrix cbrt() const { requireReal("cbrt"); return map(detail::UnOp::Cbrt); }
+        // log(1+x) and exp(x)-1, accurate for small x where the naive forms
+        // lose every significant digit.
+        Matrix log1p() const { requireReal("log1p"); return map(detail::UnOp::Log1p); }
+        Matrix expm1() const { requireReal("expm1"); return map(detail::UnOp::Expm1); }
+        // Toward zero, unlike floor (down) and round (to nearest). basic/ calls
+        // this fix(), after MATLAB; both spellings are here.
+        Matrix trunc() const { requireReal("trunc"); return map(detail::UnOp::Trunc); }
+        Matrix fix() const { return trunc(); }
+
+        Matrix atan2(const Matrix& o) const { return zip(o, detail::BinOp::Atan2, "atan2"); }
+        Matrix hypot(const Matrix& o) const { return zip(o, detail::BinOp::Hypot, "hypot"); }
+        // mod keeps the sign of the dividend; rem rounds to the nearest
+        // multiple and may be negative -- the same split basic/ makes.
+        Matrix mod(const Matrix& o) const { return zip(o, detail::BinOp::Mod, "mod"); }
+        Matrix rem(const Matrix& o) const { return zip(o, detail::BinOp::Rem, "rem"); }
+        Matrix mod(datatype v) const { return scalar(detail::BinOp::Mod, v, false); }
+        Matrix rem(datatype v) const { return scalar(detail::BinOp::Rem, v, false); }
+
+        // Logical combination of masks, matching mcpu::Matrix. Any non-zero
+        // counts as true, so these compose with the comparison results above.
+        Matrix land(const Matrix& o) const { return zip(o, detail::BinOp::And, "land"); }
+        Matrix lor(const Matrix& o) const { return zip(o, detail::BinOp::Or, "lor"); }
+        Matrix lxor(const Matrix& o) const { return zip(o, detail::BinOp::Xor, "lxor"); }
+        Matrix lnot() const { requireReal("lnot"); return map(detail::UnOp::Not); }
+
+        // --- Vector products ---
+        //
+        // Both take either orientation, since a "vector" here is any matrix
+        // with one row or one column.
+        datatype dot(const Matrix& o) const {
+            if (size() != o.size())
+                throw Error("dot: lengths differ (" + std::to_string(size()) + " vs " +
+                            std::to_string(o.size()) + ")");
+            if constexpr (isComplex) {
+                // The HERMITIAN inner product, conjugating the left operand --
+                // which is what makes dot(x, x) real and equal to norm squared.
+                return (conj() % o).sum();
+            } else {
+                return (*this % o).sum();
+            }
+        }
 
         // --- Matrix multiply ---
 
@@ -935,6 +1207,81 @@ namespace mgpu {
             return V * D * U.H();
         }
 
+        // ── Sorting ────────────────────────────────────────────────────
+        //
+        // Same signatures and the same conventions as mcpu::Matrix, so these
+        // survive a namespace swap. Real only -- sorting needs an order.
+
+        // Sorts each column (axis = COL) or each row (axis = ROW). Same shape
+        // as the input, like MATLAB's sort: this rearranges, it does not reduce.
+        Matrix sort(bool axis, bool descending = false) const {
+            requireReal("sort");
+            Matrix out(*this);
+            detail::sortAxis((int)rows_, (int)cols_, out.data(), axis, descending);
+            return out;
+        }
+        // Every element, ascending, keeping the shape.
+        Matrix sorted(bool descending = false) const {
+            requireReal("sorted");
+            Matrix out(*this);
+            detail::sortFlat(size(), out.data(), descending);
+            return out;
+        }
+
+        // Sorts whole ROWS by column `key`, carrying every other column along.
+        // Stable, so repeated calls compose into a multi-column sort.
+        Matrix sortrows(long key = 0, bool descending = false) const {
+            requireReal("sortrows");
+            Matrix out(*this);
+            detail::sortRowsBy((int)rows_, (int)cols_, out.data(), (int)key, descending);
+            return out;
+        }
+
+        // The distinct values, ascending, as a COLUMN vector -- MATLAB's unique.
+        Matrix unique() const {
+            requireReal("unique");
+            requireNonEmpty("unique");
+            Matrix buf(*this);
+            const long k = detail::uniqueInPlace(size(), buf.data());
+            // The survivors sit at the front of the buffer; take that prefix.
+            Matrix out(k, 1, uninit_t{});
+            detail::copyD2D(out.data(), buf.data(), sizeof(datatype) * (std::size_t)k);
+            return out;
+        }
+
+        // Middle value, or the mean of the two middle ones when the count is
+        // even -- which is why it returns a real rather than datatype.
+        real_type median() const {
+            requireReal("median");
+            requireNonEmpty("median");
+            Matrix s = sorted();
+            const long n = (long)size();
+            if (n % 2) return real_type(s[n / 2]);
+            return (real_type(s[n / 2 - 1]) + real_type(s[n / 2])) / real_type(2);
+        }
+
+        // Per-column (axis = COL) or per-row (axis = ROW), matching sum().
+        Matrix median(bool axis) const {
+            requireReal("median");
+            requireNonEmpty("median");
+            Matrix s = sort(axis);
+            // Along a row the run has cols_ entries; down a column, rows_.
+            const long n = axis ? cols_ : rows_;
+            const long mid = n / 2;
+            auto slice = [&](long k) {
+                return axis ? s.block(0, k, rows_, 1) : s.block(k, 0, 1, cols_);
+            };
+            if (n % 2) return slice(mid);
+            return (slice(mid - 1) + slice(mid)) * datatype(0.5);
+        }
+
+        // Most frequent value; ties go to the SMALLEST, as MATLAB's mode does.
+        datatype mode() const {
+            requireReal("mode");
+            requireNonEmpty("mode");
+            return detail::modeOf(size(), data());
+        }
+
         // ── Rearrangement ──────────────────────────────────────────────
 
         // Free: row-major contiguous data with new dimensions IS the reshape,
@@ -1152,26 +1499,13 @@ namespace mgpu {
             return {std::move(w), std::move(V)};
         }
 
-        // There is deliberately no general (non-symmetric) eig() here.
-        // cusolverDnXgeev is the only entry point CUDA 13 offers for it and it
-        // does not work on this cuSOLVER build - the exact status codes are
-        // recorded in detail/backend.hpp. Use the CPU one, which does:
-        //
-        //     auto [values, vectors] = dA.cpu().eig();
-        //
-        // It is also the right place for it: the QR sweep at the heart of a
-        // non-symmetric eigensolver is sequential, so even a working GPU
-        // version would not have been the win eigSym() is.
-
         // --- Transposed products ---
         //
         // cuBLAS honours a transpose flag inside the kernel, so A.T() * B need
         // not build A^T first. Whether that matters is entirely a question of
-        // shape: the transpose is O(mn) against a product that is O(mnk), so
-        // for a square multiply it is well under 1% and not worth thinking
-        // about. It only becomes significant when k is small -- a tall, skinny
-        // operand, which is exactly the least-squares and covariance case.
-        // gpu/test/benchmark.cpp measures both so the claim stays honest.
+        // shape: measured at 1.00x for a square multiply and 1.05x even for a
+        // 2000000x8 Gram matrix, so these are here for clarity at the call
+        // site rather than for speed.
 
         // A^T * B, with A stored as-is.
         Matrix tMul(const Matrix& B) const {
@@ -1183,7 +1517,6 @@ namespace mgpu {
                           (int)B.cols_, datatype(1), data(), B.data(), datatype(0), out.data());
             return out;
         }
-
         // A * B^T.
         Matrix mulT(const Matrix& B) const {
             if (cols_ != B.cols_)
@@ -1194,10 +1527,68 @@ namespace mgpu {
                           (int)B.cols_, datatype(1), data(), B.data(), datatype(0), out.data());
             return out;
         }
-
-        // A^T * A, the Gram matrix. Common enough to name, and the shape where
-        // skipping the transpose actually pays.
+        // A^T * A, the Gram matrix.
         Matrix gram() const { return tMul(*this); }
+
+        // ── General (non-symmetric) eigenproblem ───────────────────────
+        //
+        // Same two entry points as mcpu::Matrix, with the same contracts:
+        // eigvals() always works and returns complex; eig() returns the real
+        // pair and REFUSES a complex spectrum, because a real matrix cannot
+        // hold it.
+        //
+        // WHETHER THIS BELONGS ON A GPU AT ALL. The reduction to Hessenberg
+        // form parallelises; the QR sweep that follows is sequential and
+        // shift-dependent, so this is one of the least GPU-shaped routines in
+        // the package. gpu/README.md carries the measurement. Reach for
+        // eigSym() instead whenever the matrix is symmetric -- that one has a
+        // divide-and-conquer algorithm and is over 100x.
+
+        // Every eigenvalue, complex, as an n x 1 column. Matches
+        // mcpu::Matrix::eigvals().
+        Matrix<std::complex<real_type>> eigvals() const {
+            requireReal("eigvals");
+            requireSquare("eigvals");
+            requireNonEmpty("eigvals");
+            const int n = (int)rows_;
+            Matrix cm = colMajor();
+            Matrix<real_type> wr(n, 1, typename Matrix<real_type>::uninit_t{});
+            Matrix<real_type> wi(n, 1, typename Matrix<real_type>::uninit_t{});
+            const int info = detail::geev(n, cm.data(), wr.data(), wi.data(), nullptr, nullptr);
+            if (info != 0)
+                throw Error("eigvals: the QR iteration failed to converge, info " +
+                            std::to_string(info));
+            return Matrix<std::complex<real_type>>::fromParts(wr, &wi);
+        }
+
+        // Eigenvalues and right eigenvectors, both REAL. Throws when the
+        // spectrum is complex, with the same advice mcpu gives -- there is no
+        // way to put a conjugate pair into a real matrix, and silently
+        // dropping the imaginary part would be worse than refusing.
+        std::pair<Matrix, Matrix> eig() const {
+            requireReal("eig");
+            requireSquare("eig");
+            requireNonEmpty("eig");
+            const int n = (int)rows_;
+            Matrix cm = colMajor();
+            Matrix<real_type> wr(n, 1, typename Matrix<real_type>::uninit_t{});
+            Matrix<real_type> wi(n, 1, typename Matrix<real_type>::uninit_t{});
+            Matrix<real_type> vr(n, n, typename Matrix<real_type>::uninit_t{});
+            Matrix<real_type> vi(n, n, typename Matrix<real_type>::uninit_t{});
+            const int info =
+                detail::geev(n, cm.data(), wr.data(), wi.data(), vr.data(), vi.data());
+            if (info != 0)
+                throw Error("eig: the QR iteration failed to converge, info " +
+                            std::to_string(info));
+            // Scaled by the spectral radius, so the test is relative: an
+            // eigenvalue of 1e8 + 1e-9i is real, one of 1e-9 + 1e-9i is not.
+            const real_type scale = std::max(wr.abs().max(), real_type(1));
+            if (wi.abs().max() > real_type(1e-12) * scale)
+                throw Error("eig: this matrix has a complex-conjugate eigenvalue pair, which a "
+                            "real result cannot represent - use eigvals(), which returns "
+                            "Matrix<std::complex<>>");
+            return {wr, rowMajorFrom(vr.data(), rows_, cols_)};
+        }
 
         // --- Solving ---
 
@@ -1470,6 +1861,16 @@ namespace mgpu {
         Expr round() const { return withUnary(detail::UnOp::Round); }
         Expr sign() const { return withUnary(detail::UnOp::Sign); }
         Expr pow2() const { return withUnary(detail::UnOp::Square); }
+        Expr asinh() const { return withUnary(detail::UnOp::Asinh); }
+        Expr acosh() const { return withUnary(detail::UnOp::Acosh); }
+        Expr atanh() const { return withUnary(detail::UnOp::Atanh); }
+        Expr cbrt() const { return withUnary(detail::UnOp::Cbrt); }
+        Expr log1p() const { return withUnary(detail::UnOp::Log1p); }
+        Expr expm1() const { return withUnary(detail::UnOp::Expm1); }
+        Expr trunc() const { return withUnary(detail::UnOp::Trunc); }
+        Expr atan2(const Expr& r) const { return join(r, detail::BinOp::Atan2); }
+        Expr hypot(const Expr& r) const { return join(r, detail::BinOp::Hypot); }
+        Expr mod(const Expr& r) const { return join(r, detail::BinOp::Mod); }
         Expr log(datatype base) const {
             return lg() * datatype(1.0 / std::log2((double)base));
         }

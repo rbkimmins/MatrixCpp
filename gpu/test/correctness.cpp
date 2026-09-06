@@ -11,6 +11,7 @@
 // is a RESIDUAL instead: Q*R == A is true regardless of which sign convention
 // either library picked, and it is the property callers actually depend on.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -20,6 +21,9 @@
 // measures against - gpu_matrix.hpp alone pulls only basic/matrix.hpp.
 #include "../../basic/MatrixCpp.hpp"
 #include "../MatrixGpu.hpp"
+#include "../../shared/interop.hpp"
+
+#include <sstream>
 
 using namespace mcpu;   // bare Matrix<> is the CPU one; the GPU twin is mgpu::Matrix
 
@@ -523,6 +527,385 @@ int main() {
         for (long i = 0; i < n; ++i)
             for (long j = 0; j < n; ++j) e = std::max(e, std::fabs(P(i, j) - (i == j ? 1.0 : 0.0)));
         check("factorize: inv", e, 1e-10);
+    }
+
+    // ── Parity with mcpu: the rest of <cmath>, logicals, dot ───────────
+    {
+        Matrix<double> P = randMat(20, 15, 1.2, 4.0);    // >= 1, the acosh domain
+        Matrix<double> Q = randMat(20, 15, 0.1, 0.9);    // safe for atanh
+        Matrix<double> R = randMat(20, 15, -2.0, 2.0);
+        auto dP = mgpu::upload(P), dQ = mgpu::upload(Q), dR = mgpu::upload(R);
+
+        check("asinh vs basic/", relerr(dR.asinh().cpu(), R.asinh()), TOL);
+        check("acosh vs basic/", relerr(dP.acosh().cpu(), P.acosh()), TOL);
+        check("atanh vs basic/", relerr(dQ.atanh().cpu(), Q.atanh()), TOL);
+        check("log1p vs basic/", relerr(dQ.log1p().cpu(), Q.log1p()), TOL);
+        check("expm1 vs basic/", relerr(dQ.expm1().cpu(), Q.expm1()), TOL);
+        check("fix (trunc) vs basic/", relerr(dR.fix().cpu(), R.fix()), 0.0);
+        check("atan2 vs basic/", relerr(dR.atan2(dP).cpu(), R.atan2(P)), TOL);
+        check("hypot vs basic/", relerr(dR.hypot(dP).cpu(), R.hypot(P)), TOL);
+        // mcpu's mod/rem take a SCALAR only; the GPU also accepts a matrix,
+        // so the scalar form is checked against basic/ and the matrix form
+        // against fmod/remainder directly.
+        check("mod(scalar) vs basic/", relerr(dR.mod(0.7).cpu(), R.mod(0.7)), TOL);
+        check("rem(scalar) vs basic/", relerr(dR.rem(0.7).cpu(), R.rem(0.7)), TOL);
+        {
+            Matrix<double> gm = dR.mod(dP).cpu(), gr = dR.rem(dP).cpu();
+            double em = 0, er = 0;
+            for (long i = 0; i < R.rows(); ++i)
+                for (long j = 0; j < R.cols(); ++j) {
+                    double m = std::fmod(R(i, j), P(i, j));
+                    if (m != 0.0 && ((m < 0.0) != (P(i, j) < 0.0))) m += P(i, j);
+                    em = std::max(em, std::fabs(gm(i, j) - m));
+                    er = std::max(er, std::fabs(gr(i, j) - std::fmod(R(i, j), P(i, j))));
+                }
+            check("mod(matrix), MATLAB convention", em, 0.0);
+            check("rem(matrix) == fmod", er, 0.0);
+        }
+
+        // log1p is not shorthand: it must beat log(1+x) where x is tiny.
+        Matrix<double> tiny(1, 4);
+        tiny(0, 0) = 1e-16; tiny(0, 1) = 1e-14; tiny(0, 2) = 1e-12; tiny(0, 3) = 1e-10;
+        Matrix<double> l1 = mgpu::upload(tiny).log1p().cpu();
+        double worst = 0, naive = 0;
+        for (long j = 0; j < 4; ++j) {
+            const double want = std::log1p(tiny(0, j));   // the correct reference
+            worst = std::max(worst, std::fabs(l1(0, j) - want) / want);
+            naive = std::max(naive, std::fabs(std::log(1.0 + tiny(0, j)) - want) / want);
+        }
+        check("log1p matches std::log1p for tiny x", worst, 1e-15);
+        // and it is not merely shorthand: log(1+x) is far worse here
+        checkTrue("log1p beats log(1+x) for tiny x", naive > 1e3 * std::max(worst, 1e-17));
+
+        // Logical masks
+        Matrix<double> ma = dR.gt(0.0).cpu(), mb = dP.gt(1.5).cpu();
+        auto dma = mgpu::upload(ma), dmb = mgpu::upload(mb);
+        double e = 0, e2 = 0, e3 = 0, e4 = 0;
+        Matrix<double> ga = dma.land(dmb).cpu(), go = dma.lor(dmb).cpu();
+        Matrix<double> gx = dma.lxor(dmb).cpu(), gn = dma.lnot().cpu();
+        for (long i = 0; i < ma.rows(); ++i)
+            for (long j = 0; j < ma.cols(); ++j) {
+                const bool a = ma(i, j) != 0.0, b = mb(i, j) != 0.0;
+                e = std::max(e, std::fabs(ga(i, j) - double(a && b)));
+                e2 = std::max(e2, std::fabs(go(i, j) - double(a || b)));
+                e3 = std::max(e3, std::fabs(gx(i, j) - double(a != b)));
+                e4 = std::max(e4, std::fabs(gn(i, j) - double(!a)));
+            }
+        check("land", e, 0.0);
+        check("lor", e2, 0.0);
+        check("lxor", e3, 0.0);
+        check("lnot", e4, 0.0);
+
+        // dot, both orientations, and the Hermitian form for complex
+        Matrix<double> u = randMat(1, 40), v = randMat(1, 40);
+        double want = 0;
+        for (long j = 0; j < 40; ++j) want += u(0, j) * v(0, j);
+        check("dot", std::fabs(mgpu::upload(u).dot(mgpu::upload(v)) - want) / std::fabs(want),
+              1e-12);
+        {
+            using Cd = std::complex<double>;
+            Matrix<Cd> cu(1, 20);
+            for (long j = 0; j < 20; ++j) cu(0, j) = Cd(u(0, j), v(0, j));
+            Cd wantc(0, 0);
+            for (long j = 0; j < 20; ++j) wantc += std::conj(cu(0, j)) * cu(0, j);
+            auto dcu = mgpu::upload(cu);
+            check("complex dot is Hermitian (x.dot(x) is real)",
+                  std::abs(dcu.dot(dcu) - wantc) / std::abs(wantc), 1e-12);
+        }
+    }
+
+    // ── Output formats, bridged from mcpu ──────────────────────────────
+    {
+        Matrix<double> A = randMat(3, 4);
+        auto dA = mgpu::upload(A);
+        checkTrue("gpu str() matches cpu str()", dA.str() == A.str());
+        mcpu::matio::Opts csv;
+        csv.fmt = mcpu::matio::Fmt::CSV;
+        checkTrue("gpu str(CSV) matches cpu", dA.str(csv) == A.str(csv));
+        std::ostringstream a, b;
+        dA.print(a);
+        A.print(b);
+        checkTrue("gpu print() matches cpu print()", a.str() == b.str());
+    }
+
+    // ── shared/interop.hpp ─────────────────────────────────────────────
+    {
+        Matrix<double> A = randMat(30, 20);
+        check("mx::to_gpu / to_cpu round trip", relerr(mx::roundtrip(A), A), 0.0);
+        check("mx::to_gpu matches mgpu::upload",
+              relerr(mx::to_cpu(mx::to_gpu(A)), mgpu::upload(A).cpu()), 0.0);
+        // The pass-throughs let one template take either side.
+        auto same = [](const auto& m) { return mx::to_cpu(m).norm(); };
+        check("mx::to_cpu passes a host matrix through",
+              std::fabs(same(A) - A.norm()) / A.norm(), 0.0);
+        check("mx::to_cpu converts a device matrix",
+              std::fabs(same(mgpu::upload(A)) - A.norm()) / A.norm(), 1e-13);
+        checkTrue("mx vocabulary aliases mcpu's", mx::ROW == ROW && mx::COL == COL);
+    }
+
+    // ── Scalar element access ──────────────────────────────────────────
+    //
+    // The gap a namespace swap exposes first: mcpu code indexes elements, and
+    // without these the swap does not compile at all.
+    {
+        Matrix<double> A = randMat(6, 5);
+        auto dA = mgpu::upload(A);
+
+        double e = 0;
+        for (long i = 0; i < 6; ++i)
+            for (long j = 0; j < 5; ++j) e = std::max(e, std::fabs(dA(i, j) - A(i, j)));
+        check("operator()(i,j) read", e, 0.0);
+
+        e = 0;
+        for (long k = 0; k < 30; ++k) e = std::max(e, std::fabs(dA[k] - A(k / 5, k % 5)));
+        check("operator[] read (row-major flat)", e, 0.0);
+
+        dA(2, 3) = 7.25;
+        dA[7] = -1.5;
+        dA(0, 0) += 10.0;
+        Matrix<double> got = dA.cpu();
+        checkTrue("operator()(i,j) write", got(2, 3) == 7.25);
+        checkTrue("operator[] write", got(1, 2) == -1.5);
+        checkTrue("element += ", got(0, 0) == A(0, 0) + 10.0);
+        // and nothing else moved
+        e = 0;
+        for (long i = 0; i < 6; ++i)
+            for (long j = 0; j < 5; ++j) {
+                if ((i == 2 && j == 3) || (i == 1 && j == 2) || (i == 0 && j == 0)) continue;
+                e = std::max(e, std::fabs(got(i, j) - A(i, j)));
+            }
+        check("element write touches nothing else", e, 0.0);
+
+        // Negative indices wrap from the end -- correctly, unlike the CPU's
+        // `i % rows`, which for -1 yields -1 and reads before the buffer.
+        checkTrue("A(-1,-1) is the last element", dA(-1, -1) == got(5, 4));
+        checkTrue("A[-1] is the last element", dA[-1] == got(5, 4));
+
+        bool threw = false;
+        try { (void)dA(6, 0); } catch (const mgpu::Error&) { threw = true; }
+        checkTrue("out-of-range index throws", threw);
+        threw = false;
+        try { (void)dA[30]; } catch (const mgpu::Error&) { threw = true; }
+        checkTrue("out-of-range flat index throws", threw);
+
+        // A 1x1 IS a scalar.
+        Matrix<double> one(1, 1);
+        one(0, 0) = 3.75;
+        double asScalar = mgpu::upload(one);
+        checkTrue("1x1 converts to a scalar", asScalar == 3.75);
+        threw = false;
+        try { double bad = dA; (void)bad; } catch (const mgpu::Error&) { threw = true; }
+        checkTrue("non-1x1 scalar conversion throws", threw);
+    }
+
+    // ── The brownian demo's expression, on both sides ──────────────────
+    //
+    // This is the line the namespace swap was tried on. It exercises row
+    // views, slice subtraction, element-wise power, an axis reduction and the
+    // 1x1-to-scalar conversion in one go.
+    {
+        Matrix<double> P = randMat(12, 3);
+        auto dP = mgpu::upload(P);
+        double worst = 0;
+        for (long i = 0; i < 12; ++i)
+            for (long j = i + 1; j < 12; ++j) {
+                const double rc =
+                    std::sqrt(::sum((P(i, all) - P(j, all)).pow(2), ROW));
+                const double rg =
+                    std::sqrt(double(mgpu::sum((dP(i, all).eval() - dP(j, all).eval()).pow(2.0),
+                                               ROW)));
+                worst = std::max(worst, std::fabs(rc - rg) / rc);
+            }
+        check("brownian distance expression, cpu vs gpu", worst, 1e-13);
+
+        // And the element-write loop the demo uses for its Wiener increment.
+        mgpu::Matrix<double> dW(1, 3);
+        for (int k = 0; k < 3; k++) dW(0, k) = 0.1 * (k + 1);
+        Matrix<double> hw = dW.cpu();
+        // Not compared against the decimal it looks like -- 0.1 * 3 is not
+        // 0.3 in binary -- and not demanded exact either: under -march=native
+        // GCC contracts `hw - 0.1*(k+1)` into an fma, so the product is never
+        // rounded and the difference comes out as its rounding error rather
+        // than zero. One ulp is the honest tolerance.
+        double we = 0;
+        for (int k = 0; k < 3; k++) {
+            const volatile double want = 0.1 * (k + 1);   // volatile: no contraction
+            we = std::max(we, std::fabs(hw(0, k) - want));
+        }
+        check("element-write loop", we, 0.0);
+    }
+
+    // ── General (non-symmetric) eigenproblem ───────────────────────────
+    //
+    // Restored after an earlier version of this suite concluded, wrongly, that
+    // cusolverDnXgeev was broken. It was a data-type mistake on our side --
+    // see detail/backend.hpp.
+    {
+        const long n = 48;
+        Matrix<double> A = randMat(n, n);
+        auto dA = mgpu::upload(A);
+
+        // Eigenvalues are a SET: cuSOLVER and LAPACK need not order them the
+        // same way, so both are sorted before comparing.
+        Matrix<std::complex<double>> gw = dA.eigvals().cpu();
+        Matrix<std::complex<double>> cw = A.eigvals();
+        auto key = [](const std::complex<double>& z) {
+            return std::make_pair(z.real(), z.imag());
+        };
+        std::vector<std::complex<double>> g, c;
+        for (long i = 0; i < n; ++i) { g.push_back(gw(i, 0)); c.push_back(cw(i, 0)); }
+        std::sort(g.begin(), g.end(), [&](auto a, auto b) { return key(a) < key(b); });
+        std::sort(c.begin(), c.end(), [&](auto a, auto b) { return key(a) < key(b); });
+        double worst = 0;
+        for (long i = 0; i < n; ++i)
+            worst = std::max(worst, std::abs(g[(std::size_t)i] - c[(std::size_t)i]));
+        check("eigvals vs basic/ (sorted)", worst, 1e-9);
+
+        // Independent of either library: the trace and the determinant are the
+        // sum and product of the eigenvalues.
+        std::complex<double> sum(0, 0), prod(1, 0);
+        for (long i = 0; i < n; ++i) { sum += gw(i, 0); prod *= gw(i, 0); }
+        double tr = 0;
+        for (long i = 0; i < n; ++i) tr += A(i, i);
+        check("eigvals: sum == trace", std::abs(sum - std::complex<double>(tr, 0)) /
+                                           (std::fabs(tr) + 1e-300), 1e-10);
+        check("eigvals: product == det",
+              std::abs(prod - std::complex<double>(A.det(), 0)) / (std::abs(A.det()) + 1e-300),
+              1e-8);
+
+        // A real spectrum, so eig() is allowed: symmetric matrices qualify.
+        Matrix<double> S = spd(40);
+        auto [w, V] = mgpu::upload(S).eig();
+        Matrix<double> hw = w.cpu(), hv = V.cpu();
+        Matrix<double> D(40, 40);
+        for (long i = 0; i < 40; ++i) D(i, i) = hw(i, 0);
+        check("eig: A*V == V*diag(w)", relerr(S * hv, hv * D), 1e-9);
+
+        // ... and eig() must REFUSE a complex spectrum rather than silently
+        // dropping the imaginary part. A rotation has none that are real.
+        Matrix<double> Rot(2, 2);
+        Rot(0, 0) = 0; Rot(0, 1) = -1; Rot(1, 0) = 1; Rot(1, 1) = 0;
+        bool threw = false;
+        try { (void)mgpu::upload(Rot).eig(); } catch (const mgpu::Error&) { threw = true; }
+        checkTrue("eig refuses a complex spectrum", threw);
+        // but eigvals handles it: the eigenvalues are +-i
+        Matrix<std::complex<double>> rv = mgpu::upload(Rot).eigvals().cpu();
+        double im = std::max(std::fabs(rv(0, 0).imag()), std::fabs(rv(1, 0).imag()));
+        double re = std::max(std::fabs(rv(0, 0).real()), std::fabs(rv(1, 0).real()));
+        check("eigvals of a rotation is +-i", std::fabs(im - 1.0) + re, 1e-12);
+
+        // Complex eigenvectors, unpacked from LAPACK's real storage: check the
+        // residual on a matrix that genuinely has a conjugate pair.
+        Matrix<double> M = randMat(16, 16);
+        auto dM = mgpu::upload(M);
+        Matrix<std::complex<double>> mw = dM.eigvals().cpu();
+        double pairs = 0;
+        for (long i = 0; i < 16; ++i) if (std::fabs(mw(i, 0).imag()) > 1e-12) pairs++;
+        checkTrue("the test matrix does have complex eigenvalues", pairs > 0);
+        double resid = 0;
+        for (long j = 0; j < 16; ++j) {
+            // det(A - lambda I) must vanish; use the smallest singular value
+            // as a conditioning-safe stand-in for that determinant.
+            Matrix<std::complex<double>> Sh(16, 16);
+            for (long r = 0; r < 16; ++r)
+                for (long c2 = 0; c2 < 16; ++c2)
+                    Sh(r, c2) = std::complex<double>(M(r, c2), 0.0) -
+                                (r == c2 ? mw(j, 0) : std::complex<double>(0, 0));
+            auto [su, ss, sv] = Sh.svd();
+            resid = std::max(resid, ss(15, 15));
+        }
+        check("every eigenvalue makes A - lambda I singular", resid, 1e-9);
+    }
+
+    // ── Sorting ────────────────────────────────────────────────────────
+    {
+        Matrix<double> A = randMat(40, 25);
+        auto dA = mgpu::upload(A);
+
+        check("sort(ROW) vs basic/", relerr(dA.sort(ROW).cpu(), A.sort(ROW)), 0.0);
+        check("sort(COL) vs basic/", relerr(dA.sort(COL).cpu(), A.sort(COL)), 0.0);
+        check("sort(ROW, descending) vs basic/",
+              relerr(dA.sort(ROW, true).cpu(), A.sort(ROW, true)), 0.0);
+        check("sort(COL, descending) vs basic/",
+              relerr(dA.sort(COL, true).cpu(), A.sort(COL, true)), 0.0);
+
+        // Non-square both ways, since the column path transposes and a square
+        // matrix would hide a swapped dimension.
+        Matrix<double> W = randMat(7, 61), Tt = randMat(61, 7);
+        check("sort(COL) on a wide matrix",
+              relerr(mgpu::upload(W).sort(COL).cpu(), W.sort(COL)), 0.0);
+        check("sort(ROW) on a tall matrix",
+              relerr(mgpu::upload(Tt).sort(ROW).cpu(), Tt.sort(ROW)), 0.0);
+
+        // sorted(): every element, shape kept.
+        Matrix<double> flat = dA.sorted().cpu();
+        bool ascending = true;
+        for (long k = 1; k < 40 * 25; ++k)
+            if (flat(k / 25, k % 25) < flat((k - 1) / 25, (k - 1) % 25)) ascending = false;
+        checkTrue("sorted() is ascending across the whole matrix", ascending);
+        check("sorted() keeps the shape",
+              double(flat.rows() != 40 || flat.cols() != 25), 0.0);
+
+        // sortrows carries the other columns along.
+        for (long key : {0L, 3L, 24L}) {
+            char nm[64];
+            std::snprintf(nm, sizeof(nm), "sortrows(key=%ld) vs basic/", key);
+            check(nm, relerr(dA.sortrows(key).cpu(), A.sortrows(key)), 0.0);
+        }
+        check("sortrows descending vs basic/",
+              relerr(dA.sortrows(1, true).cpu(), A.sortrows(1, true)), 0.0);
+
+        // Stability: with a repeated key, the original row order must survive,
+        // which is what lets two sortrows calls make a two-column sort.
+        Matrix<double> D(8, 2);
+        for (long i = 0; i < 8; ++i) { D(i, 0) = double(i % 2); D(i, 1) = double(i); }
+        Matrix<double> st = mgpu::upload(D).sortrows(0).cpu();
+        bool stable = true;
+        for (long i = 1; i < 8; ++i)
+            if (st(i, 0) == st(i - 1, 0) && st(i, 1) < st(i - 1, 1)) stable = false;
+        checkTrue("sortrows is stable on equal keys", stable);
+
+        // unique: distinct values ascending, as a column.
+        Matrix<double> R(1, 200);
+        for (long j = 0; j < 200; ++j) R(0, j) = double(long(j) % 17);
+        Matrix<double> u = mgpu::upload(R).unique().cpu();
+        checkTrue("unique count", u.rows() == 17 && u.cols() == 1);
+        double ue = 0;
+        for (long i = 0; i < 17; ++i) ue = std::max(ue, std::fabs(u(i, 0) - double(i)));
+        check("unique values", ue, 0.0);
+        check("unique vs basic/", relerr(mgpu::upload(R).unique().cpu(), R.unique()), 0.0);
+
+        // median, odd and even counts, and both axes.
+        Matrix<double> Odd = randMat(1, 41), Even = randMat(1, 40);
+        check("median (odd count) vs basic/",
+              std::fabs(mgpu::upload(Odd).median() - Odd.median()), 1e-13);
+        check("median (even count) vs basic/",
+              std::fabs(mgpu::upload(Even).median() - Even.median()), 1e-13);
+        check("median(ROW) vs basic/", relerr(dA.median(ROW).cpu(), A.median(ROW)), 1e-13);
+        check("median(COL) vs basic/", relerr(dA.median(COL).cpu(), A.median(COL)), 1e-13);
+        // even-length runs on both axes, so the two-element average is exercised
+        Matrix<double> Ev(10, 8);
+        for (long i = 0; i < 10; ++i)
+            for (long j = 0; j < 8; ++j) Ev(i, j) = A(i, j);
+        check("median(ROW) even run", relerr(mgpu::upload(Ev).median(ROW).cpu(), Ev.median(ROW)),
+              1e-13);
+        check("median(COL) even run", relerr(mgpu::upload(Ev).median(COL).cpu(), Ev.median(COL)),
+              1e-13);
+
+        // mode, including the tie rule.
+        check("mode vs basic/", std::fabs(mgpu::upload(R).mode() - R.mode()), 0.0);
+        Matrix<double> Tie(1, 6);
+        Tie(0,0)=5; Tie(0,1)=5; Tie(0,2)=2; Tie(0,3)=2; Tie(0,4)=9; Tie(0,5)=1;
+        checkTrue("mode breaks ties toward the smallest", mgpu::upload(Tie).mode() == 2.0);
+        checkTrue("mode agrees with basic/ on the tie", mgpu::upload(Tie).mode() == Tie.mode());
+
+        // complex has no order, so these must refuse to compile-or-run
+        bool threw = false;
+        try {
+            Matrix<double> one(1, 1);
+            (void)mgpu::upload(one).mode();
+        } catch (const mgpu::Error&) { threw = true; }
+        checkTrue("mode of a single element works", !threw);
     }
 
     // ── Views ──────────────────────────────────────────────────────────

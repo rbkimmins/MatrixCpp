@@ -1,5 +1,5 @@
 #include "../basic/MatrixCpp.hpp"
-#include "../plotting/MatrixPlot.hpp"
+#include "../shared/plot_gpu.hpp"
 
 using namespace mcpu;  // the package lives in mcpu; mgpu is its GPU twin
 using namespace std;
@@ -146,12 +146,12 @@ int main() {
             }
         }
     }
-    double dt = 1e-6;  // time step
+    double dt = 1e-5;  // time step
     double total_time = 10;
     double diffusive_time = D_0 * dt / (part_radius * part_radius);  // dimensionless time step
     int total_time_steps = int(total_time / dt);
     Matrix<double> displacement(N, 3);  // displacement of particles, cols are x,y,z
-    const int frame = std::max(1, total_time_steps / 200);
+    const int frame = total_time_steps / 20000;
     for (int t = 0; t < total_time_steps; t++) {
         // plotting
         if (t % frame == 0) {

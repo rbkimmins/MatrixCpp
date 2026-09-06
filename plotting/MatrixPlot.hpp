@@ -30,27 +30,45 @@
 //
 // REQUIRES: julia on PATH, with Plots.jl installed.
 //
+// TWO OUTPUT FORMATS WORTH KNOWING ABOUT, both one call away:
+//
+//     plt::interactive();  ...  plt::save("fig.html");   pan/zoom/hover
+//     plt::latex();        ...  plt::save("fig.tex");    \input into a paper
+//
+// The first needs nothing installed beyond Plots. The second needs PGFPlotsX
+// and a LaTeX, and also writes .pdf and .svg. See the backends section.
+//
 // ── What is here ────────────────────────────────────────────────────────────
 //
-//   2-D series   plot  scatter  bar  barh  area  stem  stairs  stairs_pre
-//                semilogx  semilogy  loglog  hist  hist2d  hexbin*  pie
-//                hline  vline  hspan  vspan  quiver
+//   2-D series   plot  scatter  bar  bars  barh  area  stem  stairs
+//                stairs_pre  semilogx  semilogy  loglog  hist  hist2d
+//                hexbin*  pie  hline  vline  hspan  vspan  quiver
+//                fill_between  errorbar  stackplot
+//   distributions boxplot**  violin**  density**   (call stats() first)
 //   matrix views heatmap  contour  contourf  surface  wireframe  image  spy
-//                contour3d*
+//                contour3d*  contour_labels
 //   3-D series   plot3  scatter3  surface3
 //   styling      Style().label().color().width().dash().marker().markersize()
-//                       .markercolor().alpha().fill().fillalpha().fillcolor()
-//                       .yerror().xerror().ribbon().set().raw()
-//   axes         title  xlabel  ylabel  zlabel  xlim  ylim  zlim  xticks
-//                yticks  xscale  yscale  zscale  xflip  yflip  aspect  view
+//                       .markercolor().alpha().fill().fillto().fillalpha()
+//                       .fillcolor().yerror().xerror().ribbon()
+//                       .sizes().colorby().linecolorby().set().raw()
+//   axes         title  suptitle  xlabel  ylabel  zlabel  xlim  ylim  zlim
+//                xticks  yticks  xscale  yscale  zscale  xflip  yflip
+//                xrotation  yrotation  minorticks  aspect  view  polar
+//                framestyle  axis_off  twinx  link
 //   appearance   legend  grid  size  margin  dpi  fontsize  titlefontsize
-//                colorbar  colormap  clim  annotate  theme  backend  set
+//                colorbar  colorbar_title  colormap  clim  annotate  text
+//                theme  transparent  set
 //   layout       panel  layout
 //   output       save  show  frame  gif  figure  script
+//   backends     backend  interactive  latex  latex_engine  stats
 //
-// * hexbin and contour3d are NOT supported by GR, the default backend, and
-//   Plots will refuse them. Call plt::backend("pyplot") first, with PyPlot
-//   installed in Julia. Everything else above is verified working on GR.
+// *  hexbin and contour3d are NOT supported by GR, the default backend, and
+//    Plots will refuse them. Call plt::backend("pyplot") first, with PyPlot
+//    installed in Julia.
+// ** boxplot, violin and density need StatsPlots -- call plt::stats() once
+//    before the first of them. Everything NOT marked is verified rendering
+//    on GR.
 //
 // ── Styling and subplots ────────────────────────────────────────────────────
 //
@@ -103,7 +121,7 @@ std::vector<double> flat(const mcpu::Matrix<T>& m) {
     std::vector<double> v((std::size_t)(m.rows() * m.cols()));
     for (long i = 0; i < m.rows(); i++)
         for (long j = 0; j < m.cols(); j++)
-            v[(std::size_t)(i * m.cols() + j)] = double(std::real(m(int(i), int(j))));
+            v[(std::size_t)(i * m.cols() + j)] = double(std::real(m(i, j)));
     return v;
 }
 // Column-major, because that is how Julia reads a matrix.
@@ -112,7 +130,7 @@ std::vector<double> colMajor(const mcpu::Matrix<T>& m) {
     std::vector<double> v((std::size_t)(m.rows() * m.cols()));
     for (long j = 0; j < m.cols(); j++)
         for (long i = 0; i < m.rows(); i++)
-            v[(std::size_t)(j * m.rows() + i)] = double(std::real(m(int(i), int(j))));
+            v[(std::size_t)(j * m.rows() + i)] = double(std::real(m(i, j)));
     return v;
 }
 inline std::vector<double> indices(long n) {
@@ -176,6 +194,31 @@ class Style {
     template <typename T>
     Style& ribbon(const mcpu::Matrix<T>& r) {
         return put("ribbon", detail::S().bind(detail::flat(r)));
+    }
+    // matplotlib's scatter(s=...) and scatter(c=...): a size and a colour PER
+    // POINT rather than one for the series. This is what turns a scatter into
+    // a four-dimensional plot, and it is the single most-used thing matplotlib
+    // has that a plain series API does not.
+    template <typename T>
+    Style& sizes(const mcpu::Matrix<T>& s) {
+        return put("markersize", detail::S().bind(detail::flat(s)));
+    }
+    // Colour markers by a value, mapped through the current colormap. Add
+    // plt::colorbar() to show the scale.
+    template <typename T>
+    Style& colorby(const mcpu::Matrix<T>& z) {
+        return put("marker_z", detail::S().bind(detail::flat(z)));
+    }
+    // The same for a line, so a trajectory can be coloured by time or speed.
+    template <typename T>
+    Style& linecolorby(const mcpu::Matrix<T>& z) {
+        return put("line_z", detail::S().bind(detail::flat(z)));
+    }
+    // Fill up to another CURVE rather than to a level -- matplotlib's
+    // fill_between. fill(level) above is the constant case.
+    template <typename T>
+    Style& fillto(const mcpu::Matrix<T>& y2) {
+        return put("fillrange", detail::S().bind(detail::flat(y2)));
     }
     Style& z_order(const std::string& o) { return put("z_order", detail::sym(o)); }
     // The escape hatch, same convention as plt::set.
@@ -252,6 +295,20 @@ inline void series3(const std::vector<double>& x, const std::vector<double>& y,
     series3(x, y, z, kind, Style().label(label));
 }
 
+// Whether a twin y axis is currently the drawing target. Plots' twinx()
+// returns a SUBPLOT that shares the x axis; series go to it, but the figure
+// that gets saved is still the original Plot, so the root has to be put back
+// before any output happens.
+inline bool& twinned() {
+    static bool on = false;
+    return on;
+}
+inline void untwin() {
+    if (!twinned()) return;
+    S().add("_cur = _twinroot");
+    twinned() = false;
+}
+
 // How many panels have been banked with panel(), and the grid they should be
 // arranged into. Held on this side so save()/show()/frame() know whether a
 // combine has to be emitted before the figure is finished.
@@ -267,6 +324,7 @@ inline std::pair<int, int>& panelGrid() {
 // Emits the combine when panels are in play, so the rest of the output path
 // does not have to care whether it is looking at one plot or nine.
 inline void finishPanels() {
+    untwin();
     if (panelCount() == 0) return;
     S().add("push!(_panels, _cur)");
     const int n = panelCount() + 1;
@@ -309,6 +367,7 @@ void matview(const mcpu::Matrix<T>& A, const char* fn, bool yflip) {
 inline void figure() {
     detail::S().reset();
     detail::animating() = false;
+    detail::twinned() = false;
     detail::panelCount() = 0;
     detail::panelGrid() = {0, 0};
 }
@@ -328,6 +387,7 @@ inline void figure() {
 // last one needs no panel() call -- though one does no harm.
 
 inline void panel() {
+    detail::untwin();
     if (detail::panelCount() == 0) detail::S().add("_panels = Any[]");
     detail::S().add("push!(_panels, _cur)");
     detail::S().add("_cur = nothing");
@@ -358,7 +418,7 @@ void plot(const mcpu::Matrix<T>& y, const std::string& label = "") {
     for (long j = 0; j < y.cols(); j++) {
         std::vector<double> col((std::size_t)y.rows());
         for (long i = 0; i < y.rows(); i++)
-            col[(std::size_t)i] = double(std::real(y(int(i), int(j))));
+            col[(std::size_t)i] = double(std::real(y(i, j)));
         detail::series(detail::indices(y.rows()), col,
                        label.empty() ? "" : label + " " + std::to_string(j + 1), "line");
     }
@@ -371,6 +431,18 @@ inline void plot(const std::vector<double>& y, const std::string& label = "") {
     detail::series(detail::indices((long)y.size()), y, label, "line");
 }
 
+// The same two, taking a Style. Raw vectors are what a program that has read
+// its data from a file usually holds, so they should not be second-class.
+inline void plot(const std::vector<double>& x, const std::vector<double>& y, const Style& st) {
+    detail::series(x, y, "line", st);
+}
+inline void plot(const std::vector<double>& y, const Style& st) {
+    detail::series(detail::indices((long)y.size()), y, "line", st);
+}
+inline void scatter(const std::vector<double>& x, const std::vector<double>& y, const Style& st) {
+    detail::series(x, y, "scatter", st);
+}
+
 template <typename Tx, typename Ty>
 void scatter(const mcpu::Matrix<Tx>& x, const mcpu::Matrix<Ty>& y, const std::string& label = "") {
     detail::series(detail::flat(x), detail::flat(y), label, "scatter");
@@ -379,6 +451,84 @@ template <typename T>
 void scatter(const mcpu::Matrix<T>& y, const std::string& label = "") {
     detail::series(detail::indices(y.rows() * y.cols()), detail::flat(y), label, "scatter");
 }
+// ── matplotlib's other verbs ────────────────────────────────────────────────
+
+// fill_between: shade the region between two curves.
+template <typename Tx, typename T1, typename T2>
+void fill_between(const mcpu::Matrix<Tx>& x, const mcpu::Matrix<T1>& y1,
+                  const mcpu::Matrix<T2>& y2, const std::string& label = "") {
+    detail::series(detail::flat(x), detail::flat(y1), "line",
+                   Style().label(label).fillto(y2).fillalpha(0.35));
+}
+
+// errorbar: points with error bars, matplotlib's signature form. Pass only
+// yerr for vertical bars, or both.
+template <typename Tx, typename Ty, typename Te>
+void errorbar(const mcpu::Matrix<Tx>& x, const mcpu::Matrix<Ty>& y, const mcpu::Matrix<Te>& yerr,
+              const std::string& label = "") {
+    detail::series(detail::flat(x), detail::flat(y), "scatter",
+                   Style().label(label).yerror(yerr).markersize(4));
+}
+
+// stackplot: cumulative bands, one per column of A. Each series is filled down
+// to the running total beneath it, which is what makes the bands stack rather
+// than overlap.
+template <typename Tx, typename T>
+void stackplot(const mcpu::Matrix<Tx>& x, const mcpu::Matrix<T>& A) {
+    const long n = A.rows(), k = A.cols();
+    mcpu::Matrix<double> running(n, 1);
+    for (long c = 0; c < k; c++) {
+        mcpu::Matrix<double> below = running;
+        for (long i = 0; i < n; i++) running(i, 0) += double(A(i, c));
+        detail::series(detail::flat(x), detail::flat(running), "line",
+                       Style().label("series " + std::to_string(c + 1)).fillto(below)
+                           .fillalpha(0.7));
+    }
+}
+
+// Grouped and stacked bars, matplotlib's bar(bottom=...) and the width trick.
+// One series per COLUMN of A.
+template <typename Tx, typename T>
+void bars(const mcpu::Matrix<Tx>& x, const mcpu::Matrix<T>& A, bool stacked = false) {
+    for (long c = 0; c < A.cols(); c++) {
+        mcpu::Matrix<double> col(A.rows(), 1);
+        for (long i = 0; i < A.rows(); i++) col(i, 0) = double(A(i, c));
+        detail::series(detail::flat(x), detail::flat(col), "bar",
+                       Style().label("series " + std::to_string(c + 1))
+                           .set("bar_position", stacked ? ":stack" : ":dodge"));
+    }
+}
+
+// ── Distributions (needs StatsPlots) ────────────────────────────────────────
+//
+// Plots itself has no box, violin or KDE recipe -- they live in StatsPlots.
+// Call plt::stats() before the first of these in a figure to load it.
+//
+// These were long marked unverified here, because the install failed with
+//
+//     Pkg.add("StatsPlots")
+//     ERROR: version 6.10.2+1 of package Qt6Base_jll is not available
+//
+// That was never StatsPlots' fault: a stale GR_jll in this depot pinned a Qt6
+// build the registry had retired. Adding PGFPlotsX and PlotlyJS moved GR_jll
+// 0.73.24 -> 0.73.27, the pin went with it, and StatsPlots v0.15.8 resolved on
+// the next try. All three render.
+
+inline void stats() { detail::S().add("using StatsPlots"); }
+
+template <typename T>
+void boxplot(const mcpu::Matrix<T>& v, const std::string& label = "") {
+    detail::series1(detail::flat(v), "boxplot", Style().label(label));
+}
+template <typename T>
+void violin(const mcpu::Matrix<T>& v, const std::string& label = "") {
+    detail::series1(detail::flat(v), "violin", Style().label(label));
+}
+template <typename T>
+void density(const mcpu::Matrix<T>& v, const std::string& label = "") {
+    detail::series1(detail::flat(v), "density", Style().label(label));
+}
+
 // ── Three dimensions ────────────────────────────────────────────────────────
 //
 // Same call shape as plot/scatter with a third coordinate. Julia's Plots draws
@@ -609,7 +759,7 @@ void spy(const mcpu::Matrix<T>& A, double tol = 0.0) {
             // mcpu:: is required, not optional: the argument here is a plain
             // scalar, so argument-dependent lookup has no mcpu type to
             // follow back into the namespace.
-            P(int(i), int(j)) = (mcpu::magnitude(A(int(i), int(j))) > tol) ? 1.0 : 0.0;
+            P(i, j) = (mcpu::magnitude(A(i, j)) > tol) ? 1.0 : 0.0;
     heatmap(P);
 }
 
@@ -676,6 +826,24 @@ template <typename T>
 void xticks(const mcpu::Matrix<T>& at) {
     detail::attr("xticks", detail::S().bind(detail::flat(at)));
 }
+// Raw-vector forms, for data that came from a file rather than a Matrix.
+//
+// NOTE the two-argument form is usually the one wanted on a LOG axis. Giving
+// positions alone lets Plots label them with the transformed value -- ticks at
+// 128 and 512 come out as 10^2.107 and 10^2.709 -- so the labels have to be
+// supplied explicitly to read as the numbers they are.
+inline void xticks(const std::vector<double>& at) {
+    detail::attr("xticks", detail::S().bind(at));
+}
+inline void xticks(const std::vector<double>& at, const std::vector<std::string>& labels) {
+    std::string l = "[";
+    for (std::size_t i = 0; i < labels.size(); i++) l += (i ? ", " : "") + detail::q(labels[i]);
+    l += "]";
+    detail::attr("xticks", "(" + detail::S().bind(at) + ", " + l + ")");
+}
+inline void yticks(const std::vector<double>& at) {
+    detail::attr("yticks", detail::S().bind(at));
+}
 template <typename T>
 void yticks(const mcpu::Matrix<T>& at) {
     detail::attr("yticks", detail::S().bind(detail::flat(at)));
@@ -715,17 +883,145 @@ inline void fontsize(double pt) {
 inline void titlefontsize(double pt) { detail::attr("titlefontsize", detail::num(pt)); }
 inline void dpi(int d) { detail::attr("dpi", std::to_string(d)); }
 
-// ── Backend and theme ───────────────────────────────────────────────────────
+// ── Backends ────────────────────────────────────────────────────────────────
 //
-// These are whole-session settings rather than figure attributes, so they take
-// effect from the next figure onwards. GR is the default and needs nothing
-// installed; "plotlyjs" gives an interactive HTML figure, "pgfplotsx" gives
-// LaTeX-quality output -- both need their package added in Julia first.
-inline void backend(const std::string& name) { detail::S().add(name + "()"); }
+// Call before drawing; the choice applies to the figure being built.
+//
+//   "gr"         the default. Fast, needs nothing installed, raster or vector.
+//   "plotly"     INTERACTIVE HTML -- pan, zoom, hover-to-read-values. Built
+//                into Plots, so it needs no extra package at all. save() to a
+//                .html and open it in a browser.
+//   "plotlyjs"   the same figures with a native window for show(). Needs
+//                PlotlyJS.jl.
+//   "pgfplotsx"  LATEX-QUALITY vector output. The figure is compiled by a real
+//                TeX run, so the fonts and maths match the document it lands
+//                in. Needs PGFPlotsX.jl and a working LaTeX. Saves .pdf, .svg
+//                and -- most usefully -- .tex, which you can \input straight
+//                into a paper and then edit by hand.
+//   "pyplot"     matplotlib, for the handful of series GR does not implement
+//                (hexbin, contour3d). Needs PyPlot.jl.
+//
+// WHY pgfplotsx GETS SPECIAL HANDLING. PGFPlotsX defaults to lualatex, and a
+// LuaTeX installation missing luaotfload -- which is the state of this machine
+// -- fails with "The latex command `lualatex ...` failed" and no hint that the
+// engine is the problem rather than the plot. pdflatex is both more commonly
+// present and enough for everything pgfplots emits, so it is selected here.
+// Override with latex_engine() if your document needs lualatex or xelatex.
+inline void latex_engine(const std::string& engine = "PDFLATEX") {
+    detail::S().add("using PGFPlotsX");
+    detail::S().add("PGFPlotsX.latexengine!(PGFPlotsX." + engine + ")");
+}
+
+inline void backend(const std::string& name) {
+    if (name == "pgfplotsx" || name == "pgfplots") latex_engine();
+    detail::S().add(name + "()");
+}
+
+// Named shortcuts for the two worth reaching for by intent rather than by
+// package name.
+inline void interactive() { backend("plotly"); }   // -> save("figure.html")
+inline void latex() { backend("pgfplotsx"); }      // -> save("figure.tex" or ".pdf")
 // ":dark", ":ggplot2", ":juno", ":solarized", ":wong", ":default", ...
 inline void theme(const std::string& name) {
     detail::S().add("theme(" + detail::sym(name) + ")");
 }
+
+// ── A second y axis ─────────────────────────────────────────────────────────
+//
+// matplotlib's twinx(). Everything drawn after this goes on a right-hand axis
+// sharing the same x, until the figure or panel is finished:
+//
+//     plt::plot(t, signal, "signal");
+//     plt::twinx();
+//     plt::plot(t, temp, plt::Style().label("temp").color(":red"));
+//     plt::ylabel("degrees");        // the RIGHT axis, from here on
+//     plt::ylabel_left("volts");     // the left one, which needs its own call
+//
+// There is no untwin() to call: panel(), save(), show() and frame() all put
+// the root axis back on their own, because the figure that gets saved is the
+// original plot and not the twin subplot.
+//
+// TWO THINGS PLOTS DOES THAT WILL SURPRISE YOU, both verified rather than
+// guessed at:
+//
+//   * twinx() CLOBBERS the left axis label. Setting ylabel before the call
+//     does not survive it, which is why ylabel_left() exists -- it writes to
+//     the root subplot after the twin has been made.
+//   * the colour cycle RESTARTS on the twin, so the second series comes out
+//     the same colour as the first. Give it an explicit .color(), or the two
+//     axes are indistinguishable.
+//
+// matplotlib has the same second problem and the same remedy.
+inline void twinx() {
+    if (detail::twinned()) return;
+    detail::S().add("_twinroot = _cur");
+    detail::S().add("_cur = twinx(_twinroot)");
+    detail::twinned() = true;
+}
+
+// The LEFT axis label once a twin exists. Plain ylabel() targets whichever
+// axis is current, which after twinx() is the right one.
+inline void ylabel_left(const std::string& s) {
+    if (!detail::twinned()) {
+        detail::attr("ylabel", detail::q(s));
+        return;
+    }
+    detail::S().add("plot!(_twinroot[1]; ylabel=" + detail::q(s) + ")");
+}
+
+// ── Text ────────────────────────────────────────────────────────────────────
+//
+// annotate() above places plain text. This is the full form: size, colour,
+// alignment (":left", ":center", ":right") and rotation in degrees, which is
+// what matplotlib's text(..., ha=, rotation=) gives.
+inline void text(double x, double y, const std::string& s, double pt = 10,
+                 const std::string& align = ":center", double rotation = 0.0) {
+    detail::S().add("_cur = annotate!(_cur, " + detail::num(x) + ", " + detail::num(y) +
+                    ", Plots.text(" + detail::q(s) + ", " + detail::num(pt) + ", " +
+                    detail::sym(align) + ", rotation=" + detail::num(rotation) + "))");
+}
+
+// A title across a whole grid of panels, above the individual panel titles.
+// Set it before save(); it applies to the combined figure.
+inline void suptitle(const std::string& s) { detail::attr("plot_title", detail::q(s)); }
+
+// ── Frame, ticks and projection ─────────────────────────────────────────────
+
+// ":box" draws all four sides, ":axes" only left and bottom, ":none" removes
+// the frame entirely, ":grid" keeps the grid alone. matplotlib's spines.
+inline void framestyle(const std::string& style = ":box") {
+    detail::attr("framestyle", detail::sym(style));
+}
+inline void axis_off() { framestyle(":none"); }
+
+// Rotate tick labels, for the usual case of long category names colliding.
+inline void xrotation(double degrees) { detail::attr("xrotation", detail::num(degrees)); }
+inline void yrotation(double degrees) { detail::attr("yrotation", detail::num(degrees)); }
+
+inline void minorticks(bool on = true) {
+    detail::attr("minorticks", on ? "true" : "false");
+    detail::attr("minorgrid", on ? "true" : "false");
+}
+
+// Polar projection: x is then the angle in radians and y the radius.
+inline void polar(bool on = true) {
+    detail::attr("proj", on ? ":polar" : ":none");
+}
+
+// Draw the level values onto a contour plot -- matplotlib's clabel.
+inline void contour_labels(bool on = true) {
+    detail::attr("contour_labels", on ? "true" : "false");
+}
+
+// A caption on the colour bar.
+inline void colorbar_title(const std::string& s) {
+    detail::attr("colorbar_title", detail::q(s));
+}
+
+// Tie the axes of a panel grid together, so they zoom and scale as one:
+// ":x", ":y", ":both", ":none". matplotlib's sharex/sharey. Set it before
+// save(), like layout().
+inline void link(const std::string& which = ":x") { detail::attr("link", detail::sym(which)); }
 
 // Anything this header does not wrap. The key is a Plots attribute name; a
 // value starting ':' becomes a Symbol — set("linewidth", 3.0),
@@ -737,6 +1033,12 @@ inline void set(const std::string& key, const std::string& v) { detail::attr(key
 
 // Format comes from the extension: .png, .pdf, .svg, .html, and whatever else
 // the active Plots backend supports.
+// A transparent background, for dropping a figure onto a slide.
+inline void transparent(bool on = true) {
+    detail::attr("background_color", on ? ":transparent" : ":white");
+    detail::attr("foreground_color", on ? ":black" : ":black");
+}
+
 inline void save(const std::string& path) {
     detail::finishPanels();
     detail::S().add("savefig(_cur, " + detail::q(path) + ")");
@@ -778,6 +1080,7 @@ inline void show() {
 
 // Capture the current figure as one frame, then begin a fresh one.
 inline void frame() {
+    detail::untwin();
     if (detail::S().empty())
         throw std::runtime_error("plt::frame: nothing has been drawn yet");
     detail::finishPanels();

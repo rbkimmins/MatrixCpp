@@ -24,6 +24,18 @@
 #include <cufft.h>
 #include <cusolverDn.h>
 
+// CUDA 13 ships Thrust and CUB under include/cccl/, which nvcc puts on the
+// include path itself -- these need no extra -I.
+#include <cub/cub.cuh>
+#include <thrust/device_ptr.h>
+#include <thrust/execution_policy.h>
+#include <thrust/gather.h>
+#include <thrust/sequence.h>
+#include <thrust/sort.h>
+#include <thrust/unique.h>
+#include <thrust/iterator/constant_iterator.h>
+#include <thrust/reduce.h>
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -561,6 +573,26 @@ namespace mgpu {
                 case BinOp::Pow: return pow(a, b);
                 case BinOp::Max: return a > b ? a : b;
                 case BinOp::Min: return a < b ? a : b;
+                case BinOp::Atan2: return atan2(a, b);
+                case BinOp::Hypot: return hypot(a, b);
+                // MATLAB's convention, which is basic/'s:
+                //     mod(-1, 3) ==  2   the sign of the DIVISOR
+                //     rem(-1, 3) == -1   the sign of the DIVIDEND
+                // rem is C's fmod. mod is the one wanted for wrapping an angle
+                // or an index into a range. Both leave x alone when b is 0.
+                // Not to be confused with C's remainder(), which rounds to the
+                // NEAREST multiple and is neither of these.
+                case BinOp::Mod: {
+                    if (b == T(0)) return a;
+                    const T r = fmod(a, b);
+                    return (r != T(0) && ((r < T(0)) != (b < T(0)))) ? T(r + b) : r;
+                }
+                case BinOp::Rem: return b == T(0) ? a : fmod(a, b);
+                // Logical on 0/1 masks, returned as 0.0 or 1.0 so the result
+                // composes with the arithmetic like any other mask.
+                case BinOp::And: return T((a != T(0)) && (b != T(0)));
+                case BinOp::Or: return T((a != T(0)) || (b != T(0)));
+                case BinOp::Xor: return T((a != T(0)) != (b != T(0)));
             }
             return T(0);
         }
@@ -591,6 +623,16 @@ namespace mgpu {
                 case UnOp::Sign: return T(x > T(0)) - T(x < T(0));
                 case UnOp::Recip: return T(1) / x;
                 case UnOp::Square: return x * x;
+                case UnOp::Asinh: return asinh(x);
+                case UnOp::Acosh: return acosh(x);
+                case UnOp::Atanh: return atanh(x);
+                case UnOp::Cbrt: return cbrt(x);
+                // log1p and expm1 exist because log(1+x) and exp(x)-1 lose
+                // every significant digit for small x; they are not shorthand.
+                case UnOp::Log1p: return log1p(x);
+                case UnOp::Expm1: return expm1(x);
+                case UnOp::Trunc: return trunc(x);
+                case UnOp::Not: return T(x == T(0));
             }
             return T(0);
         }
@@ -2614,6 +2656,179 @@ namespace mgpu {
             kronImpl<Cx<double>>(ar, ac, cx(A), br, bc, cx(B), cx(d));
         }
 
+        // ── Sorting ────────────────────────────────────────────────────
+
+        template <class T>
+        static void sortFlatImpl(std::size_t n, T* data, bool desc) {
+            if (n < 2) return;
+            thrust::device_ptr<T> p(data);
+            if (desc) thrust::sort(thrust::device, p, p + n, thrust::greater<T>());
+            else thrust::sort(thrust::device, p, p + n);
+            checkLaunch("sort");
+        }
+        void sortFlat(std::size_t n, float* d, bool r) { sortFlatImpl<float>(n, d, r); }
+        void sortFlat(std::size_t n, double* d, bool r) { sortFlatImpl<double>(n, d, r); }
+
+        // Segment boundaries for a row-major matrix: row i spans
+        // [i*cols, (i+1)*cols). CUB wants the begin and end arrays separately,
+        // but they overlap by one, so one array of rows+1 offsets serves both.
+        __global__ void kRowOffsets(int rows, int cols, int* off) {
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i <= rows;
+                 i += blockDim.x * gridDim.x)
+                off[i] = i * cols;
+        }
+
+        template <class T>
+        static void sortSegments(int segments, int width, T* data, bool desc) {
+            const std::size_t n = (std::size_t)segments * width;
+            Scratch off(sizeof(int) * (std::size_t)(segments + 1));
+            kRowOffsets<<<gridFor((std::size_t)segments + 1), kBlock>>>(segments, width,
+                                                                       (int*)off.p);
+            checkLaunch("segment offsets");
+            // CUB's segmented sort is not in-place: it needs a distinct output.
+            Scratch out(sizeof(T) * n);
+            std::size_t bytes = 0;
+            const int* beg = (const int*)off.p;
+            const int* end = beg + 1;
+            if (desc)
+                cub::DeviceSegmentedSort::SortKeysDescending(nullptr, bytes, data, out.as<T>(),
+                                                             (int)n, segments, beg, end);
+            else
+                cub::DeviceSegmentedSort::SortKeys(nullptr, bytes, data, out.as<T>(), (int)n,
+                                                   segments, beg, end);
+            Scratch tmp(bytes);
+            if (desc)
+                cub::DeviceSegmentedSort::SortKeysDescending(tmp.p, bytes, data, out.as<T>(),
+                                                             (int)n, segments, beg, end);
+            else
+                cub::DeviceSegmentedSort::SortKeys(tmp.p, bytes, data, out.as<T>(), (int)n,
+                                                   segments, beg, end);
+            checkLaunch("segmented sort");
+            copyD2D(data, out.p, sizeof(T) * n);
+        }
+
+        template <class T, class FGeam>
+        static void sortAxisImpl(FGeam fgeam, int rows, int cols, T* data, bool byRow, bool desc) {
+            if (rows <= 0 || cols <= 0) return;
+            if (byRow) {
+                sortSegments<T>(rows, cols, data, desc);
+                return;
+            }
+            // A column is strided, and a CUB segment must be contiguous, so the
+            // matrix is transposed, sorted by row, and transposed back. Two
+            // geam passes is far cheaper than one sort launch per column.
+            const std::size_t n = (std::size_t)rows * cols;
+            Scratch t(sizeof(T) * n);
+            transposeCM<T>(fgeam, cols, rows, data, t.as<T>());
+            sortSegments<T>(cols, rows, t.as<T>(), desc);
+            transposeCM<T>(fgeam, rows, cols, t.as<T>(), data);
+        }
+        void sortAxis(int r, int c, float* d, bool byRow, bool desc) {
+            sortAxisImpl<float>(cublasSgeam, r, c, d, byRow, desc);
+        }
+        void sortAxis(int r, int c, double* d, bool byRow, bool desc) {
+            sortAxisImpl<double>(cublasDgeam, r, c, d, byRow, desc);
+        }
+
+        // Pulls one column out as the sort key.
+        template <class T>
+        __global__ void kExtractCol(int rows, int cols, const T* A, int key, T* out) {
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < rows;
+                 i += blockDim.x * gridDim.x)
+                out[i] = A[(std::size_t)i * cols + key];
+        }
+        // Moves whole rows into the order the permutation gives.
+        template <class T>
+        __global__ void kPermuteRows(int rows, int cols, const T* A, const int* order, T* out) {
+            const std::size_t n = (std::size_t)rows * cols;
+            for (std::size_t i = blockIdx.x * (std::size_t)blockDim.x + threadIdx.x; i < n;
+                 i += (std::size_t)blockDim.x * gridDim.x) {
+                const int r = (int)(i / cols), c = (int)(i % cols);
+                out[i] = A[(std::size_t)order[r] * cols + c];
+            }
+        }
+
+        template <class T>
+        static void sortRowsByImpl(int rows, int cols, T* data, int key, bool desc) {
+            if (rows <= 1 || cols <= 0) return;
+            if (key < 0 || key >= cols)
+                throw Error("sortrows: key column " + std::to_string(key) +
+                            " is outside a matrix with " + std::to_string(cols) + " columns");
+            Scratch keys(sizeof(T) * (std::size_t)rows);
+            Scratch order(sizeof(int) * (std::size_t)rows);
+            kExtractCol<T><<<gridFor((std::size_t)rows), kBlock>>>(rows, cols, data, key,
+                                                                   keys.as<T>());
+            checkLaunch("extract key column");
+            thrust::device_ptr<int> o((int*)order.p);
+            thrust::sequence(thrust::device, o, o + rows);
+            thrust::device_ptr<T> k(keys.as<T>());
+            // STABLE, so rows with equal keys keep their original order --
+            // which is what makes a sequence of sortrows calls compose into a
+            // multi-column sort, and what MATLAB does.
+            if (desc) thrust::stable_sort_by_key(thrust::device, k, k + rows, o,
+                                                 thrust::greater<T>());
+            else thrust::stable_sort_by_key(thrust::device, k, k + rows, o);
+            Scratch out(sizeof(T) * (std::size_t)rows * cols);
+            kPermuteRows<T><<<gridFor((std::size_t)rows * cols), kBlock>>>(
+                rows, cols, data, (const int*)order.p, out.as<T>());
+            checkLaunch("permute rows");
+            copyD2D(data, out.p, sizeof(T) * (std::size_t)rows * cols);
+        }
+        void sortRowsBy(int r, int c, float* d, int k, bool desc) {
+            sortRowsByImpl<float>(r, c, d, k, desc);
+        }
+        void sortRowsBy(int r, int c, double* d, int k, bool desc) {
+            sortRowsByImpl<double>(r, c, d, k, desc);
+        }
+
+        template <class T>
+        static long uniqueImpl(std::size_t n, T* data) {
+            if (n == 0) return 0;
+            thrust::device_ptr<T> p(data);
+            thrust::sort(thrust::device, p, p + n);
+            auto last = thrust::unique(thrust::device, p, p + n);
+            checkLaunch("unique");
+            return (long)(last - p);
+        }
+        long uniqueInPlace(std::size_t n, float* d) { return uniqueImpl<float>(n, d); }
+        long uniqueInPlace(std::size_t n, double* d) { return uniqueImpl<double>(n, d); }
+
+        // Longest run in the sorted copy. Ties go to the SMALLEST value because
+        // the scan keeps the first run of a given length and the data is
+        // ascending -- the same rule MATLAB's mode follows.
+        template <class T>
+        static T modeImpl(std::size_t n, const T* data) {
+            if (n == 0) throw Error("mode: empty input has no answer");
+            Scratch buf(sizeof(T) * n);
+            copyD2D(buf.p, data, sizeof(T) * n);
+            thrust::device_ptr<T> p(buf.as<T>());
+            thrust::sort(thrust::device, p, p + n);
+            // The run structure is cheap to read on the host once sorted, and
+            // n is the count of DISTINCT runs at most -- but copying n values
+            // back would defeat the point, so the scan runs on the device via
+            // reduce_by_key into counts, then one max.
+            Scratch vals(sizeof(T) * n);
+            Scratch cnts(sizeof(int) * n);
+            thrust::device_ptr<T> vp(vals.as<T>());
+            thrust::device_ptr<int> cp((int*)cnts.p);
+            auto ends = thrust::reduce_by_key(thrust::device, p, p + n,
+                                              thrust::constant_iterator<int>(1), vp, cp);
+            const long runs = (long)(ends.first - vp);
+            checkLaunch("mode: run lengths");
+            // argmax over the run counts, ties to the lowest index = smallest
+            // value, since the runs are in ascending order.
+            std::vector<int> hc((std::size_t)runs);
+            copyD2H(hc.data(), cnts.p, sizeof(int) * (std::size_t)runs);
+            long best = 0;
+            for (long i = 1; i < runs; ++i)
+                if (hc[(std::size_t)i] > hc[(std::size_t)best]) best = i;
+            T out{};
+            copyD2H(&out, vals.as<T>() + best, sizeof(T));
+            return out;
+        }
+        float modeOf(std::size_t n, const float* d) { return modeImpl<float>(n, d); }
+        double modeOf(std::size_t n, const double* d) { return modeImpl<double>(n, d); }
+
         // ── Builders ───────────────────────────────────────────────────
 
         template <class T>
@@ -2639,6 +2854,108 @@ namespace mgpu {
         }
         void linspace(std::size_t n, double* o, double lo, double hi, bool lg) {
             linspaceImpl<double>(n, o, lo, hi, lg);
+        }
+
+        // ── General (non-symmetric) eigenproblem ───────────────────────
+
+        // Splits cuSOLVER's interleaved complex eigenvalues into two real
+        // arrays, which is the layout Matrix<complex<T>> and the rest of this
+        // package want.
+        template <class T>
+        __global__ void kSplitW(int n, const T* interleaved, T* re, T* im) {
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+                 i += blockDim.x * gridDim.x) {
+                re[i] = interleaved[2 * i];
+                im[i] = interleaved[2 * i + 1];
+            }
+        }
+
+        // Unpacks LAPACK's real eigenvector storage into complex columns.
+        //
+        // A real eigenvalue owns one column of V and its vector is that column
+        // with zero imaginary part. A CONJUGATE PAIR owns two adjacent columns
+        // j and j+1: the first holds the shared real part, the second the
+        // imaginary part, and the two eigenvectors are
+        //
+        //     v_j   = V[:,j] + i V[:,j+1]        (the one with wi > 0)
+        //     v_j+1 = V[:,j] - i V[:,j+1]
+        //
+        // The pair is identified by wi[j] > 0, which cuSOLVER always puts
+        // first, exactly as LAPACK does.
+        template <class T>
+        __global__ void kAssembleEvs(int n, const T* V, const T* wi, T* re, T* im) {
+            const std::size_t total = (std::size_t)n * n;
+            for (std::size_t k = blockIdx.x * (std::size_t)blockDim.x + threadIdx.x; k < total;
+                 k += (std::size_t)blockDim.x * gridDim.x) {
+                const int col = (int)(k / n);   // column-major: column is the outer index
+                const int row = (int)(k % n);
+                const T wcol = wi[col];
+                if (wcol == T(0)) {
+                    re[k] = V[k];
+                    im[k] = T(0);
+                } else if (wcol > T(0)) {
+                    re[k] = V[k];
+                    im[k] = V[(std::size_t)(col + 1) * n + row];
+                } else {
+                    re[k] = V[(std::size_t)(col - 1) * n + row];
+                    im[k] = -V[k];
+                }
+            }
+        }
+
+        template <class T>
+        static int geevImpl(cudaDataType realType, cudaDataType cplxType, int n, T* A, T* wr,
+                            T* wi, T* VRr, T* VRi) {
+            cusolverDnParams_t params = nullptr;
+            checkSolver(cusolverDnCreateParams(&params), "cusolverDnCreateParams");
+            const bool wantVec = (VRr != nullptr);
+            const cusolverEigMode_t jobvr =
+                wantVec ? CUSOLVER_EIG_MODE_VECTOR : CUSOLVER_EIG_MODE_NOVECTOR;
+
+            Scratch W(sizeof(T) * 2 * (std::size_t)n);          // complex eigenvalues
+            Scratch V(sizeof(T) * (std::size_t)n * n);          // REAL packed eigenvectors
+            int result = 0;
+            try {
+                std::size_t devBytes = 0, hostBytes = 0;
+                // VL is passed as a valid pointer even though jobvl is
+                // NOVECTOR: cuSOLVER validates it regardless.
+                checkSolver(cusolverDnXgeev_bufferSize(
+                                solver(), params, CUSOLVER_EIG_MODE_NOVECTOR, jobvr, (int64_t)n,
+                                realType, A, (int64_t)n, cplxType, W.p, realType, V.p, (int64_t)n,
+                                realType, V.p, (int64_t)n, realType, &devBytes, &hostBytes),
+                            "cusolverDnXgeev_bufferSize");
+                Scratch devW(devBytes);
+                std::vector<char> hostW(hostBytes ? hostBytes : 1);
+                Info info;
+                checkSolver(cusolverDnXgeev(solver(), params, CUSOLVER_EIG_MODE_NOVECTOR, jobvr,
+                                            (int64_t)n, realType, A, (int64_t)n, cplxType, W.p,
+                                            realType, V.p, (int64_t)n, realType, V.p, (int64_t)n,
+                                            realType, devW.p, devBytes, hostW.data(), hostBytes,
+                                            info.d),
+                            "cusolverDnXgeev");
+                result = info.get();
+                if (result == 0) {
+                    kSplitW<T><<<gridFor((std::size_t)n), kBlock>>>(n, W.template as<T>(), wr, wi);
+                    checkLaunch("eigenvalue split");
+                    if (wantVec) {
+                        kAssembleEvs<T><<<gridFor((std::size_t)n * n), kBlock>>>(
+                            n, V.template as<T>(), wi, VRr, VRi);
+                        checkLaunch("eigenvector assembly");
+                    }
+                }
+            } catch (...) {
+                cusolverDnDestroyParams(params);
+                throw;
+            }
+            cusolverDnDestroyParams(params);
+            return result;
+        }
+
+        int geev(int n, double* A, double* wr, double* wi, double* VRr, double* VRi) {
+            return geevImpl<double>(CUDA_R_64F, CUDA_C_64F, n, A, wr, wi, VRr, VRi);
+        }
+        int geev(int n, float* A, float* wr, float* wi, float* VRr, float* VRi) {
+            return geevImpl<float>(CUDA_R_32F, CUDA_C_32F, n, A, wr, wi, VRr, VRi);
         }
 
         // ── Diagnostics ────────────────────────────────────────────────

@@ -6,6 +6,8 @@
 //
 // Build: g++ -std=c++17 -O2 -fopenmp -o validate validate.cpp && ./validate
 #include "Matrix1.0.hpp"
+
+#include <numeric>
 #include <fstream>
 #include <iostream>
 #include <iomanip>
@@ -1177,6 +1179,148 @@ int main() {
         ok(pm.numel() == 50,                 "randperm() returns n entries");
         ok(pm.unique().numel() == 50,        "randperm() is a permutation — no repeats");
         ok(pm.min() == 0 && pm.max() == 49,  "randperm() covers 0..n-1");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    section("Indexing");
+    {
+        Matrix<double> A(3, 3); A = {{1, 2, 3}, {4, 5, 6}, {7, 8, 9}};
+
+        // Integers of every width index without a cast — the conversion to the
+        // operator's int parameter is the language's job, not the caller's.
+        int i = 1; long l = 1; unsigned u = 1; std::size_t z = 1;
+        short sh = 1; char c = 1;
+        ok(A[i] == 2.0 && A[l] == 2.0 && A[u] == 2.0 && A[z] == 2.0 &&
+               A[sh] == 2.0 && A[c] == 2.0,
+           "int, long, unsigned, size_t, short and char all index directly");
+        ok(A(i, l) == 5.0 && A(u, z) == 5.0 && A(sh, c) == 5.0,
+           "two-index access takes any integral width");
+
+        const Matrix<double> C = A;
+        ok(C[4] == 5.0 && C(1, 1) == 5.0, "a const Matrix indexes the same way");
+
+        // NumPy-style negatives: -1 is the last, -n the first.
+        ok(A(-1, -1) == 9.0 && A(-3, -3) == 1.0, "negative indices count from the end");
+        ok(A(0, -1) == 3.0 && A(-1, 0) == 7.0,   "signs can be mixed");
+        ok(A[-1] == 9.0 && A[-9] == 1.0,         "flat indices count from the end too");
+        ok(Matrix<double>(A(-1, all))(0, 0) == 7.0,  "a negative row slice is the last row");
+        ok(Matrix<double>(A(all, -1))(0, 0) == 3.0,  "a negative column slice is the last column");
+        ok(Matrix<double>(A({-2, -1}, {0, 1}))(1, 1) == 8.0, "negative sub-block ranges");
+
+        // Out of range THROWS. It used to wrap silently -- A[10] quietly
+        // returning A[1] -- which is neither NumPy's behaviour nor MATLAB's,
+        // and a plausible wrong answer is worse than an error.
+        auto throwsRange = [](auto f) {
+            try { f(); return false; } catch (const std::out_of_range&) { return true; }
+            catch (...) { return false; }
+        };
+        ok(throwsRange([&] { (void)A(3, 0); }),   "a row index past the end throws");
+        ok(throwsRange([&] { (void)A(0, 3); }),   "a column index past the end throws");
+        ok(throwsRange([&] { (void)A[9]; }),      "a flat index past the end throws");
+        ok(throwsRange([&] { (void)A[-10]; }),    "a negative index past the start throws");
+        ok(throwsRange([&] { (void)A(3, all); }), "an out-of-range slice throws");
+
+        // A floating-point index is a COMPILE error, not a silent truncation.
+        // That cannot be tested at runtime by construction, so it is pinned
+        // down here: the traits below are what the guard's enable_if reads,
+        // and if they ever stopped holding the guard would stop firing.
+        ok(std::is_floating_point<double>::value && std::is_floating_point<float>::value,
+           "the index guard's condition holds for double and float");
+        ok(!std::is_floating_point<int>::value && !std::is_floating_point<long>::value &&
+               !std::is_floating_point<std::size_t>::value,
+           "and does not hold for the integral types, which must still work");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    section("Iteration");
+    {
+        Matrix<double> A(2, 3); A = {{1, 2, 3}, {4, 5, 6}};
+
+        double total = 0;
+        for (double v : A) total += v;
+        ok(total == 21.0,                    "range-for visits every element");
+
+        std::vector<double> seen;
+        for (double v : A) seen.push_back(v);
+        ok(seen == std::vector<double>({1, 2, 3, 4, 5, 6}),
+           "iteration order is row-major, matching the storage");
+
+        for (double& v : A) v *= 2.0;
+        ok(A(0, 0) == 2.0 && A(1, 2) == 12.0, "range-for can write through a reference");
+
+        const Matrix<double> C = A;
+        double cs = 0;
+        for (double v : C) cs += v;
+        ok(cs == 42.0,                       "a const Matrix is iterable");
+
+        // The point of raw pointers: <algorithm> works on a Matrix directly.
+        ok(std::accumulate(A.begin(), A.end(), 0.0) == 42.0, "std::accumulate over a Matrix");
+        ok(*std::max_element(A.begin(), A.end()) == 12.0,    "std::max_element over a Matrix");
+        Matrix<double> B(1, 5); B = {{5, 3, 1, 4, 2}};
+        std::sort(B.begin(), B.end());
+        ok(B(0, 0) == 1.0 && B(0, 4) == 5.0, "std::sort over a Matrix");
+
+        Matrix<double> E;
+        long n = 0;
+        for (double v : E) { (void)v; n++; }
+        ok(n == 0 && E.begin() == E.end(),   "an empty Matrix iterates zero times");
+
+        // Iteration needs no ordering, so complex works where sort() does not.
+        Matrix<std::complex<double>> Z(1, 2);
+        Z(0, 0) = {1, 2}; Z(0, 1) = {3, 4};
+        std::complex<double> zs{0, 0};
+        for (auto z : Z) zs += z;
+        ok(zs == std::complex<double>(4, 6), "a complex Matrix is iterable");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    section("Set operations");
+    {
+        Matrix<double> a(1, 5); a = {{3, 1, 4, 1, 5}};
+        Matrix<double> b(1, 3); b = {{1, 5, 9}};
+
+        auto colIs = [](const Matrix<double>& m, std::vector<double> want) {
+            if (m.rows() != (long)want.size() || m.cols() != 1) return false;
+            for (std::size_t i = 0; i < want.size(); i++)
+                if (m(i, 0) != want[i]) return false;
+            return true;
+        };
+
+        ok(colIs(unique(a), {1, 3, 4, 5}),      "unique() drops repeats and sorts");
+        ok(unique(a).allclose(a.unique()),      "free unique() matches the method");
+        ok(colIs(setunion(a, b), {1, 3, 4, 5, 9}), "setunion() is every value in either");
+        ok(colIs(intersect(a, b), {1, 5}),      "intersect() is the values in both");
+        ok(colIs(setdiff(a, b), {3, 4}),        "setdiff(a,b) is in a but not b");
+        ok(colIs(setdiff(b, a), {9}),           "setdiff is NOT symmetric");
+        ok(colIs(setxor(a, b), {3, 4, 9}),      "setxor() is the symmetric difference");
+        ok(setxor(a, b).allclose(setxor(b, a)), "setxor IS symmetric");
+
+        // The identity that ties the four together.
+        ok(setunion(a, b).numel() ==
+               intersect(a, b).numel() + setxor(a, b).numel(),
+           "|union| == |intersect| + |symmetric difference|");
+
+        // ismember is the one that does not reduce.
+        Matrix<bool> m = ismember(a, b);
+        ok(m.rows() == a.rows() && m.cols() == a.cols(),
+           "ismember() keeps the shape of its first argument");
+        ok(!m(0, 0) && m(0, 1) && !m(0, 2) && m(0, 3) && m(0, 4),
+           "ismember() marks exactly the shared values");
+        ok(m.nnz() == 3,                        "ismember() counts through nnz()");
+
+        // A 2-D input is a bag of values, not rows.
+        Matrix<double> M(2, 3); M = {{5, 2, 5}, {2, 7, 1}};
+        ok(colIs(unique(M), {1, 2, 5, 7}),      "set operations flatten a matrix");
+
+        ok(issubset(intersect(a, b), a),        "the intersection is a subset of either side");
+        ok(!issubset(b, a),                     "issubset() rejects a non-subset");
+
+        // Empty operands, which are where an off-by-one in the merge shows up.
+        Matrix<double> e(0, 0);
+        ok(colIs(setunion(a, e), {1, 3, 4, 5}), "union with an empty set changes nothing");
+        ok(intersect(a, e).empty(),             "intersection with an empty set is empty");
+        ok(colIs(setdiff(a, e), {1, 3, 4, 5}),  "difference with an empty set changes nothing");
+        ok(setdiff(e, a).empty(),               "an empty set minus anything is empty");
     }
 
     // ═══════════════════════════════════════════════════════════════════

@@ -33,6 +33,7 @@
 //     io.hpp                output formats: Pretty, CSV, JSON, MATLAB, ...
 //     matrix.hpp            the Matrix class and its factorisations
 //     matrixfunctions.hpp   exp(A), log(A), sqrt(A) — matrix, not element-wise
+//     setops.hpp            union, intersect, setdiff, setxor, ismember
 //     decomposition.hpp     factorize(): factor once, solve many times
 //     builders.hpp          linspace, magic, vander, polynomials
 //     eigen.hpp             funm, eig(A,B), and QZ
@@ -40,6 +41,15 @@
 //     identity.hpp          the global `I`
 //     tensor.hpp            the Tensor class
 //     random.hpp            the ran2 generator both classes use
+//     gnuplot.hpp           gp::, a bare-bones plotter needing only gnuplot
+//
+// ON THE TWO PLOTTERS. gp:: above is deliberately small: it draws lines,
+// points, histograms, heatmaps and 3-D scatter through gnuplot, which is a
+// 3.3 MB package that is usually already installed. The plotting/ package is
+// the powerful one -- statistical plots, interactive HTML, LaTeX vector output
+// -- and reaches them through Julia and Plots.jl, which is a 3.2 GB depot.
+// They are independent, they can be used in the same program, and neither is
+// a fallback for the other.
 //
 // The reasoning behind the code — every design decision, every measurement,
 // and the negative results worth not repeating — is in docs/DESIGN_NOTES.md
@@ -49,4 +59,6 @@
 // and every GFLOP/s figure in the notes assumes it.
 
 #include "identity.hpp"   // chains the whole matrix side
+#include "setops.hpp"
 #include "tensor.hpp"
+#include "gnuplot.hpp"

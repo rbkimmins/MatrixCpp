@@ -192,6 +192,105 @@ library is the whole point. It is the kind of thing only a test catches.
 
 ---
 
+## Against CuPy, across sizes
+
+The GPU counterpart of the NumPy comparison in `benchmarks/`, built the same
+way: one program times ours, one times CuPy, a third draws the figures — and
+every figure is produced by our own C++ plotting package.
+
+```bash
+make -C gpu run-bench-cupy          # times both sides, then plots
+```
+
+Writes `gpu/bench/data/{gpu,cupy}_<dtype>_<op>.csv` and **one figure per
+operation** into `gpu/bench/plots/` — 14 of them, each with two panels:
+
+- **left** — the two absolute time curves, ours and CuPy's, log-log. This is
+  the panel that says whether an operation costs a microsecond or a minute,
+  which is what decides where to run it at all.
+- **right** — their ratio on a log axis, so 10^0 is parity and "twice as fast"
+  and "half as fast" sit the same distance from it. Plotted linearly, faster
+  would look bigger than slower, which it is not. The region between the curve
+  and parity is shaded **green where we are faster and red where CuPy is**, so
+  the answer is legible before reading a single number.
+
+  The shading changes colour at the exact crossing, not at the next measured
+  size: the curve is split by interpolating in log10 on both axes, which is
+  where the drawn line between two points actually sits.
+
+One operation per figure rather than a family per figure: eight curves crowded
+onto shared axes hide exactly the divergences the comparison exists to find.
+The x axis is ticked at the sizes actually measured and labelled with them,
+since a log axis otherwise prints 10^2.107 where 128 belongs.
+
+**What this measures is front-end overhead, not kernels.** Both sides end in
+the same cuBLAS, cuSOLVER, cuFFT and CUB routines, so a curve far from parity
+means one of us is doing something structurally different — an extra copy, a
+layout conversion, a worse launch count. That is the only thing a comparison
+like this can honestly detect, and it is worth detecting.
+
+```
+op                 n=128    n=512   n=2048   n=4096      (CuPy time / ours)
+gemm f64            1.08     1.00     0.96     1.00
+gemm f32            1.36     1.08     0.98     0.95
+solve               1.06     1.05     1.00     1.00
+lu                  1.23     1.03     0.99     0.99
+qr                  1.00     0.96     1.00        -
+cholesky            0.80     0.76     1.55     1.26
+svd                 0.95     0.97        -        -
+eigh                1.00     0.99        -        -
+eigvals             1.06     0.99        -        -
+
+op                 n=4096   n=65536  n=1048576  n=16777216
+add                  1.31      1.31       1.12        1.01
+chain                1.67      1.16       0.82        1.00
+sum                  1.04      1.42       1.21        1.04
+sort                 1.07      1.09       0.82        0.93
+fft                  1.12      1.02       0.94        0.84
+```
+
+Everything sits between 0.65x and 1.67x, which is the result to want: the C++
+front end costs nothing measurable against a mature one. The one systematic
+deviation is `cholesky` — slower below n=512, faster above — because our fixed
+two-transpose layout cost is a constant only the large sizes amortise.
+
+CuPy has to be installed for the Python half; see the note at the end of this
+file.
+
+---
+
+## Sorting
+
+`sort`, `sortrows`, `unique`, `median` and `mode`, with `mcpu`'s signatures and
+conventions — stable `sortrows`, ties in `mode` going to the smallest value,
+`median` averaging the two middle entries on an even count.
+
+**Correcting something said earlier in this file's history:** Thrust and CUB
+are NOT missing from CUDA 13. They moved to `include/cccl/`, which `nvcc` adds
+to the include path by itself, so `<thrust/sort.h>` and `<cub/cub.cuh>` need no
+extra flags. No hand-written sort network was necessary.
+
+```
+                          CPU          GPU
+sort 1048576         61.45 ms     0.29 ms    210x
+sort 16777216      1222.39 ms     7.29 ms    168x
+sort rows 4096²     624.92 ms     6.72 ms     93x
+sort cols 4096²    1087.92 ms     8.19 ms    133x
+median 4194304       43.32 ms     1.68 ms     26x
+```
+
+These are the largest speedups in the package — comparison sorting is
+bandwidth-bound and branch-heavy, which is the CPU's worst case and the GPU's
+best.
+
+Per-row sorting uses CUB's segmented sort: one launch for the whole matrix
+rather than one per row. A **column** sort transposes in and back out, because
+a CUB segment has to be contiguous — and it is still *faster* than the row
+case relative to the CPU, since two `geam` passes cost far less than the
+strided access the CPU pays.
+
+---
+
 ## Complex
 
 `mgpu::Matrix<std::complex<double>>` and `<float>` are full citizens — the same
@@ -406,38 +505,40 @@ roughly break-even against the CPU.
 
 ## What is not here, and why
 
-**No general (non-symmetric) `eig()`.** CUDA 13 removed the legacy
-`Dgeev`/`Sgeev` and offers only `cusolverDnXgeev`, which does not work on this
-build. Measured, not assumed:
+**A correction, and it was ours.** An earlier version of this file reported
+that `cusolverDnXgeev` was broken on this build, having "tested it three ways".
+It is not broken. For a real matrix the eigenvector arrays take **real** data
+types, not complex, because cuSOLVER returns them in LAPACK's packed form —
+only `dataTypeW` is complex. Passing complex for `dataTypeVL`/`dataTypeVR`
+gives `CUSOLVER_STATUS_INVALID_VALUE`, which we read as a library fault rather
+than a usage error; the three tests were three variations of one wrong
+assumption. Comparing against CuPy — which calls the same symbol in the same
+`libcusolver.so.12.2.0.11` successfully — is what surfaced it.
+
+`eig()` and `eigvals()` are available, with `mcpu`'s contracts: `eigvals()`
+always works and returns complex; `eig()` returns the real pair and refuses a
+complex spectrum rather than dropping the imaginary part.
+
+**Check the size before reaching for it:**
 
 ```
-cuSOLVER 12.2.0 (CUDA 13.2), RTX 5060 Ti, sm_120
-
-  dataTypeA real     -> 3  CUSOLVER_STATUS_INVALID_VALUE
-      for every jobvl/jobvr, every W and V type, both computeTypes,
-      null and non-null VL, at n = 4, 32, 256
-
-  dataTypeA complex  -> 7  CUSOLVER_STATUS_INTERNAL_ERROR
-      from bufferSize AND from the call itself; info = 0, W left all
-      zero, even for an upper-triangular matrix whose eigenvalues are
-      just its diagonal
+n        eigvals cpu    eigvals gpu    ratio     eigSym gpu
+128           10.5 ms        18.5 ms    0.57x        3.1 ms
+256          109.5 ms        37.6 ms    2.91x        5.7 ms
+512         1319.3 ms        97.5 ms   13.52x       11.8 ms
+1024       11453.1 ms       297.5 ms   38.49x       31.6 ms
 ```
 
-Handle and params creation both return SUCCESS and `cudaGetLastError` stays
-clean, so this is a library gap rather than a misuse. Use the CPU one:
+Below n≈200 the CPU wins outright, and if the matrix is symmetric `eigSym()` is
+9x faster again at n=1024. The QR sweep behind a non-symmetric eigensolver is
+sequential and shift-dependent — close to the worst shape for this hardware —
+while the symmetric problem has a divide-and-conquer algorithm that maps onto
+it properly.
 
-```cpp
-auto [values, vectors] = dA.cpu().eig();
-```
+**Still CPU-only:** `schur`, `hess`, `funm`, `qz`, `rref`, `null`, `orth`.
 
-That is not much of a loss. The QR sweep behind a non-symmetric eigensolver is
-sequential and shift-dependent — close to the worst possible shape for a GPU.
-The symmetric problem has a divide-and-conquer algorithm that maps onto the
-hardware properly, which is why `eigSym` is the 236x entry above.
-
-**No complex or integral `mgpu::Matrix`.** Only `float` and `double` instantiate.
-Complex would roughly double the backend surface for routines cuSOLVER already
-provides (`Zgetrf`, `Zpotrf`, …); it is mechanical work, not design work.
+**No integral `mgpu::Matrix`.** `float`, `double`, `complex<float>` and
+`complex<double>` instantiate; integers stay on the CPU.
 
 **No pivoted QR.** cuSOLVER exposes no pivoted `geqrf`, so unlike
 `Matrix::QR()` there is no permutation to return.
@@ -482,7 +583,7 @@ export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 
 ```bash
 make -C gpu              # libmatrixcpp_gpu.a
-make -C gpu run-test     # 234 checks against basic/
+make -C gpu run-test     # 306 checks against basic/
 make -C gpu run-bench    # timings, writes gpu/test/results/cpp.csv
 ```
 
@@ -520,7 +621,7 @@ device.hpp           which GPU, how much memory, is there one at all
 detail/backend.hpp   declarations of everything CUDA implements — pure C++17
 src/backend.cu       the only file nvcc sees
 gpu_matrix.hpp       mgpu::Matrix<T> and mgpu::Expr<T> (the fused chains)
-test/correctness.cpp 234 checks, all against basic/
+test/correctness.cpp 306 checks, all against basic/
 test/benchmark.cpp   CPU vs GPU timings
 test/cupy_timings.py CuPy timings + the three-way table
 Makefile
@@ -528,7 +629,7 @@ Makefile
 
 ## Verification
 
-- **234 / 234** correctness checks against `basic/`, which is itself validated
+- **306 / 306** correctness checks against `basic/`, which is itself validated
   against NumPy/SciPy — so agreement here is transitively agreement with them.
 - **0 errors** under `compute-sanitizer --tool memcheck`. The 8 reported
   "leaks" are the cuBLAS/cuSOLVER/cuRAND handles, deliberately never destroyed:

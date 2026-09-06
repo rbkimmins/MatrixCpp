@@ -42,18 +42,34 @@ class Matrix {
         colSize = 0;
         grid = nullptr;
     }
-    // Creates an i x j matrix, zero-initialised
-    Matrix(long i, long j) {
+    // Every path that sizes a matrix goes through here, so the limit is stated
+    // once and cannot be bypassed. It used to live inline in this constructor
+    // alone, which left the UNINITIALISED one -- the one every internal result
+    // uses -- unguarded: kron, repmat, concat and even a plain outer product
+    // could each build a matrix past the limit, and the elements beyond it were
+    // simply unreachable.
+    //
+    // The limit is now ALLOCATION rather than indexing. Indices are `long`, so
+    // what actually binds is the byte count overflowing. The test is written as
+    // a division because `i * j * sizeof(T) > LIMIT` would already have
+    // overflowed by the time it was compared.
+    static void requireAllocatable(long i, long j) {
         if (i < 0 || j < 0)
             throw std::invalid_argument("Matrix: dimensions must be non-negative, got " +
                                         std::to_string(i) + "x" + std::to_string(j));
-        // Indexing operators use signed int, so both dimensions and their product
-        // must fit within INT_MAX to guarantee every element is reachable.
-        static constexpr long MAX_IDX = std::numeric_limits<int>::max();
-        if (i > MAX_IDX || j > MAX_IDX || i * j > MAX_IDX)
-            throw std::invalid_argument("Matrix: dimensions " + std::to_string(i) + "x" +
-                                        std::to_string(j) + " exceed the maximum indexable size (" +
-                                        std::to_string(MAX_IDX) + ")");
+        static constexpr long MAX_ELEMS =
+            std::numeric_limits<long>::max() / (long)sizeof(datatype);
+        if (i != 0 && j > MAX_ELEMS / i)
+            throw std::invalid_argument(
+                "Matrix: " + std::to_string(i) + "x" + std::to_string(j) +
+                " needs more than " + std::to_string(MAX_ELEMS) +
+                " elements, which cannot be addressed at " + std::to_string(sizeof(datatype)) +
+                " bytes each");
+    }
+
+    // Creates an i x j matrix, zero-initialised
+    Matrix(long i, long j) {
+        requireAllocatable(i, j);
         rowSize = i;
         colSize = j;
         allocZero(rowSize * colSize);
@@ -1027,7 +1043,7 @@ class Matrix {
 
     class RowProxy {
         Matrix& mat;
-        int row;
+        long row;
 
       public:
         RowProxy(Matrix& m, int r) : mat(m), row(r) {}
@@ -1159,7 +1175,7 @@ class Matrix {
 
     class ColProxy {
         Matrix& mat;
-        int col;
+        long col;
 
       public:
         ColProxy(Matrix& m, int c) : mat(m), col(c) {}
@@ -1291,10 +1307,11 @@ class Matrix {
 
     class SubProxy {
         Matrix& mat;
-        int r1, c1, rStep, cStep, numRows, numCols;
+        long r1, c1, rStep, cStep, numRows, numCols;
 
       public:
-        SubProxy(Matrix& m, int r1, int c1, int rStep, int cStep, int numRows, int numCols)
+        SubProxy(Matrix& m, long r1, long c1, long rStep, long cStep, long numRows,
+                 long numCols)
             : mat(m),
               r1(r1),
               c1(c1),
@@ -1433,16 +1450,58 @@ class Matrix {
     };
 
     // --- Indexing operators ---
-    // Note: negative indices wrap backwards (e.g. -1 gives last element).
-    // Matrix is indexed as A(i, j) where i = row, j = column (0-based).
+    //
+    // A(i, j) with i = row, j = column, 0-based. NEGATIVE INDICES COUNT FROM
+    // THE END, as NumPy's do: A(-1, -1) is the bottom-right element and
+    // A(-rows, 0) is the top-left. Anything outside [-n, n) throws.
+    //
+    // WHAT THIS REPLACED, and why. The old form was `grid[(i % rowSize) *
+    // colSize + ...]`, which had two problems and no upside:
+    //
+    //   * It did not do what its own comment claimed. C++'s % takes the sign
+    //     of the DIVIDEND, so -1 % 5 is -1, not 4 -- A(-1,-1) read BEFORE the
+    //     buffer rather than wrapping to the last element. ASan called it a
+    //     stack-buffer-underflow.
+    //   * For positive indices it silently wrapped ANY value: A[7] on five
+    //     elements quietly returned A[2]. Neither NumPy nor MATLAB does that;
+    //     both raise. A wrong element that looks right is the worst outcome an
+    //     index can produce, and it hides for as long as the answer stays
+    //     plausible. A caller who genuinely wants wrapping can still write
+    //     A[i % A.numel()] and mean it.
+    //
+    // The replacement is also FASTER. A compare-and-add costs a couple of
+    // cycles where an integer division costs twenty to forty, and there were
+    // two of them per two-dimensional access.
+    //
+    // The parameters are `long`, matching rowSize and colSize, so there is no
+    // width to truncate at. That matters more than it looks: with an `int`
+    // parameter and `long` dimensions, an index past INT_MAX arrives already
+    // wrapped to a negative number and is indistinguishable from a deliberate
+    // negative index -- the overflow bug would hide inside this very feature.
+
+    // Resolves one index against an extent, wrapping negatives from the end.
+    // Cold path is out of line so the common case stays a compare and an add.
+    [[noreturn]] static void indexOutOfRange(long i, long n, const char* axis) {
+        throw std::out_of_range(std::string("index ") + std::to_string(i) + " is out of range for " +
+                                axis + " of length " + std::to_string(n) +
+                                " (valid: " + std::to_string(-n) + " to " + std::to_string(n - 1) +
+                                ")");
+    }
+    static long resolveIndex(long i, long n, const char* axis) {
+        const long k = (i < 0) ? i + n : i;
+        if (k < 0 || k >= n) indexOutOfRange(i, n, axis);
+        return k;
+    }
 
     // Returns a reference to element (i, j) — supports A(i,j) = x
-    datatype& operator()(const int& i, const int& j) {
-        return grid[(i % rowSize) * colSize + (j % colSize)];
+    datatype& operator()(long i, long j) {
+        return grid[resolveIndex(i, rowSize, "rows") * colSize +
+                    resolveIndex(j, colSize, "columns")];
     }
     // Const element access
-    const datatype& operator()(const int& i, const int& j) const {
-        return grid[(i % rowSize) * colSize + (j % colSize)];
+    const datatype& operator()(long i, long j) const {
+        return grid[resolveIndex(i, rowSize, "rows") * colSize +
+                    resolveIndex(j, colSize, "columns")];
     }
     // ── A 1x1 matrix IS a scalar ───────────────────────────────────────────
     //
@@ -1488,57 +1547,146 @@ class Matrix {
         return grid[0];
     }
 
-    // Flat index access into the underlying row-major array — supports A[i] = x
-    datatype& operator[](const int& i) { return grid[i % (rowSize * colSize)]; }
-    // Const flat index access, so A[i] reads from a const Matrix too.
-    const datatype& operator[](const int& i) const { return grid[i % (rowSize * colSize)]; }
+    // Flat index into the row-major buffer — supports A[i] = x. Same rules as
+    // A(i, j): negative counts from the end, out of range throws.
+    datatype& operator[](long i) {
+        return grid[resolveIndex(i, rowSize * colSize, "the matrix")];
+    }
+    // Const flat index, so A[i] reads from a const Matrix too.
+    const datatype& operator[](long i) const {
+        return grid[resolveIndex(i, rowSize * colSize, "the matrix")];
+    }
+
+    // ── Indexing with a floating-point value is refused ────────────────────
+    //
+    // A[2.9] does not mean A[3]. C++ converts a double index by TRUNCATING
+    // toward zero, so it silently means A[2], and nothing in -Wall -Wextra
+    // says a word. The same goes for A[n * 0.5] and B(1.9, 1.9). It is a
+    // classic first-week bug and it hides for a long time, because the answer
+    // is only off by one.
+    //
+    // So these overloads exist to catch it. They are templates constrained to
+    // floating-point arguments, which makes them a better match than the int
+    // ones, and their bodies fail to compile with an explanation. An integer
+    // of any width still goes to the real operators below and converts
+    // normally -- long, size_t and friends are all fine, and need no cast.
+    //
+    // The static_assert is written against U so it depends on the template
+    // parameter and fires only when one of these is actually instantiated.
+    template <typename U, typename = std::enable_if_t<std::is_floating_point<U>::value>>
+    datatype& operator[](U) {
+        static_assert(!std::is_floating_point<U>::value,
+                      "a floating-point index TRUNCATES: A[2.9] means A[2], not A[3].\n"
+                      "Round first and say which you meant — A[(int)std::round(x)] or\n"
+                      "A[(int)std::floor(x)] — or keep the index integral.");
+        return grid[0];
+    }
+    template <typename U, typename = std::enable_if_t<std::is_floating_point<U>::value>>
+    const datatype& operator[](U) const {
+        static_assert(!std::is_floating_point<U>::value,
+                      "a floating-point index TRUNCATES: A[2.9] means A[2], not A[3].\n"
+                      "Round first and say which you meant — A[(int)std::round(x)] or\n"
+                      "A[(int)std::floor(x)] — or keep the index integral.");
+        return grid[0];
+    }
+    template <typename U, typename V,
+              typename = std::enable_if_t<std::is_floating_point<U>::value ||
+                                          std::is_floating_point<V>::value>>
+    datatype& operator()(U, V) {
+        static_assert(!(std::is_floating_point<U>::value || std::is_floating_point<V>::value),
+                      "a floating-point index TRUNCATES: A(1.9, 1.9) means A(1, 1).\n"
+                      "Round first and say which you meant, or keep the indices integral.");
+        return grid[0];
+    }
+    template <typename U, typename V,
+              typename = std::enable_if_t<std::is_floating_point<U>::value ||
+                                          std::is_floating_point<V>::value>>
+    const datatype& operator()(U, V) const {
+        static_assert(!(std::is_floating_point<U>::value || std::is_floating_point<V>::value),
+                      "a floating-point index TRUNCATES: A(1.9, 1.9) means A(1, 1).\n"
+                      "Round first and say which you meant, or keep the indices integral.");
+        return grid[0];
+    }
+
+    // ── Iteration ──────────────────────────────────────────────────────────
+    //
+    //     for (double& v : A) v *= 2.0;          // every element, in order
+    //     for (double v : A) total += v;         // reading a const Matrix too
+    //
+    // The order is ROW-MAJOR, element by element, because that is how the
+    // storage is laid out: A(0,0), A(0,1), ... A(0,n-1), A(1,0), ... Iterating
+    // in the order the memory sits in is the only order that costs nothing.
+    //
+    // These are raw pointers rather than a wrapper class. The buffer is one
+    // contiguous block, so a pointer already IS a random-access iterator with
+    // the right category, the right arithmetic and no indirection -- and it
+    // means std::sort, std::accumulate and the rest of <algorithm> work on a
+    // Matrix directly.
+    //
+    // NOT offered for the proxies. A(i, all) is contiguous and could have
+    // them, but A(all, j) strides by a whole row and would need a real
+    // iterator class; giving one slice iterators and not the other would be
+    // worse than giving neither. Materialise the slice first.
+    //
+    // mgpu::Matrix deliberately has NO iterators -- see the note there.
+    datatype* begin() { return grid; }
+    datatype* end() { return grid + rowSize * colSize; }
+    const datatype* begin() const { return grid; }
+    const datatype* end() const { return grid + rowSize * colSize; }
+    const datatype* cbegin() const { return grid; }
+    const datatype* cend() const { return grid + rowSize * colSize; }
 
     // Row extraction — non-const returns RowProxy: supports A(i, all) = B
-    RowProxy operator()(const int& i, all_t) {
-        int r = ((i % (int)rowSize) + (int)rowSize) % (int)rowSize;
-        return RowProxy(*this, r);
+    RowProxy operator()(long i, all_t) {
+        return RowProxy(*this, resolveIndex(i, rowSize, "rows"));
     }
     // Row extraction — const returns Matrix by value for reading
-    Matrix operator()(const int& i, all_t) const {
-        Matrix<datatype> ans(1, this->colSize);
-        for (long j = 0; j < this->colSize; j++)
-            ans[j] = this->grid[(i % rowSize) * colSize + (j % colSize)];
+    Matrix operator()(long i, all_t) const {
+        const long r = resolveIndex(i, rowSize, "rows");
+        Matrix<datatype> ans(1, colSize);
+        for (long j = 0; j < colSize; j++) ans[j] = grid[r * colSize + j];
         return ans;
     }
 
     // Column extraction — non-const returns ColProxy: supports A(all, j) = B
-    ColProxy operator()(all_t, const int& i) {
-        int c = ((i % (int)colSize) + (int)colSize) % (int)colSize;
-        return ColProxy(*this, c);
+    ColProxy operator()(all_t, long i) {
+        return ColProxy(*this, resolveIndex(i, colSize, "columns"));
     }
     // Column extraction — const returns Matrix by value for reading
-    Matrix operator()(all_t, const int& i) const {
+    Matrix operator()(all_t, long i) const {
+        const long c = resolveIndex(i, colSize, "columns");
         Matrix<datatype> ans(rowSize, 1);
-        for (long j = 0; j < rowSize; j++)
-            ans[j] = grid[(j % rowSize) * colSize + (i % colSize)];
+        for (long j = 0; j < rowSize; j++) ans[j] = grid[j * colSize + c];
         return ans;
     }
 
     // Submatrix — non-const returns SubProxy: supports A({r1,r2},{c1,c2}) = B
     // Negative indices wrap; reversed ranges (e.g. {9,7}) return elements in
     // reverse order.
-    SubProxy operator()(std::pair<int, int> rowRange, std::pair<int, int> colRange) {
-        int rN = (int)rowSize, cN = (int)colSize;
-        int r1 = ((rowRange.first % rN) + rN) % rN;
-        int r2 = ((rowRange.second % rN) + rN) % rN;
-        int c1 = ((colRange.first % cN) + cN) % cN;
-        int c2 = ((colRange.second % cN) + cN) % cN;
-        int numRows = std::abs(r2 - r1) + 1, numCols = std::abs(c2 - c1) + 1;
+    SubProxy operator()(std::pair<long, long> rowRange, std::pair<long, long> colRange) {
+        // Each endpoint resolves the same way a single index does: negative
+        // counts from the end, out of range throws. A REVERSED range is still
+        // a feature -- {9, 7} walks backwards -- which is why the two ends are
+        // resolved independently and the step is derived after.
+        const long r1 = resolveIndex(rowRange.first, rowSize, "rows");
+        const long r2 = resolveIndex(rowRange.second, rowSize, "rows");
+        const long c1 = resolveIndex(colRange.first, colSize, "columns");
+        const long c2 = resolveIndex(colRange.second, colSize, "columns");
+        const long numRows = std::labs(r2 - r1) + 1, numCols = std::labs(c2 - c1) + 1;
         return SubProxy(*this, r1, c1, (r2 >= r1) ? 1 : -1, (c2 >= c1) ? 1 : -1, numRows, numCols);
     }
     // Submatrix — const returns Matrix by value for reading
-    Matrix operator()(std::pair<int, int> rowRange, std::pair<int, int> colRange) const {
-        int rN = (int)rowSize, cN = (int)colSize;
-        int r1 = ((rowRange.first % rN) + rN) % rN;
-        int r2 = ((rowRange.second % rN) + rN) % rN;
-        int c1 = ((colRange.first % cN) + cN) % cN;
-        int c2 = ((colRange.second % cN) + cN) % cN;
-        int numRows = std::abs(r2 - r1) + 1, numCols = std::abs(c2 - c1) + 1;
+    Matrix operator()(std::pair<long, long> rowRange,
+                      std::pair<long, long> colRange) const {
+        // Each endpoint resolves the same way a single index does: negative
+        // counts from the end, out of range throws. A REVERSED range is still
+        // a feature -- {9, 7} walks backwards -- which is why the two ends are
+        // resolved independently and the step is derived after.
+        const long r1 = resolveIndex(rowRange.first, rowSize, "rows");
+        const long r2 = resolveIndex(rowRange.second, rowSize, "rows");
+        const long c1 = resolveIndex(colRange.first, colSize, "columns");
+        const long c2 = resolveIndex(colRange.second, colSize, "columns");
+        const long numRows = std::labs(r2 - r1) + 1, numCols = std::labs(c2 - c1) + 1;
         int rStep = (r2 >= r1) ? 1 : -1, cStep = (c2 >= c1) ? 1 : -1;
         Matrix<datatype> ans(numRows, numCols);
         for (int idx = 0; idx < numRows * numCols; idx++) {
@@ -4867,6 +5015,7 @@ class Matrix {
     // n = 2000. Only ever use this when the buffer is fully written before
     // it can be read.
     Matrix(long i, long j, uninit_t) {
+        requireAllocatable(i, j);   // same gate as the zero-filled form
         rowSize = i;
         colSize = j;
         allocRaw(i * j);  // deliberately not zeroed

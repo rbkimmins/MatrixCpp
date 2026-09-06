@@ -136,11 +136,16 @@ namespace mgpu {
         // kernels in the package that we write. All are memory-bound and
         // trivially correct: one thread per element, grid-stride loop.
 
-        enum class BinOp { Add, Sub, Mul, Div, Pow, Max, Min };
+        // Atan2/Hypot/Mod/Rem and the three logical ops are REAL ONLY -- see
+        // the complex section for why the ordered and integral operations have
+        // no complex counterpart.
+        enum class BinOp { Add, Sub, Mul, Div, Pow, Max, Min,
+                           Atan2, Hypot, Mod, Rem, And, Or, Xor };
         enum class UnOp {
             Neg, Abs, Sqrt, Exp, Log, Log2, Log10, Exp2,
             Sin, Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Tanh,
-            Floor, Ceil, Round, Sign, Recip, Square
+            Floor, Ceil, Round, Sign, Recip, Square,
+            Asinh, Acosh, Atanh, Cbrt, Log1p, Expm1, Trunc, Not
         };
         enum class RedOp { Sum, Max, Min, SumAbs, SumSq, Prod };
 
@@ -309,6 +314,40 @@ namespace mgpu {
         void kron(int ar, int ac, const std::complex<double>* A, int br, int bc,
                   const std::complex<double>* B, std::complex<double>* dst);
 
+        // ── Sorting ────────────────────────────────────────────────────
+        //
+        // Thrust and CUB do the work. CUDA 13 relocated them to
+        // include/cccl/, which nvcc adds to the include path on its own, so
+        // <thrust/sort.h> and <cub/cub.cuh> just work -- no extra flags and no
+        // hand-written sort network.
+        //
+        // Real only: sorting needs an order and the complex numbers have none.
+
+        // Sorts the whole buffer in place.
+        void sortFlat(std::size_t n, float* data, bool descending);
+        void sortFlat(std::size_t n, double* data, bool descending);
+
+        // Sorts each row (byRow) or each column independently, in place, via
+        // CUB's segmented sort -- one launch for the whole matrix rather than
+        // one per row. Columns are handled by transposing in and back out,
+        // since a segment has to be contiguous.
+        void sortAxis(int rows, int cols, float* data, bool byRow, bool descending);
+        void sortAxis(int rows, int cols, double* data, bool byRow, bool descending);
+
+        // Reorders whole ROWS by the values in column `key`, carrying every
+        // other column along.
+        void sortRowsBy(int rows, int cols, float* data, int key, bool descending);
+        void sortRowsBy(int rows, int cols, double* data, int key, bool descending);
+
+        // Sorts, removes adjacent duplicates, and returns how many distinct
+        // values are left at the front of the buffer.
+        long uniqueInPlace(std::size_t n, float* data);
+        long uniqueInPlace(std::size_t n, double* data);
+
+        // Most frequent value; ties go to the smallest, as MATLAB does.
+        float modeOf(std::size_t n, const float* data);
+        double modeOf(std::size_t n, const double* data);
+
         // ── Builders ───────────────────────────────────────────────────
         //
         // Both endpoints included, so the step is (hi - lo) / (n - 1) rather
@@ -386,204 +425,151 @@ namespace mgpu {
         int syevd(int n, float* A, float* w, bool vectors);
         int syevd(int n, double* A, double* w, bool vectors);
 
-        // NO GENERAL (NON-SYMMETRIC) EIGENPROBLEM. Measured, not assumed.
-        //
-        // CUDA 13 removed the legacy Dgeev/Sgeev and offers only the 64-bit
-        // cusolverDnXgeev. On this machine that entry point does not work:
-        //
-        //   cuSOLVER 12.2.0 (CUDA 13.2), RTX 5060 Ti, sm_120
-        //
-        //   dataTypeA real (CUDA_R_64F / CUDA_R_32F)
-        //       cusolverDnXgeev_bufferSize -> 3  CUSOLVER_STATUS_INVALID_VALUE
-        //       for every combination of jobvl/jobvr, every W and V type,
-        //       both computeTypes, null and non-null VL, n = 4, 32, 256.
-        //
-        //   dataTypeA complex (CUDA_C_64F / CUDA_C_32F)
-        //       cusolverDnXgeev_bufferSize -> 7  CUSOLVER_STATUS_INTERNAL_ERROR
-        //       cusolverDnXgeev            -> 7, info = 0, W left all zero
-        //       even for an upper-triangular matrix whose eigenvalues are
-        //       just its diagonal.
-        //
-        // Handle and params creation both return SUCCESS, and cudaGetLastError
-        // stays clean throughout, so this is a gap in the library rather than
-        // a misuse or a device fault. sm_120 is new enough that the most
-        // likely explanation is a missing kernel for this architecture.
-        //
-        // So the non-symmetric eigenproblem stays on the CPU, where basic/
-        // already has a Francis double-shift Schur decomposition:
-        //
-        //     auto [values, vectors] = dA.cpu().eig();
-        //
-        // That is not much of a loss. The QR iteration behind it is sequential
-        // and shift-dependent, which is close to the worst possible shape for
-        // a GPU; the reduction to Hessenberg form parallelises, but the sweep
-        // that follows does not. syevd below IS available and IS worth using -
-        // the symmetric problem has a divide-and-conquer algorithm that maps
-        // onto the hardware properly.
-
-        // ── FFT (cuFFT) ────────────────────────────────────────────────
-        //
-        // The CPU package has a whole signal module -- fft, ifft, conv, filter
-        // -- with no GPU counterpart, and cuFFT is the vendor library for it,
-        // already installed. Same principle as everywhere else here: we do the
-        // marshalling, NVIDIA does the transform.
-        //
-        // Complex data travels as SPLIT real and imaginary arrays rather than
-        // interleaved, because mgpu::Matrix is real-only and two real matrices
-        // are what the rest of the package can actually operate on. cuFFT wants
-        // interleaved, so the backend converts on the way in and out; that is
-        // two extra passes over the data, which is small against a transform
-        // that is O(n log n) with a much worse constant.
-        //
-        // LAYOUT. `stride` is the gap between successive elements of one
-        // transform and `dist` the gap between the starts of consecutive
-        // transforms, both in elements. Row-major m x n:
-        //
-        //     along rows     n = cols, batch = rows, stride = 1,    dist = cols
-        //     down columns   n = rows, batch = cols, stride = cols, dist = 1
-        //
-        // so both axes work without transposing anything, which is why the
-        // parameters are exposed rather than inferred.
-        //
-        // The inverse is scaled by 1/n, matching NumPy, MATLAB and the CPU
-        // side. cuFFT itself returns an unnormalised inverse.
-        void fft1d(int batch, int n, int stride, int dist, const float* inRe, const float* inIm,
-                   float* outRe, float* outIm, bool inverse);
-        void fft1d(int batch, int n, int stride, int dist, const double* inRe, const double* inIm,
-                   double* outRe, double* outIm, bool inverse);
-
-        void fft2d(int rows, int cols, const float* inRe, const float* inIm, float* outRe,
-                   float* outIm, bool inverse);
-        void fft2d(int rows, int cols, const double* inRe, const double* inIm, double* outRe,
-                   double* outIm, bool inverse);
-
-        // Complex in, complex out. cuFFT wants INTERLEAVED complex, which is
-        // exactly std::complex<T>'s layout, so this path skips the interleave
-        // and split the real one needs -- two fewer passes over the data.
-        void fft1dCx(int batch, int n, int stride, int dist, const std::complex<float>* in,
-                     std::complex<float>* out, bool inverse);
-        void fft1dCx(int batch, int n, int stride, int dist, const std::complex<double>* in,
-                     std::complex<double>* out, bool inverse);
-        void fft2dCx(int rows, int cols, const std::complex<float>* in, std::complex<float>* out,
-                     bool inverse);
-        void fft2dCx(int rows, int cols, const std::complex<double>* in, std::complex<double>* out,
-                     bool inverse);
-
-        // cuFFT plans are expensive to build and are cached by shape. This
-        // releases them, for the same reason poolRelease() exists.
-        void fftRelease();
-
         // ══════════════════════════════════════════════════════════════
         //  COMPLEX
         // ══════════════════════════════════════════════════════════════
         //
-        // std::complex<T> is required by the standard to have the same object
-        // representation as T[2], and cuDoubleComplex is a double2. So a host
-        // complex matrix, the device buffer, and what cuBLAS/cuSOLVER expect
-        // are all the same bytes: uploads stay a single memcpy and nothing is
-        // ever repacked. That is why the interface can speak std::complex
-        // directly while staying free of CUDA headers.
+        // std::complex<T> has the same object representation as T[2] and
+        // cuDoubleComplex is a double2, so the host matrix, the device buffer
+        // and what cuBLAS/cuSOLVER expect are all the same bytes -- uploads
+        // stay a single memcpy and nothing is repacked.
         //
-        // Ordering-based operations -- Max, Min, floor, ceil, round, sign --
-        // have no complex counterpart and are absent rather than faked. The
-        // public API does not offer them for complex types, so the gap is
-        // unreachable rather than silently wrong.
+        // Ordering-based operations (Max, Min, floor, ceil, round, sign) have
+        // no complex counterpart and are absent rather than faked.
+        //
+        // project(): complex -> real. part 0 real, 1 imaginary, 2 magnitude,
+        // 3 argument. compose(): real -> complex, im may be null.
+        // transposeCx(): conjugate = true gives A^H rather than A^T.
+        // normSq(): sum |z|^2, real-valued -- the Frobenius norm's inside.
+        // heevd(): the Hermitian eigenproblem, with real eigenvalues.
 
-        void binary(BinOp op, std::size_t n, const std::complex<float>* a,
-                    const std::complex<float>* b, std::complex<float>* out);
-        void binary(BinOp op, std::size_t n, const std::complex<double>* a,
-                    const std::complex<double>* b, std::complex<double>* out);
-        void binaryScalar(BinOp op, std::size_t n, const std::complex<float>* a,
-                          std::complex<float> s, std::complex<float>* out, bool scalarLeft);
-        void binaryScalar(BinOp op, std::size_t n, const std::complex<double>* a,
-                          std::complex<double> s, std::complex<double>* out, bool scalarLeft);
-        void unary(UnOp op, std::size_t n, const std::complex<float>* a, std::complex<float>* out);
-        void unary(UnOp op, std::size_t n, const std::complex<double>* a,
-                   std::complex<double>* out);
-        void conj(std::size_t n, const std::complex<float>* a, std::complex<float>* out);
-        void conj(std::size_t n, const std::complex<double>* a, std::complex<double>* out);
+        void binary(BinOp op, std::size_t n, const std::complex<float>* a, const std::complex<float>* b, std::complex<float>* o);
+        void binary(BinOp op, std::size_t n, const std::complex<double>* a, const std::complex<double>* b, std::complex<double>* o);
+        void binaryScalar(BinOp op, std::size_t n, const std::complex<float>* a, std::complex<float> s, std::complex<float>* o, bool l);
+        void binaryScalar(BinOp op, std::size_t n, const std::complex<double>* a, std::complex<double> s, std::complex<double>* o, bool l);
+        void unary(UnOp op, std::size_t n, const std::complex<float>* a, std::complex<float>* o);
+        void unary(UnOp op, std::size_t n, const std::complex<double>* a, std::complex<double>* o);
+        void conj(std::size_t n, const std::complex<float>* a, std::complex<float>* o);
+        void conj(std::size_t n, const std::complex<double>* a, std::complex<double>* o);
         void fill(std::size_t n, std::complex<float>* a, std::complex<float> v);
         void fill(std::size_t n, std::complex<double>* a, std::complex<double> v);
-
-        // Complex -> real. part: 0 real, 1 imaginary, 2 magnitude, 3 argument.
-        void project(int part, std::size_t n, const std::complex<float>* a, float* out);
-        void project(int part, std::size_t n, const std::complex<double>* a, double* out);
-        // Real -> complex; `im` may be null for a purely real result.
-        void compose(std::size_t n, const float* re, const float* im, std::complex<float>* out);
-        void compose(std::size_t n, const double* re, const double* im, std::complex<double>* out);
-
-        // Sum and product only -- see the note above about ordering.
+        void project(int part, std::size_t n, const std::complex<float>* a, float* o);
+        void project(int part, std::size_t n, const std::complex<double>* a, double* o);
+        void compose(std::size_t n, const float* re, const float* im, std::complex<float>* o);
+        void compose(std::size_t n, const double* re, const double* im, std::complex<double>* o);
         std::complex<float> reduce(RedOp op, std::size_t n, const std::complex<float>* a);
         std::complex<double> reduce(RedOp op, std::size_t n, const std::complex<double>* a);
-        // sum |z|^2, real-valued: the inside of the Frobenius norm.
         float normSq(std::size_t n, const std::complex<float>* a);
         double normSq(std::size_t n, const std::complex<double>* a);
-
-        void triangle(int rows, int cols, std::complex<float>* A, bool upper, bool unitDiag);
-        void triangle(int rows, int cols, std::complex<double>* A, bool upper, bool unitDiag);
-        void copyBlock(int srcRows, int srcCols, const std::complex<float>* src, int r0, int c0,
-                       int nr, int nc, std::complex<float>* dst);
-        void copyBlock(int srcRows, int srcCols, const std::complex<double>* src, int r0, int c0,
-                       int nr, int nc, std::complex<double>* dst);
-        void setBlock(int dstRows, int dstCols, std::complex<float>* dst, int r0, int c0,
-                      int srcRows, int srcCols, const std::complex<float>* src);
-        void setBlock(int dstRows, int dstCols, std::complex<double>* dst, int r0, int c0,
-                      int srcRows, int srcCols, const std::complex<double>* src);
-        void setDiagonal(int rows, int cols, std::complex<float>* A, const std::complex<float>* d);
-        void setDiagonal(int rows, int cols, std::complex<double>* A,
-                         const std::complex<double>* d);
-        void getDiagonal(int rows, int cols, const std::complex<float>* A, std::complex<float>* d);
-        void getDiagonal(int rows, int cols, const std::complex<double>* A,
-                         std::complex<double>* d);
-
-        void gemm(int M, int N, int K, std::complex<float> alpha, const std::complex<float>* A,
-                  const std::complex<float>* B, std::complex<float> beta, std::complex<float>* C);
-        void gemm(int M, int N, int K, std::complex<double> alpha, const std::complex<double>* A,
-                  const std::complex<double>* B, std::complex<double> beta,
-                  std::complex<double>* C);
-
-        // conjugate = true gives A^H rather than A^T. For complex data A^H is
-        // nearly always the one meant: it is what makes Q^H Q = I and
-        // A = U S V^H come out right.
-        void transposeCx(int rows, int cols, const std::complex<float>* A,
-                         std::complex<float>* out, bool conjugate);
-        void transposeCx(int rows, int cols, const std::complex<double>* A,
-                         std::complex<double>* out, bool conjugate);
-
-        void fusedElementwise(const FusedProgram& prog, std::size_t n,
-                              const std::complex<float>* const* inputs, int nInputs,
-                              std::complex<float>* out);
-        void fusedElementwise(const FusedProgram& prog, std::size_t n,
-                              const std::complex<double>* const* inputs, int nInputs,
-                              std::complex<double>* out);
-
-        int getrf(int m, int n, std::complex<float>* A, int* ipiv);
+        void triangle(int r, int c, std::complex<float>* A, bool u, bool ud);
+        void triangle(int r, int c, std::complex<double>* A, bool u, bool ud);
+        void copyBlock(int sr, int sc, const std::complex<float>* s, int r0, int c0, int nr, int nc, std::complex<float>* d);
+        void copyBlock(int sr, int sc, const std::complex<double>* s, int r0, int c0, int nr, int nc, std::complex<double>* d);
+        void setBlock(int dr, int dc, std::complex<float>* d, int r0, int c0, int nr, int nc, const std::complex<float>* s);
+        void setBlock(int dr, int dc, std::complex<double>* d, int r0, int c0, int nr, int nc, const std::complex<double>* s);
+        void setDiagonal(int r, int c, std::complex<float>* A, const std::complex<float>* d);
+        void setDiagonal(int r, int c, std::complex<double>* A, const std::complex<double>* d);
+        void getDiagonal(int r, int c, const std::complex<float>* A, std::complex<float>* d);
+        void getDiagonal(int r, int c, const std::complex<double>* A, std::complex<double>* d);
+        void gemm(int M, int N, int K, std::complex<float> alpha, const std::complex<float>* A, const std::complex<float>* B, std::complex<float> beta, std::complex<float>* C);
+        void gemm(int M, int N, int K, std::complex<double> alpha, const std::complex<double>* A, const std::complex<double>* B, std::complex<double> beta, std::complex<double>* C);
+        void transposeCx(int rows, int cols, const std::complex<float>* A, std::complex<float>* out, bool conjugate);
+        void transposeCx(int rows, int cols, const std::complex<double>* A, std::complex<double>* out, bool conjugate);
+        void fusedElementwise(const FusedProgram& prog, std::size_t n, const std::complex<float>* const* inputs, int nInputs, std::complex<float>* out);
+        void fusedElementwise(const FusedProgram& prog, std::size_t n, const std::complex<double>* const* inputs, int nInputs, std::complex<double>* out);
         int getrf(int m, int n, std::complex<double>* A, int* ipiv);
-        int getrs(int n, int nrhs, const std::complex<float>* A, const int* ipiv,
-                  std::complex<float>* B);
-        int getrs(int n, int nrhs, const std::complex<double>* A, const int* ipiv,
-                  std::complex<double>* B);
-        int potrf(int n, std::complex<float>* A, bool upper);
+        int getrf(int m, int n, std::complex<float>* A, int* ipiv);
+        int getrs(int n, int nrhs, const std::complex<double>* A, const int* ipiv, std::complex<double>* B);
+        int getrs(int n, int nrhs, const std::complex<float>* A, const int* ipiv, std::complex<float>* B);
         int potrf(int n, std::complex<double>* A, bool upper);
-        int potrs(int n, int nrhs, const std::complex<float>* A, std::complex<float>* B,
-                  bool upper);
-        int potrs(int n, int nrhs, const std::complex<double>* A, std::complex<double>* B,
-                  bool upper);
-        int geqrf(int m, int n, std::complex<float>* A, std::complex<float>* tau);
+        int potrf(int n, std::complex<float>* A, bool upper);
+        int potrs(int n, int nrhs, const std::complex<double>* A, std::complex<double>* B, bool upper);
+        int potrs(int n, int nrhs, const std::complex<float>* A, std::complex<float>* B, bool upper);
         int geqrf(int m, int n, std::complex<double>* A, std::complex<double>* tau);
-        int orgqr(int m, int n, int k, std::complex<float>* A, const std::complex<float>* tau);
+        int geqrf(int m, int n, std::complex<float>* A, std::complex<float>* tau);
         int orgqr(int m, int n, int k, std::complex<double>* A, const std::complex<double>* tau);
-
-        // Singular values are REAL whatever went in -- they are magnitudes.
-        int gesvd(int m, int n, std::complex<float>* A, float* S, std::complex<float>* U,
-                  std::complex<float>* VT, bool full);
-        int gesvd(int m, int n, std::complex<double>* A, double* S, std::complex<double>* U,
-                  std::complex<double>* VT, bool full);
-
-        // The Hermitian eigenproblem -- the complex counterpart of syevd. Its
-        // eigenvalues are real even though its eigenvectors are not.
-        int heevd(int n, std::complex<float>* A, float* w, bool vectors);
+        int orgqr(int m, int n, int k, std::complex<float>* A, const std::complex<float>* tau);
+        int gesvd(int m, int n, std::complex<double>* A, double* S, std::complex<double>* U, std::complex<double>* VT, bool full);
+        int gesvd(int m, int n, std::complex<float>* A, float* S, std::complex<float>* U, std::complex<float>* VT, bool full);
         int heevd(int n, std::complex<double>* A, double* w, bool vectors);
+        int heevd(int n, std::complex<float>* A, float* w, bool vectors);
+        void fft1dCx(int b, int n, int st, int di, const std::complex<float>* in, std::complex<float>* out, bool inv);
+        void fft1dCx(int b, int n, int st, int di, const std::complex<double>* in, std::complex<double>* out, bool inv);
+        void fft2dCx(int r, int c, const std::complex<float>* in, std::complex<float>* out, bool inv);
+        void fft2dCx(int r, int c, const std::complex<double>* in, std::complex<double>* out, bool inv);
+        void compare(CmpOp op, std::size_t n, const float* a, const float* b, float* o);
+        void compare(CmpOp op, std::size_t n, const double* a, const double* b, double* o);
+        void compareScalar(CmpOp op, std::size_t n, const float* a, float s, float* o);
+        void compareScalar(CmpOp op, std::size_t n, const double* a, double s, double* o);
+        long argExtreme(bool mx, std::size_t n, const float* a);
+        long argExtreme(bool mx, std::size_t n, const double* a);
+        void rearrange(Rearrange h, int sr, int sc, const float* s, int p, int q, float* d);
+        void rearrange(Rearrange h, int sr, int sc, const double* s, int p, int q, double* d);
+        void rearrange(Rearrange h, int sr, int sc, const std::complex<float>* s, int p, int q, std::complex<float>* d);
+        void rearrange(Rearrange h, int sr, int sc, const std::complex<double>* s, int p, int q, std::complex<double>* d);
+        void kron(int ar, int ac, const float* A, int br, int bc, const float* B, float* d);
+        void kron(int ar, int ac, const double* A, int br, int bc, const double* B, double* d);
+        void kron(int ar, int ac, const std::complex<float>* A, int br, int bc, const std::complex<float>* B, std::complex<float>* d);
+        void kron(int ar, int ac, const std::complex<double>* A, int br, int bc, const std::complex<double>* B, std::complex<double>* d);
+        void sortFlat(std::size_t n, float* d, bool r);
+        void sortFlat(std::size_t n, double* d, bool r);
+        void sortAxis(int r, int c, float* d, bool byRow, bool desc);
+        void sortAxis(int r, int c, double* d, bool byRow, bool desc);
+        void sortRowsBy(int r, int c, float* d, int k, bool desc);
+        void sortRowsBy(int r, int c, double* d, int k, bool desc);
+        long uniqueInPlace(std::size_t n, float* d);
+        long uniqueInPlace(std::size_t n, double* d);
+        float modeOf(std::size_t n, const float* d);
+        double modeOf(std::size_t n, const double* d);
+        void linspace(std::size_t n, float* o, float lo, float hi, bool lg);
+        void linspace(std::size_t n, double* o, double lo, double hi, bool lg);
+        int geev(int n, double* A, double* wr, double* wi, double* VRr, double* VRi);
+        int geev(int n, float* A, float* wr, float* wi, float* VRr, float* VRi);
+
+        // ── FFT (cuFFT) ────────────────────────────────────────────────
+        //
+        // Complex data travels as SPLIT real/imaginary arrays for the real
+        // entry points, because mgpu::Matrix is real-only there; the Cx forms
+        // take interleaved complex straight through, which is what cuFFT wants
+        // and what std::complex already is.
+        //
+        // stride is the gap between elements of one transform, dist the gap
+        // between transforms. Row-major m x n: along rows n=cols batch=rows
+        // stride=1 dist=cols; down columns n=rows batch=cols stride=cols dist=1.
+        // The inverse is scaled by 1/n, matching NumPy, MATLAB and basic/.
+
+        void fft1d(int b, int n, int st, int di, const float* ir, const float* ii, float* orr, float* oi, bool inv);
+        void fft1d(int b, int n, int st, int di, const double* ir, const double* ii, double* orr, double* oi, bool inv);
+        void fft2d(int r, int c, const float* ir, const float* ii, float* orr, float* oi, bool inv);
+        void fft2d(int r, int c, const double* ir, const double* ii, double* orr, double* oi, bool inv);
+
+        // ── General (non-symmetric) eigenproblem ───────────────────────
+        //
+        // cusolverDnXgeev, and the DATA TYPES ARE THE WHOLE TRICK. For a real
+        // matrix:
+        //
+        //     dataTypeA   real       the matrix
+        //     dataTypeW   COMPLEX    eigenvalues, which are complex in general
+        //     dataTypeVL  real       <- real, NOT complex
+        //     dataTypeVR  real       <- real, NOT complex
+        //     computeType real
+        //
+        // Passing complex for the eigenvector arrays -- which looks right,
+        // since the vectors are complex whenever the values are -- makes
+        // bufferSize return CUSOLVER_STATUS_INVALID_VALUE, and an earlier
+        // version of this file concluded from that the routine was broken. It
+        // is not. cuSOLVER returns the vectors in LAPACK's PACKED REAL form:
+        // a real eigenvalue gets one column, and a conjugate pair gets two,
+        // holding the shared real part and the imaginary part. assembleEvs()
+        // below turns that back into complex columns.
+        //
+        // VL must be a valid pointer even when jobvl is NOVECTOR.
+
+        // wr/wi receive the eigenvalues split into real and imaginary parts,
+        // n each. VRr/VRi, when non-null, receive the right eigenvectors
+        // already unpacked into complex, n*n each, column-major.
+        int geev(int n, double* A, double* wr, double* wi, double* VRr, double* VRi);
+        int geev(int n, float* A, float* wr, float* wi, float* VRr, float* VRi);
 
         // ── Diagnostics ────────────────────────────────────────────────
 
