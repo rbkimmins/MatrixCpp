@@ -339,4 +339,150 @@ namespace ml {
 
     }  // namespace logic
 
+    // ── ROADMAP -- what is not here yet ─────────────────────────────────────
+    //
+    // What is above is ONE layer, ONE output, and a hard yes/no. The steps
+    // below are in dependency order: each needs the one before it, and each
+    // names the reading that covers it.
+    //
+    // Sources, since page numbers are edition-specific:
+    //   [E]  Ekman, "Learning Deep Learning", Addison-Wesley 2021
+    //   [G]  Goodfellow/Bengio/Courville, "Deep Learning", MIT Press 2016
+    //   [M]  Mohri/Rostamizadeh/Talwalkar, "Foundations of Machine
+    //        Learning", 2nd ed, MIT Press 2018
+    // Pages are PRINTED book pages, not PDF viewer pages.
+    //
+    //
+    // 0. RENAME bool_perceptron_sign -> bool_perceptron_predict.
+    //
+    //    It applies whatever activation it is handed, so `_sign` names the
+    //    default rather than the function -- and the name reads as though it
+    //    were interchangeable with activation::sign, which is the thing
+    //    actually passed as `act`. It is not: the functor is `bool(T)` over
+    //    one scalar, this takes two matrices. Cheap fix, do it first.
+    //
+    //
+    // 1. MULTI-CLASS, still a hard decision. NO ACTIVATION CHANGE NEEDED.
+    //
+    //    weight becomes (classes x features), the score is the whole vector
+    //    W * xi, and the prediction is argmax over it. The ARGMAX REPLACES
+    //    THE STEP, which is why nothing differentiable is required yet. y
+    //    becomes HostMatrix<long> of class indices. The update stays
+    //    mistake-driven -- predicted p, true class t, p != t:
+    //
+    //        W.row(t) += learning_rate * xi;
+    //        W.row(p) -= learning_rate * xi;
+    //
+    //    Novikoff's guarantee survives this, so `trained` and the -1-on-cap
+    //    contract keep meaning exactly what they mean above. This is the
+    //    cheapest real capability jump and it reuses the whole epoch loop.
+    //
+    //    READ  [M] 9.1 p213 for the score-vector formulation; 9.4.1-9.4.2
+    //          p229 for one-vs-all against one-vs-one, and why a single
+    //          argmax beats K independent binary perceptrons (the ambiguous
+    //          -region problem). [E] ch4 p101 and p103 for the code view.
+    //
+    //
+    // 2. GRADED OUTPUT -- and the TRAINING RULE HAS TO CHANGE WITH IT.
+    //
+    //    This is the step that cannot be done by swapping the activation
+    //    alone. The perceptron rule works BECAUSE the output is a step: it
+    //    is mistake-driven, so no error means no update. With a sigmoid the
+    //    output is never exactly the label, `y[i] == pred` never holds, and
+    //    the `if (trained) return epoch + 1` early exit becomes dead code.
+    //    Replace it with a loss tolerance or a no-improvement test.
+    //
+    //    The update becomes gradient descent on a loss. Logistic output with
+    //    cross-entropy is the pairing worth writing, because the activation
+    //    derivative cancels:
+    //
+    //        yhat = sigma(dot(w, xi));
+    //        w += learning_rate * (y[i] - yhat) * xi;   // sigma' cancels
+    //
+    //    Pair the same sigmoid with SQUARED error instead and the update
+    //    carries a sigma' = sigma(1 - sigma) factor that goes to zero
+    //    exactly when the unit is confidently wrong -- the saturation stall.
+    //    Cross-entropy exists to kill that term. Do not discover this the
+    //    hard way.
+    //
+    //    API consequence: the Activation concept above is `bool(T)`. Graded
+    //    output makes it `T(T)`, and gradient descent also needs the
+    //    derivative, so those structs grow a second member:
+    //
+    //        struct logistic {
+    //            T operator()(T s) const;    // sigma(s)
+    //            T derivative(T s) const;    // sigma(s) * (1 - sigma(s))
+    //        };
+    //
+    //    That is a genuinely different contract from activation::sign, and
+    //    it constrains T to floating point, which sign does not. Give it its
+    //    own namespace rather than mixing it in with the boolean ones.
+    //
+    //    READ  [E] ch2 p49, "Analytic Explanation of the Perceptron Learning
+    //          Algorithm" -- derives the rule above AS gradient descent,
+    //          which is what makes this step follow rather than be asserted.
+    //          [G] 6.2.1 p178 on cost functions: you do not pick a loss, you
+    //          derive it from the distribution you claim to model. Then
+    //          [G] 6.2.2.2 p182 for the saturation argument in full.
+    //          [E] ch5 p124 and p130 for the same ground concretely, and
+    //          p135 for the numerical traps -- naive log(sigmoid(x)) bites.
+    //
+    //
+    // 3. THE OTHER TWO OUTPUT UNITS, once 2 is in place.
+    //
+    //    Softmax over K scores with cross-entropy generalises 2 to the
+    //    multi-class case of 1; a bare linear unit with squared error gives
+    //    regression (ADALINE / the delta rule). Same loop, different output
+    //    unit and loss.
+    //
+    //    READ  [G] 6.2.2.3 p184 (softmax) and 6.2.2.1 p181 (linear).
+    //          [E] ch6 "Output Units" p154 lays all three out as a menu
+    //          keyed to problem type -- the most useful single section for
+    //          deciding what this API should actually offer.
+    //          [M] 13.7 p325 for logistic regression stated properly.
+    //
+    //
+    // 4. A HIDDEN LAYER, which is the only thing that lifts the ceiling.
+    //
+    //    Worth being blunt about, because it is the common misreading of
+    //    steps 2-3: swapping the step for a sigmoid does NOT make XOR
+    //    learnable. A single unit with any monotone activation still cuts
+    //    the input space with one hyperplane; it just reports distance from
+    //    it smoothly instead of which side. The note on logic::XOR above
+    //    stays true verbatim.
+    //
+    //    The real reason a differentiable activation is needed is that it is
+    //    the PREREQUISITE FOR STACKING: backprop has to push error through
+    //    the activation, so it needs the derivative. A step function has a
+    //    zero derivative everywhere it is defined, which is why the
+    //    perceptron never became a multi-layer method on its own.
+    //
+    //    READ  [G] 6.1 p171, the XOR example worked end to end, showing
+    //          geometrically what the hidden layer buys. Then [G] 6.5 p204
+    //          for backprop proper. [E] ch3 p60 and p82 for the code.
+    //
+    //
+    // SUGGESTED ORDER, if reading rather than working step by step:
+    //
+    //    [E] ch1-2      -- fast, mostly what is already implemented above,
+    //                      but ch1 p20 "Implementing Perceptrons with Linear
+    //                      Algebra" walks dot product -> matrix-vector ->
+    //                      matrix-matrix as the deliberate path from one
+    //                      perceptron to a layer, which maps straight onto
+    //                      the primitives this file is built on
+    //    [M] 8.3.1 p190 -- the perceptron as stochastic gradient descent on
+    //                      a convex but NON-DIFFERENTIABLE objective, plus
+    //                      Theorem 8.8, Novikoff's mistake bound: updates
+    //                      bounded by (r/rho)^2, independent of dimension.
+    //                      This is the citation for the max_epochs note
+    //                      above -- it states plainly that the algorithm
+    //                      simply does not terminate on non-separable data
+    //    [E] ch3        -- sigmoid neurons and backpropagation
+    //    [G] 6.2.1-6.2.2 -- output units and the losses that go with them
+    //    [M] 9.4 p229   -- read before writing the multi-class version
+    //
+    //    Optional, for the general theory behind step 2: [M] 4.7 p73,
+    //    "Convex surrogate losses" -- why the 0-1 loss gets replaced by
+    //    something differentiable at all.
+
 }  // namespace ml
